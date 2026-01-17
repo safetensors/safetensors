@@ -343,8 +343,10 @@ impl fmt::Display for Framework {
     }
 }
 
-impl<'source> FromPyObject<'source> for Framework {
-    fn extract_bound(ob: &PyBound<'source, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Framework {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let name: String = ob.extract()?;
         match &name[..] {
             "pt" => Ok(Framework::Pytorch),
@@ -414,8 +416,10 @@ fn parse_device(name: &str) -> PyResult<usize> {
     }
 }
 
-impl<'source> FromPyObject<'source> for Device {
-    fn extract_bound(ob: &PyBound<'source, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Device {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         if let Ok(name) = ob.extract::<String>() {
             match name.as_str() {
                 "cpu" => Ok(Device::Cpu),
@@ -441,7 +445,9 @@ impl<'source> FromPyObject<'source> for Device {
         } else if let Ok(number) = ob.extract::<usize>() {
             Ok(Device::Anonymous(number))
         } else {
-            Err(SafetensorError::new_err(format!("device {ob} is invalid")))
+            Err(SafetensorError::new_err(format!(
+                "device {ob:?} is invalid"
+            )))
         }
     }
 }
