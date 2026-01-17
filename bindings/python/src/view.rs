@@ -40,8 +40,8 @@ impl View for &PyView<'_> {
         // XXX: Ideally we could have at least readonly tensors
         // assert!(self.data.readonly());
         // SAFETY:
-        // This is actually totally unsafe, PyBuffer is not immutable and could be changed from
-        // under us.
+        // This is actually totally unsafe, PyBuffer is not immutable and could be
+        // changed from under us.
         // This is made safer because we're still hanging to the GIL while treating
         // this structure
         Cow::Borrowed(unsafe {
