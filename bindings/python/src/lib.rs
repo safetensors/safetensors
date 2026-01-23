@@ -346,7 +346,7 @@ impl fmt::Display for Framework {
 impl<'a, 'py> FromPyObject<'a, 'py> for Framework {
     type Error = PyErr;
 
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
         let name: String = ob.extract()?;
         match &name[..] {
             "pt" => Ok(Framework::Pytorch),
@@ -419,7 +419,7 @@ fn parse_device(name: &str) -> PyResult<usize> {
 impl<'a, 'py> FromPyObject<'a, 'py> for Device {
     type Error = PyErr;
 
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
         if let Ok(name) = ob.extract::<String>() {
             match name.as_str() {
                 "cpu" => Ok(Device::Cpu),
