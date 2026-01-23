@@ -148,7 +148,9 @@ jobs:
         run: |
           cargo test
           pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
-          pytest -sv tests/ --ignore=tests/test_tf_comparison.py
+          # importing msgpack._cmsgpack re-enables the GIL, so force-disable
+          # until msgpack declares support
+          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py
 
   test_s390x_big_endian:
     runs-on: ubuntu-latest
