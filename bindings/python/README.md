@@ -43,6 +43,9 @@ save_file(tensors, "./model.safetensors")
 loaded = load_file("./model.safetensors")
 ```
 
+When loading large models, some unified memory systems (such as Strix Halo) behave poorly with PyTorch's file-backed storage.
+You may set `SAFETENSORS_DISABLE_TORCH_FROM_FILE=1` before loading.
+
 ### Developing
 
 ```

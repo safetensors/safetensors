@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
-use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -14,6 +14,7 @@ use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::ops::Bound;
 use std::path::PathBuf;
@@ -26,6 +27,16 @@ static TENSORFLOW_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static MLX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+
+fn env_flag_is_set(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
 
 struct TensorDataPointer {
     addr: u64,
@@ -514,6 +525,12 @@ impl Open {
         // before making a copy within Python.
         let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
 
+        // Some unified memory systems (such as Strix Halo) behave poorly when
+        // PyTorch keeps a file-backed storage alive for the whole safetensors
+        // handle lifetime. This flag allows opting into the generic copy-based
+        // path instead of `torch.UntypedStorage.from_file(...)`.
+        let disable_torch_from_file = env_flag_is_set("SAFETENSORS_DISABLE_TORCH_FROM_FILE");
+
         let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
             SafetensorError::new_err(format!("Error while deserializing header: {e}"))
         })?;
@@ -576,55 +593,63 @@ impl Open {
                     Ok(Storage::Mmap(buffer))
                 }
             })?,
-            Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
-                let module = get_module(py, &TORCH_MODULE)?;
-
-                let version: String = module.getattr(intern!(py, "__version__"))?.extract()?;
-                let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
-
-                // Untyped storage only exists for versions over 1.11.0
-                // Same for torch.asarray which is necessary for zero-copy tensor
-                if version >= Version::new(1, 11, 0) {
-                    // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
-                    let py_filename: PyObject = filename
-                        .to_str()
-                        .ok_or_else(|| {
-                            SafetensorError::new_err(format!(
-                                "Path {} is not valid UTF-8",
-                                filename.display()
-                            ))
-                        })?
-                        .into_pyobject(py)?
-                        .into();
-                    let size: PyObject = buffer.len().into_pyobject(py)?.into();
-                    let shared: PyObject = PyBool::new(py, false).to_owned().into();
-                    let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
-                        (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
-                    } else {
-                        (intern!(py, "size"), intern!(py, "ByteStorage"))
-                    };
-
-                    let kwargs =
-                        [(intern!(py, "shared"), shared), (size_name, size)].into_py_dict(py)?;
-                    let storage = module
-                        .getattr(storage_name)?
-                        // .getattr(intern!(py, "from_file"))?
-                        .call_method("from_file", (py_filename,), Some(&kwargs))?;
-
-                    let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
-                    {
-                        Ok(untyped) => untyped,
-                        Err(_) => storage.getattr(intern!(py, "_untyped"))?,
-                    };
-                    let storage = untyped.call0()?.into_pyobject(py)?.into();
-                    let gil_storage = OnceLock::new();
-                    gil_storage.get_or_init_py_attached(py, || storage);
-
-                    Ok(Storage::Torch(gil_storage))
+            Framework::Pytorch => {
+                if disable_torch_from_file {
+                    Storage::Mmap(buffer)
                 } else {
-                    Ok(Storage::Mmap(buffer))
+                    Python::with_gil(|py| -> PyResult<Storage> {
+                        let module = get_module(py, &TORCH_MODULE)?;
+
+                        let version: String =
+                            module.getattr(intern!(py, "__version__"))?.extract()?;
+                        let version =
+                            Version::from_string(&version).map_err(SafetensorError::new_err)?;
+
+                        // Untyped storage only exists for versions over 1.11.0
+                        // Same for torch.asarray which is necessary for zero-copy tensor
+                        if version >= Version::new(1, 11, 0) {
+                            // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
+                            let py_filename: PyObject = filename
+                                .to_str()
+                                .ok_or_else(|| {
+                                    SafetensorError::new_err(format!(
+                                        "Path {} is not valid UTF-8",
+                                        filename.display()
+                                    ))
+                                })?
+                                .into_pyobject(py)?
+                                .into();
+                            let size: PyObject = buffer.len().into_pyobject(py)?.into();
+                            let shared: PyObject = PyBool::new(py, false).to_owned().into();
+                            let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
+                                (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
+                            } else {
+                                (intern!(py, "size"), intern!(py, "ByteStorage"))
+                            };
+
+                            let kwargs = [(intern!(py, "shared"), shared), (size_name, size)]
+                                .into_py_dict(py)?;
+                            let storage = module
+                                .getattr(storage_name)?
+                                // .getattr(intern!(py, "from_file"))?
+                                .call_method("from_file", (py_filename,), Some(&kwargs))?;
+
+                            let untyped: PyBound<'_, PyAny> =
+                                match storage.getattr(intern!(py, "untyped")) {
+                                    Ok(untyped) => untyped,
+                                    Err(_) => storage.getattr(intern!(py, "_untyped"))?,
+                                };
+                            let storage = untyped.call0()?.into_pyobject(py)?.into();
+                            let gil_storage = OnceLock::new();
+                            gil_storage.get_or_init_py_attached(py, || storage);
+
+                            Ok(Storage::Torch(gil_storage))
+                        } else {
+                            Ok(Storage::Mmap(buffer))
+                        }
+                    })?
                 }
-            })?,
+            }
             _ => Storage::Mmap(buffer),
         };
 
@@ -1119,19 +1144,23 @@ impl PySafeSlice {
         match &self.storage.as_ref() {
             Storage::Mmap(mmap) => {
                 let pyslices = slices;
-                let slices: Slice = pyslices.extract()?;
                 let is_list = pyslices.is_instance_of::<PyList>();
-                let slices: Vec<SliceIndex> = match slices {
-                    Slice::Slice(slice) => vec![slice],
-                    Slice::Slices(slices) => {
-                        if slices.is_empty() && is_list {
-                            vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
-                        } else if is_list {
-                            return Err(SafetensorError::new_err(
-                                "Non empty lists are not implemented",
-                            ));
-                        } else {
-                            slices
+                let slices: Vec<SliceIndex> = if pyslices.is_instance_of::<PyEllipsis>() {
+                    Vec::new()
+                } else {
+                    let slices: Slice = pyslices.extract()?;
+                    match slices {
+                        Slice::Slice(slice) => vec![slice],
+                        Slice::Slices(slices) => {
+                            if slices.is_empty() && is_list {
+                                vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
+                            } else if is_list {
+                                return Err(SafetensorError::new_err(
+                                    "Non empty lists are not implemented",
+                                ));
+                            } else {
+                                slices
+                            }
                         }
                     }
                 };
