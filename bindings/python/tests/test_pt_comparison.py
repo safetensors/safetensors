@@ -101,23 +101,42 @@ class TorchTestCase(unittest.TestCase):
             b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\xbf\x00\x00\x80?",
         )
 
-    def test_odd_dtype_fp8(self):
+    def test_odd_dtype_fp8_e4m3fn(self):
         if not hasattr(torch, "float8_e4m3fn"):
             return  # torch.float8_e4m3fn requires 2.1
 
-        data = {
-            "test1": torch.tensor([-0.5], dtype=torch.float8_e4m3fn),
-            "test2": torch.tensor([-0.5], dtype=torch.float8_e5m2),
-        }
-        local = "./tests/data/out_safe_pt_mmap_small.safetensors"
+        data = {"test": torch.tensor([-0.5], dtype=torch.float8_e4m3fn)}
+        local = "./tests/data/out_safe_pt_mmap_small_e4m3fn.safetensors"
 
         save_file(data, local)
         reloaded = load_file(local)
-        # note: PyTorch doesn't implement torch.equal for float8 so we just compare the single element
-        self.assertEqual(reloaded["test1"].dtype, torch.float8_e4m3fn)
-        self.assertEqual(reloaded["test1"].item(), -0.5)
-        self.assertEqual(reloaded["test2"].dtype, torch.float8_e5m2)
-        self.assertEqual(reloaded["test2"].item(), -0.5)
+        self.assertEqual(reloaded["test"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(reloaded["test"].item(), -0.5)
+
+    def test_odd_dtype_fp8_e5m2(self):
+        if not hasattr(torch, "float8_e5m2"):
+            return  # torch.float8_e5m2 requires 2.1
+
+        data = {"test": torch.tensor([-0.5], dtype=torch.float8_e5m2)}
+        local = "./tests/data/out_safe_pt_mmap_small_e5m2.safetensors"
+
+        save_file(data, local)
+        reloaded = load_file(local)
+        self.assertEqual(reloaded["test"].dtype, torch.float8_e5m2)
+        self.assertEqual(reloaded["test"].item(), -0.5)
+
+    def test_odd_dtype_fp8_e8m0(self):
+        if not hasattr(torch, "float8_e8m0fnu"):
+            return  # torch.float8_e8m0fnu requires 2.8
+
+        # E8M0 only represents positive powers of 2, so pick one that casts without loss.
+        data = {"test": torch.tensor([0.5], dtype=torch.float8_e8m0fnu)}
+        local = "./tests/data/out_safe_pt_mmap_small_e8m0.safetensors"
+
+        save_file(data, local)
+        reloaded = load_file(local)
+        self.assertEqual(reloaded["test"].dtype, torch.float8_e8m0fnu)
+        self.assertEqual(reloaded["test"].item(), 0.5)
 
     def test_odd_dtype_fp8_fnuz(self):
         if not hasattr(torch, "float8_e4m3fnuz"):
