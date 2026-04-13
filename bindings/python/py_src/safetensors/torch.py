@@ -505,6 +505,8 @@ def _to_ndarray(tensor: torch.Tensor):
             _float8_e4m3fnuz: np.uint8,
             _float8_e5m2: np.uint8,
             _float8_e5m2fnuz: np.uint8,
+            _float8_e8m0: np.uint8,
+            _float4_e2m1_x2: np.uint8,
             torch.complex64: np.complex64,
         }
         npdtype = NPDTYPES[tensor.dtype]

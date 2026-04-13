@@ -102,8 +102,8 @@ class TorchTestCase(unittest.TestCase):
         )
 
     def test_odd_dtype_fp8(self):
-        if not hasattr(torch, "float8"):
-            return  # torch.float8 requires 2.1
+        if not hasattr(torch, "float8_e4m3fn"):
+            return  # torch.float8_e4m3fn requires 2.1
 
         data = {
             "test1": torch.tensor([-0.5], dtype=torch.float8_e4m3fn),
@@ -142,8 +142,8 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test2"].item(), 0.5)
 
     def test_odd_dtype_fp4(self):
-        if not hasattr(torch, "float4"):
-            return  # torch.float4 requires 2.8
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            return  # torch.float4_e2m1fn_x2 requires 2.8
 
         test1 = torch.tensor([0.0], dtype=torch.float8_e8m0fnu)
         test2 = torch.empty(2, 2, device="cpu", dtype=torch.float4_e2m1fn_x2)
