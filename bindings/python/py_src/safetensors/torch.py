@@ -245,7 +245,9 @@ def load_model(
 
 
 def save(
-    tensors: Dict[str, torch.Tensor], metadata: Optional[Dict[str, str]] = None
+    tensors: Dict[str, torch.Tensor],
+    metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> bytes:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -257,6 +259,8 @@ def save(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `bytes`: The raw bytes representing the format
@@ -273,7 +277,9 @@ def save(
     """
     keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
     serialized = serialize(
-        _flatten_as_ptr(tensors, keep_references_alive), metadata=metadata
+        _flatten_as_ptr(tensors, keep_references_alive),
+        metadata=metadata,
+        max_header_size=max_header_size,
     )
     result = bytes(serialized)
     return result
@@ -283,6 +289,7 @@ def save_file(
     tensors: Dict[str, torch.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ):
     """
     Saves a dictionary of tensors into `filename` in safetensors format.
@@ -299,6 +306,8 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `None`
@@ -315,12 +324,17 @@ def save_file(
     """
     keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
     serialize_file(
-        _flatten_as_ptr(tensors, keep_references_alive), filename, metadata=metadata
+        _flatten_as_ptr(tensors, keep_references_alive),
+        filename,
+        metadata=metadata,
+        max_header_size=max_header_size,
     )
 
 
 def load_file(
-    filename: Union[str, os.PathLike], device: Union[str, int] = "cpu"
+    filename: Union[str, os.PathLike],
+    device: Union[str, int] = "cpu",
+    max_header_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Loads a safetensors file into torch format.
@@ -331,6 +345,8 @@ def load_file(
         device (`Union[str, int]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular torch device locations.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, torch.Tensor]`: dictionary that contains name as key, value as `torch.Tensor`
@@ -345,19 +361,25 @@ def load_file(
     ```
     """
     result = {}
-    with safe_open(filename, framework="pt", device=device) as f:
+    with safe_open(
+        filename, framework="pt", device=device, max_header_size=max_header_size
+    ) as f:
         for k in f.offset_keys():
             result[k] = f.get_tensor(k)
     return result
 
 
-def load(data: bytes) -> Dict[str, torch.Tensor]:
+def load(
+    data: bytes, max_header_size: Optional[int] = None
+) -> Dict[str, torch.Tensor]:
     """
     Loads a safetensors file into torch format from pure bytes.
 
     Args:
         data (`bytes`):
             The content of a safetensors file
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, torch.Tensor]`: dictionary that contains name as key, value as `torch.Tensor` on cpu
@@ -374,7 +396,7 @@ def load(data: bytes) -> Dict[str, torch.Tensor]:
     loaded = load(data)
     ```
     """
-    flat = deserialize(data)
+    flat = deserialize(data, max_header_size=max_header_size)
     return _view2torch(flat)
 
 

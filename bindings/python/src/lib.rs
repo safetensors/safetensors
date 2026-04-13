@@ -10,7 +10,9 @@ use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
-use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
+use safetensors::tensor::{
+    DeserializeOptions, Dtype, Metadata, SafeTensors, SerializeOptions, TensorInfo, TensorView,
+};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -152,20 +154,28 @@ fn prepare_tensor_raw_data_view(
 ///             {"tensor_name": {"dtype": "F32", "shape": [2, 3], "data_ptr": 1234, "data_len": 24}}
 ///     metadata (`Dict[str, str]`, *optional*):
 ///         The optional purely text annotations
+///     max_header_size (`int`, *optional*):
+///         Maximum allowed header size in bytes. Defaults to 100MB.
 ///
 /// Returns:
 ///     (`bytes`):
 ///         The serialized content.
 #[pyfunction]
-#[pyo3(signature = (tensor_dict, metadata=None))]
+#[pyo3(signature = (tensor_dict, metadata=None, max_header_size=None))]
 fn serialize<'b>(
     py: Python<'b>,
     tensor_dict: HashMap<String, PyBound<PyDict>>,
     metadata: Option<HashMap<String, String>>,
+    max_header_size: Option<usize>,
 ) -> PyResult<PyBound<'b, PyBytes>> {
     let tensors = prepare_tensor_raw_data_view(tensor_dict)?;
+    let options = max_header_size
+        .map(|size| SerializeOptions {
+            max_header_size: size,
+        })
+        .unwrap_or_default();
     let out = py
-        .allow_threads(|| safetensors::tensor::serialize(&tensors, metadata))
+        .allow_threads(|| safetensors::tensor::serialize_with_options(&tensors, metadata, &options))
         .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))?;
     let pybytes = PyBytes::new(py, &out);
     Ok(pybytes)
@@ -188,22 +198,35 @@ fn serialize<'b>(
 ///         The name of the file to write into.
 ///     metadata (`Dict[str, str]`, *optional*):
 ///         The optional purely text annotations
+///     max_header_size (`int`, *optional*):
+///         Maximum allowed header size in bytes. Defaults to 100MB.
 ///
 /// Returns:
 ///     (`NoneType`):
 ///         On success return None
 #[pyfunction]
-#[pyo3(signature = (tensor_dict, filename, metadata=None))]
+#[pyo3(signature = (tensor_dict, filename, metadata=None, max_header_size=None))]
 fn serialize_file(
     py: Python<'_>,
     tensor_dict: HashMap<String, PyBound<PyDict>>,
     filename: PathBuf,
     metadata: Option<HashMap<String, String>>,
+    max_header_size: Option<usize>,
 ) -> PyResult<()> {
     let tensors = prepare_tensor_raw_data_view(tensor_dict)?;
+    let options = max_header_size
+        .map(|size| SerializeOptions {
+            max_header_size: size,
+        })
+        .unwrap_or_default();
     py.allow_threads(|| {
-        safetensors::tensor::serialize_to_file(&tensors, metadata, filename.as_path())
-            .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
+        safetensors::tensor::serialize_to_file_with_options(
+            &tensors,
+            metadata,
+            filename.as_path(),
+            &options,
+        )
+        .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
     })?;
 
     Ok(())
@@ -214,15 +237,26 @@ fn serialize_file(
 /// Args:
 ///     data (`bytes`):
 ///         The byte content of a file
+///     max_header_size (`int`, *optional*):
+///         Maximum allowed header size in bytes. Defaults to 100MB.
 ///
 /// Returns:
 ///     (`List[str, Dict[str, Dict[str, any]]]`):
 ///         The deserialized content is like:
 ///             [("tensor_name", {"shape": [2, 3], "dtype": "F32", "data": b"\0\0.." }), (...)]
 #[pyfunction]
-#[pyo3(signature = (bytes))]
-fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String, PyObject>)>> {
-    let safetensor = SafeTensors::deserialize(bytes)
+#[pyo3(signature = (bytes, max_header_size=None))]
+fn deserialize(
+    py: Python,
+    bytes: &[u8],
+    max_header_size: Option<usize>,
+) -> PyResult<Vec<(String, HashMap<String, PyObject>)>> {
+    let options = max_header_size
+        .map(|size| DeserializeOptions {
+            max_header_size: size,
+        })
+        .unwrap_or_default();
+    let safetensor = SafeTensors::deserialize_with_options(bytes, &options)
         .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e}")))?;
 
     let tensors = safetensor.tensors();
@@ -493,7 +527,12 @@ struct Open {
 }
 
 impl Open {
-    fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+    fn new(
+        filename: PathBuf,
+        framework: Framework,
+        device: Option<Device>,
+        max_header_size: Option<usize>,
+    ) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
@@ -514,9 +553,14 @@ impl Open {
         // before making a copy within Python.
         let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
 
-        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
-            SafetensorError::new_err(format!("Error while deserializing header: {e}"))
-        })?;
+        let options = max_header_size
+            .map(|size| DeserializeOptions {
+                max_header_size: size,
+            })
+            .unwrap_or_default();
+        let (n, metadata) = SafeTensors::read_metadata_with_options(&buffer, &options).map_err(
+            |e| SafetensorError::new_err(format!("Error while deserializing header: {e}")),
+        )?;
 
         let offset = n + 8;
         Python::with_gil(|py| -> PyResult<()> {
@@ -931,6 +975,9 @@ impl Open {
 ///
 ///     device (`str`, defaults to `"cpu"`):
 ///         The device on which you want the tensors.
+///
+///     max_header_size (`int`, *optional*):
+///         Maximum allowed header size in bytes. Defaults to 100MB.
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
@@ -950,9 +997,14 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu)))]
-    fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device)?);
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), max_header_size=None))]
+    fn new(
+        filename: PathBuf,
+        framework: Framework,
+        device: Option<Device>,
+        max_header_size: Option<usize>,
+    ) -> PyResult<Self> {
+        let inner = Some(Open::new(filename, framework, device, max_header_size)?);
         Ok(Self { inner })
     }
 
@@ -1562,15 +1614,20 @@ impl _safe_open_handle {
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu)))]
-    fn new(f: PyObject, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), max_header_size=None))]
+    fn new(
+        f: PyObject,
+        framework: Framework,
+        device: Option<Device>,
+        max_header_size: Option<usize>,
+    ) -> PyResult<Self> {
         let filename = Python::with_gil(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
             let filename = f.getattr(py, "name")?;
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device)?);
+        let inner = Some(Open::new(filename, framework, device, max_header_size)?);
         Ok(Self { inner })
     }
 

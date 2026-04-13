@@ -26,7 +26,9 @@ def _flatten(
 
 
 def save(
-    tensor_dict: Dict[str, np.ndarray], metadata: Optional[Dict[str, str]] = None
+    tensor_dict: Dict[str, np.ndarray],
+    metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> bytes:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -38,6 +40,8 @@ def save(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `bytes`: The raw bytes representing the format
@@ -53,7 +57,11 @@ def save(
     ```
     """
     keep_alive_buffer = []  # to keep byteswapped tensors alive
-    serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
+    serialized = serialize(
+        _flatten(tensor_dict, keep_alive_buffer),
+        metadata=metadata,
+        max_header_size=max_header_size,
+    )
     result = bytes(serialized)
     return result
 
@@ -62,6 +70,7 @@ def save_file(
     tensor_dict: Dict[str, np.ndarray],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> None:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -75,6 +84,8 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `None`
@@ -91,17 +102,24 @@ def save_file(
     """
     keep_alive_buffer = []  # to keep byteswapped tensors alive
     serialize_file(
-        _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
+        _flatten(tensor_dict, keep_alive_buffer),
+        filename,
+        metadata=metadata,
+        max_header_size=max_header_size,
     )
 
 
-def load(data: bytes) -> Dict[str, np.ndarray]:
+def load(
+    data: bytes, max_header_size: Optional[int] = None
+) -> Dict[str, np.ndarray]:
     """
     Loads a safetensors file into numpy format from pure bytes.
 
     Args:
         data (`bytes`):
             The content of a safetensors file
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, np.ndarray]`: dictionary that contains name as key, value as `np.ndarray` on cpu
@@ -118,17 +136,21 @@ def load(data: bytes) -> Dict[str, np.ndarray]:
     loaded = load(data)
     ```
     """
-    flat = deserialize(data)
+    flat = deserialize(data, max_header_size=max_header_size)
     return _view2np(flat)
 
 
-def load_file(filename: Union[str, os.PathLike]) -> Dict[str, np.ndarray]:
+def load_file(
+    filename: Union[str, os.PathLike], max_header_size: Optional[int] = None
+) -> Dict[str, np.ndarray]:
     """
     Loads a safetensors file into numpy format.
 
     Args:
         filename (`str`, or `os.PathLike`)):
             The name of the file which contains the tensors
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, np.ndarray]`: dictionary that contains name as key, value as `np.ndarray`
@@ -143,7 +165,7 @@ def load_file(filename: Union[str, os.PathLike]) -> Dict[str, np.ndarray]:
     ```
     """
     result = {}
-    with safe_open(filename, framework="np") as f:
+    with safe_open(filename, framework="np", max_header_size=max_header_size) as f:
         for k in f.offset_keys():
             result[k] = f.get_tensor(k)
     return result

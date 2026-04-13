@@ -9,7 +9,9 @@ from safetensors import numpy, deserialize, safe_open, serialize, serialize_file
 
 
 def save(
-    tensors: Dict[str, paddle.Tensor], metadata: Optional[Dict[str, str]] = None
+    tensors: Dict[str, paddle.Tensor],
+    metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> bytes:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -21,6 +23,8 @@ def save(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `bytes`: The raw bytes representing the format
@@ -36,7 +40,11 @@ def save(
     ```
     """
     keep_references_alive = []
-    serialized = serialize(_flatten(tensors, keep_references_alive), metadata=metadata)
+    serialized = serialize(
+        _flatten(tensors, keep_references_alive),
+        metadata=metadata,
+        max_header_size=max_header_size,
+    )
     result = bytes(serialized)
     return result
 
@@ -45,6 +53,7 @@ def save_file(
     tensors: Dict[str, paddle.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> None:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -58,6 +67,8 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `None`
@@ -74,17 +85,26 @@ def save_file(
     """
     keep_references_alive = []
     serialize_file(
-        _flatten(tensors, keep_references_alive), filename, metadata=metadata
+        _flatten(tensors, keep_references_alive),
+        filename,
+        metadata=metadata,
+        max_header_size=max_header_size,
     )
 
 
-def load(data: bytes, device: str = "cpu") -> Dict[str, paddle.Tensor]:
+def load(
+    data: bytes, device: str = "cpu", max_header_size: Optional[int] = None
+) -> Dict[str, paddle.Tensor]:
     """
     Loads a safetensors file into paddle format from pure bytes.
 
     Args:
         data (`bytes`):
             The content of a safetensors file
+        device (`str`, *optional*, defaults to `cpu`):
+            The device where the tensors need to be located after load.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, paddle.Tensor]`: dictionary that contains name as key, value as `paddle.Tensor` on cpu
@@ -102,15 +122,17 @@ def load(data: bytes, device: str = "cpu") -> Dict[str, paddle.Tensor]:
     ```
     """
     if paddle.__version__ >= "3.2.0":
-        flat = deserialize(data)
+        flat = deserialize(data, max_header_size=max_header_size)
         return _view2paddle(flat, device)
     else:
-        flat = numpy.load(data)
+        flat = numpy.load(data, max_header_size=max_header_size)
         return _np2paddle(flat, device)
 
 
 def load_file(
-    filename: Union[str, os.PathLike], device="cpu"
+    filename: Union[str, os.PathLike],
+    device="cpu",
+    max_header_size: Optional[int] = None,
 ) -> Dict[str, paddle.Tensor]:
     """
     Loads a safetensors file into paddle format.
@@ -121,6 +143,8 @@ def load_file(
         device (`Union[Dict[str, any], str]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular paddle device locations
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, paddle.Tensor]`: dictionary that contains name as key, value as `paddle.Tensor`
@@ -136,11 +160,13 @@ def load_file(
     """
     result = {}
     if paddle.__version__ >= "3.2.0":
-        with safe_open(filename, framework="paddle", device=device) as f:
+        with safe_open(
+            filename, framework="paddle", device=device, max_header_size=max_header_size
+        ) as f:
             for k in f.offset_keys():
                 result[k] = f.get_tensor(k)
     else:
-        flat = numpy.load_file(filename)
+        flat = numpy.load_file(filename, max_header_size=max_header_size)
         result = _np2paddle(flat, device)
     return result
 

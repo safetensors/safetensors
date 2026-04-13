@@ -8,7 +8,9 @@ from safetensors import numpy, safe_open
 
 
 def save(
-    tensors: Dict[str, tf.Tensor], metadata: Optional[Dict[str, str]] = None
+    tensors: Dict[str, tf.Tensor],
+    metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> bytes:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -20,6 +22,8 @@ def save(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `bytes`: The raw bytes representing the format
@@ -35,13 +39,14 @@ def save(
     ```
     """
     np_tensors = _tf2np(tensors)
-    return numpy.save(np_tensors, metadata=metadata)
+    return numpy.save(np_tensors, metadata=metadata, max_header_size=max_header_size)
 
 
 def save_file(
     tensors: Dict[str, tf.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    max_header_size: Optional[int] = None,
 ) -> None:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -55,6 +60,8 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `None`
@@ -70,16 +77,22 @@ def save_file(
     ```
     """
     np_tensors = _tf2np(tensors)
-    return numpy.save_file(np_tensors, filename, metadata=metadata)
+    return numpy.save_file(
+        np_tensors, filename, metadata=metadata, max_header_size=max_header_size
+    )
 
 
-def load(data: bytes) -> Dict[str, tf.Tensor]:
+def load(
+    data: bytes, max_header_size: Optional[int] = None
+) -> Dict[str, tf.Tensor]:
     """
     Loads a safetensors file into tensorflow format from pure bytes.
 
     Args:
         data (`bytes`):
             The content of a safetensors file
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, tf.Tensor]`: dictionary that contains name as key, value as `tf.Tensor` on cpu
@@ -96,17 +109,21 @@ def load(data: bytes) -> Dict[str, tf.Tensor]:
     loaded = load(data)
     ```
     """
-    flat = numpy.load(data)
+    flat = numpy.load(data, max_header_size=max_header_size)
     return _np2tf(flat)
 
 
-def load_file(filename: Union[str, os.PathLike]) -> Dict[str, tf.Tensor]:
+def load_file(
+    filename: Union[str, os.PathLike], max_header_size: Optional[int] = None
+) -> Dict[str, tf.Tensor]:
     """
     Loads a safetensors file into tensorflow format.
 
     Args:
         filename (`str`, or `os.PathLike`)):
             The name of the file which contains the tensors
+        max_header_size (`int`, *optional*):
+            Maximum allowed header size in bytes. Defaults to 100MB.
 
     Returns:
         `Dict[str, tf.Tensor]`: dictionary that contains name as key, value as `tf.Tensor`
@@ -121,7 +138,7 @@ def load_file(filename: Union[str, os.PathLike]) -> Dict[str, tf.Tensor]:
     ```
     """
     result = {}
-    with safe_open(filename, framework="tf") as f:
+    with safe_open(filename, framework="tf", max_header_size=max_header_size) as f:
         for k in f.offset_keys():
             result[k] = f.get_tensor(k)
     return result

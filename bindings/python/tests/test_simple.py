@@ -375,3 +375,107 @@ class ReadmeTestCase(unittest.TestCase):
                 str(cm.exception),
                 "Error during slicing [:, :20] with shape [10, 5]: index 19 out of bounds for tensor dimension #1 of size 5",
             )
+
+
+class MaxHeaderSizeTestCase(unittest.TestCase):
+    def test_serialize_with_max_header_size_too_small(self):
+        """Test that serialization fails when header exceeds max_header_size."""
+        # Create metadata large enough to exceed a small limit
+        large_metadata = {"key": "a" * 1000}
+        data = np.zeros((2, 2), dtype=np.int32)
+
+        # Should fail with small max_header_size
+        with self.assertRaises(SafetensorError) as ctx:
+            save({"test": data}, metadata=large_metadata, max_header_size=100)
+        self.assertIn("header too large", str(ctx.exception).lower())
+
+    def test_serialize_with_max_header_size_large_enough(self):
+        """Test that serialization succeeds when header is within max_header_size."""
+        large_metadata = {"key": "a" * 1000}
+        data = np.zeros((2, 2), dtype=np.int32)
+
+        # Should succeed with large enough max_header_size
+        out = save({"test": data}, metadata=large_metadata, max_header_size=10000)
+        self.assertIsNotNone(out)
+
+        # Verify we can load it back
+        loaded = load(out)
+        self.assertEqual(list(loaded.keys()), ["test"])
+
+    def test_serialize_file_with_max_header_size(self):
+        """Test save_file with max_header_size parameter."""
+        large_metadata = {"key": "a" * 1000}
+        data = np.zeros((2, 2), dtype=np.int32)
+
+        # Should fail with small max_header_size
+        with self.assertRaises(SafetensorError) as ctx:
+            save_file(
+                {"test": data},
+                "./max_header_test.safetensors",
+                metadata=large_metadata,
+                max_header_size=100,
+            )
+        self.assertIn("header too large", str(ctx.exception).lower())
+
+        # Should succeed with large enough max_header_size
+        save_file(
+            {"test": data},
+            "./max_header_test.safetensors",
+            metadata=large_metadata,
+            max_header_size=10000,
+        )
+        loaded = load_file("./max_header_test.safetensors")
+        self.assertEqual(list(loaded.keys()), ["test"])
+        os.remove("./max_header_test.safetensors")
+
+    def test_deserialize_with_max_header_size_too_small(self):
+        """Test that deserialization fails when header exceeds max_header_size."""
+        data = np.zeros((2, 2), dtype=np.int32)
+        serialized = save({"test": data})
+
+        # Should fail with very small max_header_size
+        with self.assertRaises(SafetensorError) as ctx:
+            load(serialized, max_header_size=10)
+        self.assertIn("header too large", str(ctx.exception).lower())
+
+    def test_deserialize_with_max_header_size_large_enough(self):
+        """Test that deserialization succeeds when header is within max_header_size."""
+        data = np.zeros((2, 2), dtype=np.int32)
+        serialized = save({"test": data})
+
+        # Should succeed with adequate max_header_size
+        loaded = load(serialized, max_header_size=1000)
+        self.assertEqual(list(loaded.keys()), ["test"])
+        np.testing.assert_array_equal(loaded["test"], data)
+
+    def test_safe_open_with_max_header_size_too_small(self):
+        """Test that safe_open fails when header exceeds max_header_size."""
+        data = np.zeros((2, 2), dtype=np.int32)
+        save_file({"test": data}, "./max_header_open_test.safetensors")
+
+        # Should fail with very small max_header_size
+        with self.assertRaises(SafetensorError) as ctx:
+            with safe_open(
+                "./max_header_open_test.safetensors",
+                framework="np",
+                max_header_size=10,
+            ):
+                pass
+        self.assertIn("header too large", str(ctx.exception).lower())
+        os.remove("./max_header_open_test.safetensors")
+
+    def test_safe_open_with_max_header_size_large_enough(self):
+        """Test that safe_open succeeds when header is within max_header_size."""
+        data = np.zeros((2, 2), dtype=np.int32)
+        save_file({"test": data}, "./max_header_open_test2.safetensors")
+
+        # Should succeed with adequate max_header_size
+        with safe_open(
+            "./max_header_open_test2.safetensors",
+            framework="np",
+            max_header_size=1000,
+        ) as f:
+            self.assertEqual(f.keys(), ["test"])
+            tensor = f.get_tensor("test")
+            np.testing.assert_array_equal(tensor, data)
+        os.remove("./max_header_open_test2.safetensors")

@@ -5,8 +5,11 @@ pub mod slice;
 pub mod tensor;
 /// serialize_to_file only valid in std
 #[cfg(feature = "std")]
-pub use tensor::serialize_to_file;
-pub use tensor::{serialize, Dtype, SafeTensorError, SafeTensors, View};
+pub use tensor::{serialize_to_file, serialize_to_file_with_options};
+pub use tensor::{
+    serialize, serialize_with_options, DeserializeOptions, Dtype, SafeTensorError, SafeTensors,
+    SerializeOptions, View, DEFAULT_MAX_HEADER_SIZE,
+};
 
 #[cfg(not(feature = "std"))]
 #[macro_use]

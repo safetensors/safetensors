@@ -7,8 +7,40 @@ use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer}
 #[cfg(feature = "std")]
 use std::{io::Write, path::Path};
 
-const MAX_HEADER_SIZE: usize = 100_000_000;
+/// Default maximum header size (100MB)
+pub const DEFAULT_MAX_HEADER_SIZE: usize = 100_000_000;
+
 const N_LEN: usize = size_of::<u64>();
+
+/// Options for serialization operations
+#[derive(Debug, Clone)]
+pub struct SerializeOptions {
+    /// Maximum allowed header size in bytes
+    pub max_header_size: usize,
+}
+
+impl Default for SerializeOptions {
+    fn default() -> Self {
+        Self {
+            max_header_size: DEFAULT_MAX_HEADER_SIZE,
+        }
+    }
+}
+
+/// Options for deserialization operations
+#[derive(Debug, Clone)]
+pub struct DeserializeOptions {
+    /// Maximum allowed header size in bytes
+    pub max_header_size: usize,
+}
+
+impl Default for DeserializeOptions {
+    fn default() -> Self {
+        Self {
+            max_header_size: DEFAULT_MAX_HEADER_SIZE,
+        }
+    }
+}
 
 /// Possible errors that could occur while reading
 /// A Safetensor file.
@@ -276,6 +308,19 @@ pub fn serialize<
     data: I,
     data_info: Option<HashMap<String, String>>,
 ) -> Result<Vec<u8>, SafeTensorError> {
+    serialize_with_options(data, data_info, &SerializeOptions::default())
+}
+
+/// Serialize to an owned byte buffer the dictionnary of tensors with custom options.
+pub fn serialize_with_options<
+    S: AsRef<str> + Ord + core::fmt::Display,
+    V: View,
+    I: IntoIterator<Item = (S, V)>,
+>(
+    data: I,
+    data_info: Option<HashMap<String, String>>,
+    options: &SerializeOptions,
+) -> Result<Vec<u8>, SafeTensorError> {
     let (
         PreparedData {
             n,
@@ -285,7 +330,7 @@ pub fn serialize<
         tensors,
     ) = prepare(data, data_info)?;
 
-    if n > MAX_HEADER_SIZE as u64 {
+    if n > options.max_header_size as u64 {
         return Err(SafeTensorError::HeaderTooLarge);
     }
 
@@ -350,6 +395,24 @@ where
     V: View,
     I: IntoIterator<Item = (S, V)>,
 {
+    serialize_to_file_with_options(data, data_info, filename, &SerializeOptions::default())
+}
+
+/// Serialize to a regular file the dictionnary of tensors with custom options.
+/// Writing directly to file reduces the need to allocate the whole amount to
+/// memory.
+#[cfg(feature = "std")]
+pub fn serialize_to_file_with_options<S, V, I>(
+    data: I,
+    data_info: Option<HashMap<String, String>>,
+    filename: &std::path::Path,
+    options: &SerializeOptions,
+) -> Result<(), SafeTensorError>
+where
+    S: AsRef<str> + Ord + Display,
+    V: View,
+    I: IntoIterator<Item = (S, V)>,
+{
     let (
         PreparedData {
             n,
@@ -360,7 +423,7 @@ where
         tensors,
     ) = prepare(data, data_info)?;
 
-    if n > MAX_HEADER_SIZE as u64 {
+    if n > options.max_header_size as u64 {
         return Err(SafeTensorError::HeaderTooLarge);
     }
 
@@ -383,6 +446,15 @@ impl<'data> SafeTensors<'data> {
     /// Given a byte-buffer representing the whole safetensor file
     /// parses the header, and returns the size of the header + the parsed data.
     pub fn read_metadata(buffer: &'data [u8]) -> Result<(usize, Metadata), SafeTensorError> {
+        Self::read_metadata_with_options(buffer, &DeserializeOptions::default())
+    }
+
+    /// Given a byte-buffer representing the whole safetensor file
+    /// parses the header with custom options, and returns the size of the header + the parsed data.
+    pub fn read_metadata_with_options(
+        buffer: &'data [u8],
+        options: &DeserializeOptions,
+    ) -> Result<(usize, Metadata), SafeTensorError> {
         let buffer_len = buffer.len();
         let Some(header_size_bytes) = buffer.get(..N_LEN) else {
             return Err(SafeTensorError::HeaderTooSmall);
@@ -394,7 +466,7 @@ impl<'data> SafeTensors<'data> {
             .try_into()
             .map_err(|_| SafeTensorError::HeaderTooLarge)?;
 
-        if n > MAX_HEADER_SIZE {
+        if n > options.max_header_size {
             return Err(SafeTensorError::HeaderTooLarge);
         }
 
@@ -444,7 +516,16 @@ impl<'data> SafeTensors<'data> {
     ///         .unwrap();
     /// ```
     pub fn deserialize(buffer: &'data [u8]) -> Result<Self, SafeTensorError> {
-        let (n, metadata) = SafeTensors::read_metadata(buffer)?;
+        Self::deserialize_with_options(buffer, &DeserializeOptions::default())
+    }
+
+    /// Given a byte-buffer representing the whole safetensor file
+    /// parses it with custom options and returns the Deserialized form (No Tensor allocation).
+    pub fn deserialize_with_options(
+        buffer: &'data [u8],
+        options: &DeserializeOptions,
+    ) -> Result<Self, SafeTensorError> {
+        let (n, metadata) = SafeTensors::read_metadata_with_options(buffer, options)?;
         let data = &buffer[N_LEN + n..];
         Ok(Self { metadata, data })
     }
@@ -1541,7 +1622,7 @@ mod tests {
         let tensors: HashMap<String, TensorView> = HashMap::new();
 
         // a char is 1 byte in utf-8, so we can just repeat 'a' to get large metadata
-        let very_large_metadata = "a".repeat(MAX_HEADER_SIZE);
+        let very_large_metadata = "a".repeat(DEFAULT_MAX_HEADER_SIZE);
         data_info.insert("very_large_metadata".to_string(), very_large_metadata);
         match serialize(&tensors, Some(data_info)) {
             Err(SafeTensorError::HeaderTooLarge) => {
@@ -1549,5 +1630,58 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
+    }
+
+    #[test]
+    fn test_custom_max_header_size_serialization() {
+        let mut data_info = HashMap::<String, String>::new();
+        let tensors: HashMap<String, TensorView> = HashMap::new();
+
+        // Create metadata slightly larger than the custom limit
+        let custom_limit = 1000;
+        let large_metadata = "a".repeat(custom_limit + 100);
+        data_info.insert("large_metadata".to_string(), large_metadata);
+
+        // Should fail with default-sized custom options set to small value
+        let options = SerializeOptions {
+            max_header_size: custom_limit,
+        };
+        match serialize_with_options(&tensors, Some(data_info.clone()), &options) {
+            Err(SafeTensorError::HeaderTooLarge) => {
+                // Yes we have the correct error
+            }
+            _ => panic!("This should not be able to be serialized"),
+        }
+
+        // Should succeed with larger custom limit
+        let options = SerializeOptions {
+            max_header_size: custom_limit + 1000,
+        };
+        assert!(serialize_with_options(&tensors, Some(data_info), &options).is_ok());
+    }
+
+    #[test]
+    fn test_custom_max_header_size_deserialization() {
+        // Create a valid serialized file first
+        let data: Vec<u8> = vec![0u8; 16];
+        let tensor = TensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let tensors: HashMap<String, TensorView> = [("test".to_string(), tensor)].into_iter().collect();
+        let serialized = serialize(&tensors, None).unwrap();
+
+        // Should succeed with default options
+        assert!(SafeTensors::deserialize(&serialized).is_ok());
+
+        // Should fail with very small max_header_size
+        let options = DeserializeOptions { max_header_size: 10 };
+        match SafeTensors::deserialize_with_options(&serialized, &options) {
+            Err(SafeTensorError::HeaderTooLarge) => {
+                // Yes we have the correct error
+            }
+            _ => panic!("This should not be able to be deserialized with small header limit"),
+        }
+
+        // Should succeed with adequate max_header_size
+        let options = DeserializeOptions { max_header_size: 1000 };
+        assert!(SafeTensors::deserialize_with_options(&serialized, &options).is_ok());
     }
 }
