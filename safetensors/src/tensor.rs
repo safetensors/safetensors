@@ -16,8 +16,6 @@ const N_LEN: usize = size_of::<u64>();
 pub enum SafeTensorError {
     /// The header is an invalid UTF-8 string and cannot be read.
     InvalidHeader(Utf8Error),
-    /// The header's first byte is not the expected `{`.
-    InvalidHeaderStart,
     /// The header does contain a valid string, but it is not valid JSON.
     InvalidHeaderDeserialization(serde_json::Error),
     /// The header is large than 100Mo which is considered too large (Might evolve in the future).
@@ -70,7 +68,6 @@ impl Display for SafeTensorError {
 
         match self {
             InvalidHeader(error) => write!(f, "invalid UTF-8 in header: {error}"),
-            InvalidHeaderStart => write!(f, "invalid start character in header, must be `{{`"),
             InvalidHeaderDeserialization(error) => write!(f, "invalid JSON in header: {error}"),
             JsonError(error) => write!(f, "JSON error: {error}"),
             HeaderTooLarge => write!(f, "header too large"),
@@ -408,10 +405,6 @@ impl<'data> SafeTensors<'data> {
             return Err(SafeTensorError::InvalidHeaderLength);
         };
         let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
-        // Assert the string starts with `{`
-        if !string.starts_with('{') {
-            return Err(SafeTensorError::InvalidHeaderStart);
-        }
         let metadata: HashMetadata =
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
@@ -1477,15 +1470,13 @@ mod tests {
     }
 
     #[test]
-    /// Test that the JSON header must begin with a `{` character.
-    fn test_whitespace_start_padded_header_is_not_allowed() {
+    /// Test that the JSON header may be leading-padded with JSON whitespace characters.
+    /// This is intentional: writers may pad the header to align the data section to a
+    /// page boundary, so readers must tolerate leading whitespace.
+    fn test_whitespace_leading_padded_header() {
         let serialized = b"\x06\x00\x00\x00\x00\x00\x00\x00\x09\x0A{}\x0D\x20";
-        match SafeTensors::deserialize(serialized) {
-            Err(SafeTensorError::InvalidHeaderStart) => {
-                // Correct error
-            }
-            _ => panic!("This should not be able to be deserialized"),
-        }
+        let loaded = SafeTensors::deserialize(serialized).unwrap();
+        assert_eq!(loaded.len(), 0);
     }
 
     #[test]
