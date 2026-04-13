@@ -119,6 +119,28 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test2"].dtype, torch.float8_e5m2)
         self.assertEqual(reloaded["test2"].item(), -0.5)
 
+    def test_odd_dtype_fp8_fnuz(self):
+        if not hasattr(torch, "float8_e4m3fnuz"):
+            return  # fnuz dtypes not available in this torch version
+        if sys.byteorder == "big":
+            # FNUZ is an AMD FP8 format; AMD hardware is little-endian only, so FNUZ
+            # on big-endian is never a real deployment target. We only reach this path
+            # via the s390x CI job, whose PyTorch conda build lacks FNUZ kernel dispatch.
+            return
+
+        data = {
+            "test1": torch.tensor([0.5], dtype=torch.float8_e4m3fnuz),
+            "test2": torch.tensor([0.5], dtype=torch.float8_e5m2fnuz),
+        }
+        local = "./tests/data/out_safe_pt_mmap_small_fnuz.safetensors"
+
+        save_file(data, local)
+        reloaded = load_file(local)
+        self.assertEqual(reloaded["test1"].dtype, torch.float8_e4m3fnuz)
+        self.assertEqual(reloaded["test1"].item(), 0.5)
+        self.assertEqual(reloaded["test2"].dtype, torch.float8_e5m2fnuz)
+        self.assertEqual(reloaded["test2"].item(), 0.5)
+
     def test_odd_dtype_fp4(self):
         if not hasattr(torch, "float4"):
             return  # torch.float4 requires 2.8

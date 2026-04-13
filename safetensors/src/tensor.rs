@@ -824,6 +824,12 @@ pub enum Dtype {
     /// F8_E8M0 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
     #[allow(non_camel_case_types)]
     F8_E8M0,
+    /// FP8 E4M3 (FNUZ) <https://arxiv.org/pdf/2206.02915.pdf>_
+    #[allow(non_camel_case_types)]
+    F8_E4M3FNUZ,
+    /// FP8 E5M2 (FNUZ) <https://arxiv.org/pdf/2206.02915.pdf>_
+    #[allow(non_camel_case_types)]
+    F8_E5M2FNUZ,
     /// Signed integer (16-bit)
     I16,
     /// Unsigned integer (16-bit)
@@ -861,6 +867,8 @@ impl Dtype {
             Dtype::F8_E5M2 => 8,
             Dtype::F8_E4M3 => 8,
             Dtype::F8_E8M0 => 8,
+            Dtype::F8_E4M3FNUZ => 8,
+            Dtype::F8_E5M2FNUZ => 8,
             Dtype::I16 => 16,
             Dtype::U16 => 16,
             Dtype::I32 => 32,
@@ -896,6 +904,8 @@ impl Display for Dtype {
             Dtype::F8_E5M2 => "F8_E5M2",
             Dtype::F8_E4M3 => "F8_E4M3",
             Dtype::F8_E8M0 => "F8_E8M0",
+            Dtype::F8_E4M3FNUZ => "F8_E4M3FNUZ",
+            Dtype::F8_E5M2FNUZ => "F8_E5M2FNUZ",
             Dtype::I16 => "I16",
             Dtype::U16 => "U16",
             Dtype::I32 => "I32",

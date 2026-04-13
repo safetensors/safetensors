@@ -87,7 +87,9 @@ fn prepare_dtype(tensor_desc: &PyBound<PyDict>) -> PyResult<Dtype> {
         "float64" => Dtype::F64,
         "bfloat16" => Dtype::BF16,
         "float8_e4m3fn" => Dtype::F8_E4M3,
+        "float8_e4m3fnuz" => Dtype::F8_E4M3FNUZ,
         "float8_e5m2" => Dtype::F8_E5M2,
+        "float8_e5m2fnuz" => Dtype::F8_E5M2FNUZ,
         "float8_e8m0fnu" => Dtype::F8_E8M0,
         "float4_e2m1fn_x2" => Dtype::F4,
         "complex64" => Dtype::C64,
@@ -1522,7 +1524,9 @@ fn get_pydtype(module: &PyBound<'_, PyModule>, dtype: Dtype, is_numpy: bool) -> 
                 }
             }
             Dtype::F8_E4M3 => module.getattr(intern!(py, "float8_e4m3fn"))?.into(),
+            Dtype::F8_E4M3FNUZ => module.getattr(intern!(py, "float8_e4m3fnuz"))?.into(),
             Dtype::F8_E5M2 => module.getattr(intern!(py, "float8_e5m2"))?.into(),
+            Dtype::F8_E5M2FNUZ => module.getattr(intern!(py, "float8_e5m2fnuz"))?.into(),
             Dtype::F8_E8M0 => module.getattr(intern!(py, "float8_e8m0fnu"))?.into(),
             Dtype::F4 => module.getattr(intern!(py, "float4_e2m1fn_x2"))?.into(),
             Dtype::C64 => module.getattr(intern!(py, "complex64"))?.into(),

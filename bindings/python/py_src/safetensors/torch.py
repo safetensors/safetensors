@@ -380,7 +380,9 @@ def load(data: bytes) -> Dict[str, torch.Tensor]:
 
 # torch.float8 formats require 2.1; we do not support these dtypes on earlier versions
 _float8_e4m3fn = getattr(torch, "float8_e4m3fn", None)
+_float8_e4m3fnuz = getattr(torch, "float8_e4m3fnuz", None)
 _float8_e5m2 = getattr(torch, "float8_e5m2", None)
+_float8_e5m2fnuz = getattr(torch, "float8_e5m2fnuz", None)
 _float8_e8m0 = getattr(torch, "float8_e8m0fnu", None)
 _float4_e2m1_x2 = getattr(torch, "float4_e2m1fn_x2", None)
 
@@ -397,7 +399,9 @@ _SIZE = {
     torch.float64: 8,
     torch.complex64: 8,
     _float8_e4m3fn: 1,
+    _float8_e4m3fnuz: 1,
     _float8_e5m2: 1,
+    _float8_e5m2fnuz: 1,
     _float8_e8m0: 1,
     _float4_e2m1_x2: 1,
 }
@@ -423,7 +427,9 @@ _TYPES = {
     "U8": torch.uint8,
     "BOOL": torch.bool,
     "F8_E4M3": _float8_e4m3fn,
+    "F8_E4M3FNUZ": _float8_e4m3fnuz,
     "F8_E5M2": _float8_e5m2,
+    "F8_E5M2FNUZ": _float8_e5m2fnuz,
     "C64": torch.complex64,
 }
 
@@ -496,7 +502,9 @@ def _to_ndarray(tensor: torch.Tensor):
             torch.float64: np.float64,
             # XXX: This is ok because both have the same width and byteswap is a no-op anyway
             _float8_e4m3fn: np.uint8,
+            _float8_e4m3fnuz: np.uint8,
             _float8_e5m2: np.uint8,
+            _float8_e5m2fnuz: np.uint8,
             torch.complex64: np.complex64,
         }
         npdtype = NPDTYPES[tensor.dtype]
