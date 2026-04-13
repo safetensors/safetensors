@@ -120,9 +120,6 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test2"].item(), -0.5)
 
     def test_odd_dtype_fp8_fnuz(self):
-        if not hasattr(torch, "float8"):
-            return  # torch.float8 requires 2.1
-
         if not hasattr(torch, "float8_e4m3fnuz"):
             return  # fnuz dtypes not available in this torch version
 
