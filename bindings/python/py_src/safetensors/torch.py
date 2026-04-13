@@ -502,7 +502,9 @@ def _to_ndarray(tensor: torch.Tensor):
             torch.float64: np.float64,
             # XXX: This is ok because both have the same width and byteswap is a no-op anyway
             _float8_e4m3fn: np.uint8,
+            _float8_e4m3fnuz: np.uint8,
             _float8_e5m2: np.uint8,
+            _float8_e5m2fnuz: np.uint8,
             torch.complex64: np.complex64,
         }
         npdtype = NPDTYPES[tensor.dtype]
