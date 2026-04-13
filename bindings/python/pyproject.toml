@@ -37,22 +37,23 @@ pinned-tf = ["safetensors[numpy]", "tensorflow==2.18.0"]
 jax = ["safetensors[numpy]", "flax>=0.6.3", "jax>=0.3.25", "jaxlib>=0.3.25"]
 mlx = ["mlx>=0.0.9"]
 paddlepaddle = ["safetensors[numpy]", "paddlepaddle>=2.4.1"]
+convert = ["safetensors[torch]", "huggingface_hub>=1.4"]
 quality = [
   "ruff", # after updating to black 2023, also update Python version in pyproject.toml to 3.7
 ]
 testing = [
   "safetensors[numpy]",
   "h5py>=3.7.0",
-  "huggingface_hub>=1.4",
   "setuptools_rust>=1.12.0",
   "pytest>=9.0",
   "pytest-benchmark>=5.2",
   # "python-afl>=0.7.3",
   "hypothesis>=6.70.2",
+  "fsspec>=2024.6.0",
+  "s3fs>=2024.6.0",
 ]
 testingfree = [
   "safetensors[numpy]",
-  "huggingface_hub>=1.4",
   "setuptools_rust>=1.12.0",
   "pytest>=9.0",
   "pytest-benchmark>=5.2",
@@ -65,6 +66,7 @@ all = [
   "safetensors[pinned-tf]",
   "safetensors[jax]",
   "safetensors[paddlepaddle]",
+  "safetensors[convert]",
   "safetensors[quality]",
   "safetensors[testing]",
 ]
