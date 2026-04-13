@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import threading
@@ -37,9 +38,12 @@ def test_multithreaded_roundtripping_numpy():
     def save_worker(tensors, barrier):
         barrier.wait()
         for _ in range(NUM_ITERATIONS):
-            with tempfile.NamedTemporaryFile() as fp:
-                save_file_np(tensors, fp.name)
-                loaded_tensors = load_file_np(fp.name)
+            # NamedTemporaryFile can't be reopened on Windows (ERROR_SHARING_VIOLATION
+            # due to delete-on-close semantics), so use a TemporaryDirectory + path join.
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "test.safetensors")
+                save_file_np(tensors, path)
+                loaded_tensors = load_file_np(path)
                 for name, tensor in tensors.items():
                     assert np.all(loaded_tensors[name] == tensor)
 
@@ -58,9 +62,10 @@ def test_multithreaded_roundtripping_torch():
     def save_worker(tensors, barrier):
         barrier.wait()
         for _ in range(NUM_ITERATIONS):
-            with tempfile.NamedTemporaryFile() as fp:
-                save_file_pt(tensors, fp.name)
-                loaded_tensors = load_file_pt(fp.name)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "test.safetensors")
+                save_file_pt(tensors, path)
+                loaded_tensors = load_file_pt(path)
                 for name, tensor in tensors.items():
                     assert torch.all(loaded_tensors[name] == tensor)
 
