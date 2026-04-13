@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776100646553,
+  "lastUpdate": 1776100879719,
   "repoUrl": "https://github.com/huggingface/safetensors",
   "entries": {
     "Benchmark": [
@@ -39247,6 +39247,107 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.006547877452759305",
             "extra": "mean: 139.9136703333331 msec\nrounds: 6"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "97126670+nathanrchn@users.noreply.github.com",
+            "name": "nathan",
+            "username": "nathanrchn"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b3b714d3e556e51b89dfa013c804e82af35bbf4f",
+          "message": "feat: add float8_e4m3fnuz and float8_e5m2fnuz dtype support for AMD GPUs (#711)\n\n* feat: add float8_e4m3fnuz and float8_e5m2fnuz dtype support\n\nAdd support for the FNUZ (finite, no unsigned zero) float8 variants\nused by PyTorch. These dtypes differ from the existing float8_e4m3fn\nand float8_e5m2 types by having no negative zero representation.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* fix: check if torch hasattr rather than version comparison\n\n* refactor: remove unnecessary hasattr check\n\n* fix: add new types to npdtypes for bigendian\n\n* fix: skip fp8_fnuz test if bigendian\n\n---------\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>\nCo-authored-by: Luc Georges <luc.sydney.georges@gmail.com>",
+          "timestamp": "2026-04-13T19:19:04+02:00",
+          "tree_id": "8e9249f8550a2b8c3b4d7977e61fcfe68d33f4ff",
+          "url": "https://github.com/huggingface/safetensors/commit/b3b714d3e556e51b89dfa013c804e82af35bbf4f"
+        },
+        "date": 1776100877589,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "benches/test_flax.py::test_flax_flax_load",
+            "value": 1.8181388942365295,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0055083098479173824",
+            "extra": "mean: 550.0129847999972 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_flax.py::test_flax_sf_load",
+            "value": 5.103827051634768,
+            "unit": "iter/sec",
+            "range": "stddev: 0.008061018059424776",
+            "extra": "mean: 195.9314040000038 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_paddle_load",
+            "value": 6.681625974521278,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0023779543766803803",
+            "extra": "mean: 149.66416914284812 msec\nrounds: 7"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_sf_load",
+            "value": 7.442504296629129,
+            "unit": "iter/sec",
+            "range": "stddev: 0.003318687484735764",
+            "extra": "mean: 134.36337557143523 msec\nrounds: 7"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu",
+            "value": 9.003054385233986,
+            "unit": "iter/sec",
+            "range": "stddev: 0.012560576967487481",
+            "extra": "mean: 111.073415444442 msec\nrounds: 9"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu",
+            "value": 305.6083517254132,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0000842375714818354",
+            "extra": "mean: 3.272161884170275 msec\nrounds: 259"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu_small",
+            "value": 11.230513763283456,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00098923050799324",
+            "extra": "mean: 89.04312136363305 msec\nrounds: 11"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small",
+            "value": 48.61113037078108,
+            "unit": "iter/sec",
+            "range": "stddev: 0.030845254071833413",
+            "extra": "mean: 20.57142042105391 msec\nrounds: 57"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_save_cpu",
+            "value": 7.251207955166605,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00005446609619370142",
+            "extra": "mean: 137.9080570000042 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_tf_load",
+            "value": 3.3182005756379254,
+            "unit": "iter/sec",
+            "range": "stddev: 0.020963345504873773",
+            "extra": "mean: 301.3681593999934 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_sf_load",
+            "value": 4.467620433934466,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0036146905652918735",
+            "extra": "mean: 223.8328019999983 msec\nrounds: 5"
           }
         ]
       }
