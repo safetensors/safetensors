@@ -65,6 +65,8 @@ def pyi_file(obj, indent=""):
     string = ""
     if inspect.ismodule(obj):
         string += GENERATED_COMMENT
+        if hasattr(obj, "__version__"):
+            string += "__version__: str\n\n"
         members = get_module_members(obj)
         for member in members:
             string += pyi_file(member, indent)

@@ -1,98 +1,74 @@
 [project]
 name = 'safetensors'
-requires-python = '>=3.9'
+requires-python = '>=3.10'
 authors = [
-    {name = 'Nicolas Patry', email = 'patry.nicolas@protonmail.com'}
+  { name = 'Nicolas Patry', email = 'patry.nicolas@protonmail.com' },
+  { name = "Luc Georges", email = 'luc@huggingface.co' },
+  { name = "Daniël De Kok", email = 'daniel.dekok@huggingface.co' },
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Education",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Typing :: Typed",
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
 ]
 license = { file = "LICENSE" }
-dynamic = [
-    'description',
-    'readme',
-    'version',
-]
+dynamic = ['description', 'readme', 'version']
 
 [project.urls]
 Homepage = 'https://github.com/huggingface/safetensors'
 Source = 'https://github.com/huggingface/safetensors'
 
 [project.optional-dependencies]
-numpy = ["numpy>=1.21.6"]
-torch = [
-    "packaging",
-    "safetensors[numpy]",
-    "torch>=1.10",
-]
-tensorflow = [
-    "safetensors[numpy]",
-    "tensorflow>=2.11.0",
-]
+numpy = ["numpy>=1.24.6"]
+torch = ["safetensors[numpy]", "torch>=2.4"]
+tensorflow = ["safetensors[numpy]", "tensorflow>=2.11.0"]
 # pinning tf version 2.11.0 for doc-builder
-pinned-tf = [
-    "safetensors[numpy]",
-    "tensorflow==2.18.0",
-]
-jax = [
-    "safetensors[numpy]",
-    "flax>=0.6.3",
-    "jax>=0.3.25",
-    "jaxlib>=0.3.25",
-]
-mlx = [
-    "mlx>=0.0.9",
-]
-paddlepaddle = [
-    "safetensors[numpy]",
-    "paddlepaddle>=2.4.1",
-]
+pinned-tf = ["safetensors[numpy]", "tensorflow==2.18.0"]
+jax = ["safetensors[numpy]", "flax>=0.6.3", "jax>=0.3.25", "jaxlib>=0.3.25"]
+mlx = ["mlx>=0.0.9"]
+paddlepaddle = ["safetensors[numpy]", "paddlepaddle>=2.4.1"]
 quality = [
-    "ruff",  # after updating to black 2023, also update Python version in pyproject.toml to 3.7
+  "ruff", # after updating to black 2023, also update Python version in pyproject.toml to 3.7
 ]
 testing = [
-    "safetensors[numpy]",
-    "h5py>=3.7.0",
-    "huggingface_hub>=0.12.1",
-    "setuptools_rust>=1.5.2",
-    "pytest>=7.2.0",
-    "pytest-benchmark>=4.0.0",
-    # "python-afl>=0.7.3",
-    "hypothesis>=6.70.2",
+  "safetensors[numpy]",
+  "h5py>=3.7.0",
+  "huggingface_hub>=1.4",
+  "setuptools_rust>=1.12.0",
+  "pytest>=9.0",
+  "pytest-benchmark>=5.2",
+  # "python-afl>=0.7.3",
+  "hypothesis>=6.70.2",
 ]
 testingfree = [
-    "safetensors[numpy]",
-    "huggingface_hub>=0.12.1",
-    "setuptools_rust>=1.5.2",
-    "pytest>=7.2.0",
-    "pytest-benchmark>=4.0.0",
-    # "python-afl>=0.7.3",
-    "hypothesis>=6.70.2",
+  "safetensors[numpy]",
+  "huggingface_hub>=1.4",
+  "setuptools_rust>=1.12.0",
+  "pytest>=9.0",
+  "pytest-benchmark>=5.2",
+  # "python-afl>=0.7.3",
+  "hypothesis>=6.70.2",
 ]
 all = [
-    "safetensors[torch]",
-    "safetensors[numpy]",
-    "safetensors[pinned-tf]",
-    "safetensors[jax]",
-    "safetensors[paddlepaddle]",
-    "safetensors[quality]",
-    "safetensors[testing]",
+  "safetensors[torch]",
+  "safetensors[numpy]",
+  "safetensors[pinned-tf]",
+  "safetensors[jax]",
+  "safetensors[paddlepaddle]",
+  "safetensors[quality]",
+  "safetensors[testing]",
 ]
-dev = [
-    "safetensors[all]",
-]
+dev = ["safetensors[all]"]
 
 
 [build-system]
@@ -107,7 +83,7 @@ features = ["pyo3/extension-module"]
 
 [tool.black]
 line-length = 119
-target-version = ['py35']
+target-version = ['py310']
 
 [tool.setuptools.dynamic]
-readme = {file = ["README.rst"]}
+readme = { file = ["README.rst"] }

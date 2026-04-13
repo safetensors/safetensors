@@ -12,15 +12,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         # Lowest and highest, no version specified so that
         # new releases get automatically tested against
-        version: [{torch: torch==1.10, python: "3.9", arch: "x64", numpy: numpy==1.26.4}, {torch: torch, python: "3.12", arch: "x64", numpy: numpy}]
-          # TODO this would include macos ARM target.
-          # however jax has an illegal instruction issue
-          # that exists only in CI (probably difference in instruction support).
-          # include:
-          #   - os: macos-latest
-          #     version:
-          #       torch: torch
-          #       python: "3.11"
+        version: [
+          {torch: torch==2.4, python: "3.10", arch: "x64", numpy: numpy==1.26.4},
+          {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
+        ]
         include:
           - os: ubuntu-latest
             version:
@@ -30,20 +25,20 @@ jobs:
               arch: "x64-freethreaded"
           - os: macos-15-intel
             version:
-              torch: torch==1.10
+              torch: torch
               numpy: "numpy==1.26"
-              python: "3.9"
+              python: "3.10"
               arch: "x64"
           - os: macos-latest
             version:
               torch: torch
-              python: "3.12"
+              python: "3.13"
               numpy: numpy
               arch: "arm64"
           - os: windows-11-arm
             version:
               torch: torch
-              python: "3.12"
+              python: "3.13"
               numpy: numpy
               arch: "arm64"
     defaults:
@@ -51,22 +46,22 @@ jobs:
         working-directory: ./bindings/python
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           components: rustfmt, clippy
 
       - name: Cargo install audit
         run: cargo install cargo-audit
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           workspaces: "bindings/python"
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: ${{ matrix.version.python }}
           architecture: ${{ matrix.version.arch }}
@@ -79,10 +74,6 @@ jobs:
 
       - name: Run Audit
         run: cargo audit -D warnings
-
-      # - name: Install
-      #   run: |
-      #     pip install -U pip
 
       - name: Install (torch)
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
@@ -114,6 +105,7 @@ jobs:
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
           pip install .[tensorflow]
+          # XXX: I assume this is still the case for 3.10
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
           pip install ${{ matrix.version.numpy }}
         shell: bash
@@ -165,11 +157,11 @@ jobs:
       packages: write
     name: Test bigendian - S390X
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - name: Can push to GHCR?
         id: canpush
         shell: bash
@@ -177,7 +169,7 @@ jobs:
           echo "value=${{ github.event.pull_request.head.repo.fork == false }}" >> "$GITHUB_OUTPUT"
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
           # list of Docker images to use as base name for tags
           images: |
@@ -193,13 +185,13 @@ jobs:
             type=sha
       - name: Login to Registry
         if: steps.canpush.outputs.value == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Test big endian
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           platforms: linux/s390x
           file: Dockerfile.s390x.test

@@ -1,4 +1,6 @@
 # Generated content DO NOT EDIT
+__version__: str
+
 @staticmethod
 def deserialize(bytes):
     """

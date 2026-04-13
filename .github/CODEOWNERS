@@ -1,0 +1,3 @@
+# CODEOWNERS file for safetensors repository
+# Global owners for all files
+* @danieldk @McPatate

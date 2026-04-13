@@ -13,3 +13,17 @@ Once you're done, someone will review your PR shortly (see the section "Who can 
 <!-- Remove if not applicable -->
 
 Fixes # (issue) or description of the problem this PR solves.
+
+## AI model use
+
+We do accept PRs that were developed together with an AI model, but we ask
+that you to fill out this section.
+
+- [ ] No AI model was used when making this PR.
+- [ ] An AI model assisted me in developing this PR.
+- [ ] Development of this PR was done by an AI model.
+
+If you ticked one of the last two options, please state the model and model
+version that you used:
+
+If you ticked the last option, please list the prompt(s) that you used:

@@ -2,7 +2,6 @@ import sys
 import unittest
 
 import torch
-from packaging.version import Version
 
 from safetensors import safe_open
 from safetensors.torch import load, load_file, save, save_file
@@ -103,7 +102,7 @@ class TorchTestCase(unittest.TestCase):
         )
 
     def test_odd_dtype_fp8(self):
-        if torch.__version__ < "2.1":
+        if not hasattr(torch, "float8"):
             return  # torch.float8 requires 2.1
 
         data = {
@@ -141,7 +140,7 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test2"].item(), 0.5)
 
     def test_odd_dtype_fp4(self):
-        if Version(torch.__version__) < Version("2.8"):
+        if not hasattr(torch, "float4"):
             return  # torch.float4 requires 2.8
 
         test1 = torch.tensor([0.0], dtype=torch.float8_e8m0fnu)

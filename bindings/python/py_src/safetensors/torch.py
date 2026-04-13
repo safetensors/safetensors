@@ -2,7 +2,6 @@ import os
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from packaging.version import Version
 
 import torch
 from safetensors import (
@@ -406,7 +405,8 @@ _SIZE = {
     _float8_e8m0: 1,
     _float4_e2m1_x2: 1,
 }
-if Version(torch.__version__) >= Version("2.3.0"):
+
+if hasattr(torch, "uint64"):  # Torch 2.3.0+
     _SIZE.update(
         {
             torch.uint64: 8,
@@ -432,7 +432,8 @@ _TYPES = {
     "F8_E5M2FNUZ": _float8_e5m2fnuz,
     "C64": torch.complex64,
 }
-if Version(torch.__version__) >= Version("2.3.0"):
+
+if hasattr(torch, "uint64"):  # Torch 2.3.0+
     _TYPES.update(
         {
             "U64": torch.uint64,
