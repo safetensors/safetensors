@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776103648983,
+  "lastUpdate": 1776125214776,
   "repoUrl": "https://github.com/huggingface/safetensors",
   "entries": {
     "Benchmark": [
@@ -39744,6 +39744,103 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.006523177822372795",
             "extra": "mean: 230.04964619998418 msec\nrounds: 5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "huggingface",
+            "username": "huggingface"
+          },
+          "committer": {
+            "name": "huggingface",
+            "username": "huggingface"
+          },
+          "id": "4f7397302f7465e132fa8a3e6ab7d896b976e056",
+          "message": "Bump pillow from 12.1.1 to 12.2.0 in /bindings/python",
+          "timestamp": "2026-04-13T18:05:13Z",
+          "url": "https://github.com/huggingface/safetensors/pull/737/commits/4f7397302f7465e132fa8a3e6ab7d896b976e056"
+        },
+        "date": 1776125212507,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "benches/test_flax.py::test_flax_flax_load",
+            "value": 1.92842331651451,
+            "unit": "iter/sec",
+            "range": "stddev: 0.005328427520277234",
+            "extra": "mean: 518.558343199993 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_flax.py::test_flax_sf_load",
+            "value": 5.690192981984212,
+            "unit": "iter/sec",
+            "range": "stddev: 0.002824073786868196",
+            "extra": "mean: 175.74096400001054 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_paddle_load",
+            "value": 4.088984025481452,
+            "unit": "iter/sec",
+            "range": "stddev: 0.002172329720510681",
+            "extra": "mean: 244.5595271999764 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_sf_load",
+            "value": 4.13722859583846,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0024133908061108283",
+            "extra": "mean: 241.70769800002745 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu",
+            "value": 6.039768754690463,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0104950615313749",
+            "extra": "mean: 165.56925283329824 msec\nrounds: 6"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu",
+            "value": 321.28684165941195,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00003211578816376036",
+            "extra": "mean: 3.1124835204426913 msec\nrounds: 269"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu_small",
+            "value": 14.138091761253243,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0006550444967785014",
+            "extra": "mean: 70.73090321429325 msec\nrounds: 14"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small",
+            "value": 57.707518855258606,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00008720654149359845",
+            "extra": "mean: 17.328764428569343 msec\nrounds: 56"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_save_cpu",
+            "value": 6.206607450517226,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0025009069108796202",
+            "extra": "mean: 161.11861560000307 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_tf_load",
+            "value": 3.1235163297430786,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0010878753402567833",
+            "extra": "mean: 320.15200000003006 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_sf_load",
+            "value": 3.2273629212987593,
+            "unit": "iter/sec",
+            "range": "stddev: 0.03493242809265549",
+            "extra": "mean: 309.85049539999636 msec\nrounds: 5"
           }
         ]
       }
