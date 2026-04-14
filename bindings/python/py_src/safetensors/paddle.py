@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import paddle
 
-from safetensors import numpy, deserialize, safe_open, serialize, serialize_file
+from safetensors import TensorSpec, numpy, deserialize, safe_open, serialize, serialize_file
 
 
 def save(
@@ -290,10 +290,10 @@ def _flatten(
     for k, v in tensors.items():
         arr, tensor_ref = _to_ndarray(v, k)
         keep_alive_buffer.append((arr, tensor_ref))
-        flattened[k] = {
-            "dtype": str(v.dtype).split(".")[-1],
-            "shape": v.shape,
-            "data_ptr": arr.ctypes.data,
-            "data_len": arr.nbytes,
-        }
+        flattened[k] = TensorSpec(
+            dtype=str(v.dtype).split(".")[-1],
+            shape=v.shape,
+            data_ptr=arr.ctypes.data,
+            data_len=arr.nbytes,
+        )
     return flattened

@@ -2,7 +2,7 @@ import unittest
 from concurrent import futures
 import threading
 import numpy as np
-from safetensors import serialize_file
+from safetensors import TensorSpec, serialize_file
 from safetensors.numpy import load_file
 import time
 import os
@@ -18,18 +18,18 @@ class TestCase(unittest.TestCase):
 
         # Build the tensor dict with data pointers (as serialize_file expects)
         tensor_data = {
-            "tensor_a": {
-                "dtype": tensor_a.dtype.name,
-                "shape": tensor_a.shape,
-                "data_ptr": tensor_a.ctypes.data,
-                "data_len": tensor_a.nbytes,
-            },
-            "tensor_b": {
-                "dtype": tensor_b.dtype.name,
-                "shape": tensor_b.shape,
-                "data_ptr": tensor_b.ctypes.data,
-                "data_len": tensor_b.nbytes,
-            },
+            "tensor_a": TensorSpec(
+                dtype=tensor_a.dtype.name,
+                shape=tensor_a.shape,
+                data_ptr=tensor_a.ctypes.data,
+                data_len=tensor_a.nbytes,
+            ),
+            "tensor_b": TensorSpec(
+                dtype=tensor_b.dtype.name,
+                shape=tensor_b.shape,
+                data_ptr=tensor_b.ctypes.data,
+                data_len=tensor_b.nbytes,
+            ),
         }
 
         num_threads = 4

@@ -27,18 +27,92 @@ static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static MLX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
-struct TensorDataPointer {
-    addr: u64,
-    len: usize,
-}
-
-struct TensorRawDataView {
-    shape: Vec<usize>,
+/// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
+///
+/// Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
+/// The dtype string is validated at construction; an unknown dtype raises
+/// immediately rather than failing further inside the serializer.
+///
+/// `shape` is the logical (header) shape — the number of elements along each
+/// axis as recorded in the safetensors header. For packed dtypes like
+/// `float4_e2m1fn_x2` (two F4 values per byte), callers may pass the storage
+/// shape reported by their framework (e.g. `torch.Size`); the constructor
+/// transparently doubles the last dimension so `spec.shape` always reflects
+/// the logical element count.
+///
+/// SAFETY: `data_ptr` is a raw memory address. The caller must ensure the
+/// underlying buffer stays alive for the duration of every `serialize` /
+/// `serialize_file` call that consumes this spec.
+#[pyclass(frozen)]
+#[derive(Clone, Debug)]
+struct TensorSpec {
     dtype: Dtype,
-    tensor_data_ptr: TensorDataPointer,
+    shape: Vec<usize>,
+    data_ptr: u64,
+    data_len: usize,
 }
 
-impl View for &TensorRawDataView {
+#[pymethods]
+impl TensorSpec {
+    #[new]
+    #[pyo3(signature = (dtype, shape, data_ptr, data_len))]
+    fn new(dtype: &str, shape: Vec<usize>, data_ptr: u64, data_len: usize) -> PyResult<Self> {
+        let dtype = parse_dtype_str(dtype)?;
+        let mut shape = shape;
+        // F4 packs two elements per byte; the safetensors header records the
+        // logical element count, so double the last dim.
+        if dtype == Dtype::F4 && !shape.is_empty() {
+            let n = shape.len();
+            shape[n - 1] *= 2;
+        }
+        Ok(Self {
+            dtype,
+            shape,
+            data_ptr,
+            data_len,
+        })
+    }
+
+    /// The tensor's dtype as its safetensors format code (e.g. `"F32"`, `"BF16"`,
+    /// `"F8_E5M2FNUZ"`). This is the identifier written into the safetensors
+    /// header, not the Python constructor-style name (`"float32"` etc.).
+    #[getter]
+    fn dtype(&self) -> String {
+        format!("{}", self.dtype)
+    }
+
+    /// The tensor's logical shape — the element-count shape recorded in the
+    /// safetensors header. For packed dtypes like `float4_e2m1fn_x2`, this is
+    /// the last-dim-doubled version of whatever was passed to the constructor.
+    #[getter]
+    fn shape(&self) -> Vec<usize> {
+        self.shape.clone()
+    }
+
+    /// The raw memory address of the tensor's contiguous buffer.
+    #[getter]
+    fn data_ptr(&self) -> u64 {
+        self.data_ptr
+    }
+
+    /// The length of the tensor's buffer in bytes.
+    #[getter]
+    fn data_len(&self) -> usize {
+        self.data_len
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorSpec(dtype='{}', shape={:?}, data_ptr={}, data_len={})",
+            self.dtype(),
+            self.shape,
+            self.data_ptr,
+            self.data_len
+        )
+    }
+}
+
+impl View for &TensorSpec {
     fn dtype(&self) -> Dtype {
         self.dtype
     }
@@ -48,31 +122,21 @@ impl View for &TensorRawDataView {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        let p = self.tensor_data_ptr.addr as *const u8;
+        let p = self.data_ptr as *const u8;
+        // SAFETY: validated by the caller; see the struct-level safety note.
         unsafe {
-            let slice = slice::from_raw_parts(p, self.tensor_data_ptr.len);
+            let slice = slice::from_raw_parts(p, self.data_len);
             Cow::Borrowed(slice)
         }
     }
 
     fn data_len(&self) -> usize {
-        self.tensor_data_ptr.len
+        self.data_len
     }
 }
 
-fn prepare_shape(tensor_desc: &PyBound<PyDict>) -> PyResult<Vec<usize>> {
-    tensor_desc
-        .get_item("shape")?
-        .ok_or_else(|| SafetensorError::new_err(format!("Missing `shape` in {tensor_desc}")))?
-        .extract()
-}
-
-fn prepare_dtype(tensor_desc: &PyBound<PyDict>) -> PyResult<Dtype> {
-    let pydtype = tensor_desc
-        .get_item("dtype")?
-        .ok_or_else(|| SafetensorError::new_err(format!("Missing `dtype` in {tensor_desc}")))?;
-    let dtype: String = pydtype.extract()?;
-    let dtype = match dtype.as_ref() {
+fn parse_dtype_str(dtype: &str) -> PyResult<Dtype> {
+    Ok(match dtype {
         "bool" => Dtype::BOOL,
         "int8" => Dtype::I8,
         "uint8" => Dtype::U8,
@@ -93,65 +157,30 @@ fn prepare_dtype(tensor_desc: &PyBound<PyDict>) -> PyResult<Dtype> {
         "float8_e8m0fnu" => Dtype::F8_E8M0,
         "float4_e2m1fn_x2" => Dtype::F4,
         "complex64" => Dtype::C64,
-        dtype_str => {
+        other => {
             return Err(SafetensorError::new_err(format!(
-                "dtype {dtype_str} is not covered",
+                "Unknown dtype {other:?}. Supported dtypes: bool, int8, uint8, int16, uint16, \
+                 int32, uint32, int64, uint64, float16, float32, float64, bfloat16, \
+                 float8_e4m3fn, float8_e4m3fnuz, float8_e5m2, float8_e5m2fnuz, float8_e8m0fnu, \
+                 float4_e2m1fn_x2, complex64",
             )));
         }
-    };
-    Ok(dtype)
-}
-
-fn prepare_tensor_raw_data_view(
-    tensor_dict: HashMap<String, PyBound<PyDict>>,
-) -> PyResult<HashMap<String, TensorRawDataView>> {
-    let mut tensors = HashMap::with_capacity(tensor_dict.len());
-    for (tensor_name, tensor_desc) in tensor_dict {
-        let data_ptr: u64 = tensor_desc
-            .get_item("data_ptr")?
-            .ok_or_else(|| {
-                SafetensorError::new_err(format!("Missing `data_ptr` in {tensor_desc}"))
-            })?
-            .extract()?;
-        let data_len: usize = tensor_desc
-            .get_item("data_len")?
-            .ok_or_else(|| {
-                SafetensorError::new_err(format!("Missing `data_len` in {tensor_desc}"))
-            })?
-            .extract()?;
-        let dtype = prepare_dtype(&tensor_desc)?;
-        let mut shape = prepare_shape(&tensor_desc)?;
-        if dtype == Dtype::F4 {
-            let n = shape.len();
-            shape[n - 1] *= 2;
-        }
-        let tensor_data_ptr = TensorDataPointer {
-            addr: data_ptr,
-            len: data_len,
-        };
-        let tensor = TensorRawDataView {
-            shape,
-            dtype,
-            tensor_data_ptr,
-        };
-        tensors.insert(tensor_name, tensor);
-    }
-    Ok(tensors)
+    })
 }
 
 /// Serializes raw data.
 ///
-/// NOTE: the caller is required to ensure any pointer passed via `data_ptr` is valid and will live
-/// long enough for the duration of the serialization.
+/// NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
+/// and stays alive for the duration of the serialization.
 /// We will remove the need for the caller to hold references themselves when we drop support for
 /// python versions prior to 3.11 where the `PyBuffer` API is available.
 /// Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
 /// increasing its ref count preventing the gc from collecting it while we serialize.
 ///
 /// Args:
-///     tensor_dict (`Dict[str, Dict[Any]]`):
-///         The tensor dict is like:
-///             {"tensor_name": {"dtype": "F32", "shape": [2, 3], "data_ptr": 1234, "data_len": 24}}
+///     tensor_dict (`Dict[str, TensorSpec]`):
+///         Mapping of tensor name to its `TensorSpec`, e.g.:
+///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
 ///     metadata (`Dict[str, str]`, *optional*):
 ///         The optional purely text annotations
 ///
@@ -162,12 +191,16 @@ fn prepare_tensor_raw_data_view(
 #[pyo3(signature = (tensor_dict, metadata=None))]
 fn serialize<'b>(
     py: Python<'b>,
-    tensor_dict: HashMap<String, PyBound<PyDict>>,
+    tensor_dict: HashMap<String, Py<TensorSpec>>,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<PyBound<'b, PyBytes>> {
-    let tensors = prepare_tensor_raw_data_view(tensor_dict)?;
     let out = py
-        .allow_threads(|| safetensors::tensor::serialize(&tensors, metadata))
+        .allow_threads(|| {
+            safetensors::tensor::serialize(
+                tensor_dict.iter().map(|(k, v)| (k.as_str(), v.get())),
+                metadata,
+            )
+        })
         .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))?;
     let pybytes = PyBytes::new(py, &out);
     Ok(pybytes)
@@ -175,17 +208,17 @@ fn serialize<'b>(
 
 /// Serializes raw data into file.
 ///
-/// NOTE: the caller is required to ensure any pointer passed via `data_ptr` is valid and will live
-/// long enough for the duration of the serialization.
+/// NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
+/// and stays alive for the duration of the serialization.
 /// We will remove the need for the caller to hold references themselves when we drop support for
 /// python versions prior to 3.11 where the `PyBuffer` API is available.
 /// Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
 /// increasing its ref count preventing the gc from collecting it while we serialize.
 ///
 /// Args:
-///     tensor_dict (`Dict[str, Dict[Any]]`):
-///         The tensor dict is like:
-///             {"tensor_name": {"dtype": "F32", "shape": [2, 3], "data_ptr": 1234, "data_len": 24}}
+///     tensor_dict (`Dict[str, TensorSpec]`):
+///         Mapping of tensor name to its `TensorSpec`, e.g.:
+///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
 ///     filename (`str`, or `os.PathLike`):
 ///         The name of the file to write into.
 ///     metadata (`Dict[str, str]`, *optional*):
@@ -198,14 +231,17 @@ fn serialize<'b>(
 #[pyo3(signature = (tensor_dict, filename, metadata=None))]
 fn serialize_file(
     py: Python<'_>,
-    tensor_dict: HashMap<String, PyBound<PyDict>>,
+    tensor_dict: HashMap<String, Py<TensorSpec>>,
     filename: PathBuf,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
-    let tensors = prepare_tensor_raw_data_view(tensor_dict)?;
     py.allow_threads(|| {
-        safetensors::tensor::serialize_to_file(&tensors, metadata, filename.as_path())
-            .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
+        safetensors::tensor::serialize_to_file(
+            tensor_dict.iter().map(|(k, v)| (k.as_str(), v.get())),
+            metadata,
+            filename.as_path(),
+        )
+        .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
     })?;
 
     Ok(())
@@ -1665,6 +1701,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    m.add_class::<TensorSpec>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;

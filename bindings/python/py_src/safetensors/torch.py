@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from safetensors import (
+    TensorSpec,
     deserialize,
     safe_open,
     serialize,
@@ -572,10 +573,10 @@ def _flatten_as_ptr(
             )
         arr, tensor_ref = _to_ndarray(v)
         keep_alive_buffer.append((arr, tensor_ref))
-        flattened[k] = {
-            "dtype": str(v.dtype).split(".")[-1],
-            "shape": v.shape,
-            "data_ptr": arr.ctypes.data,
-            "data_len": arr.nbytes,
-        }
+        flattened[k] = TensorSpec(
+            dtype=str(v.dtype).split(".")[-1],
+            shape=v.shape,
+            data_ptr=arr.ctypes.data,
+            data_len=arr.nbytes,
+        )
     return flattened

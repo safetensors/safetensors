@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from safetensors import deserialize, safe_open, serialize, serialize_file
+from safetensors import TensorSpec, deserialize, safe_open, serialize, serialize_file
 
 
 def _flatten(
@@ -16,12 +16,12 @@ def _flatten(
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
             keep_alive_buffer.append(tensor)
-        flattened[k] = {
-            "dtype": tensor.dtype.name,
-            "shape": tensor.shape,
-            "data_ptr": tensor.ctypes.data,
-            "data_len": tensor.nbytes,
-        }
+        flattened[k] = TensorSpec(
+            dtype=tensor.dtype.name,
+            shape=tensor.shape,
+            data_ptr=tensor.ctypes.data,
+            data_len=tensor.nbytes,
+        )
     return flattened
 
 
