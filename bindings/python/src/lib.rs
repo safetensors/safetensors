@@ -55,7 +55,7 @@ struct TensorSpec {
 #[pymethods]
 impl TensorSpec {
     #[new]
-    #[pyo3(signature = (dtype, shape, data_ptr, data_len))]
+    #[pyo3(signature = (*, dtype, shape, data_ptr, data_len))]
     fn new(dtype: &str, shape: Vec<usize>, data_ptr: u64, data_len: usize) -> PyResult<Self> {
         let dtype = parse_dtype_str(dtype)?;
         let mut shape = shape;

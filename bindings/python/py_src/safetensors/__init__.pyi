@@ -5,10 +5,10 @@
 #   - `__version__: str`
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
 #
-# TODO: once we upgrade pyo3 to >= 0.28 (assuming `experimental-inspect`,
-# replace `stub.py` with a dedicated `tools/stub-gen` binary using
-# `pyo3-introspection`, mirroring how `huggingface/tokenizers` does it (see
-# #1928). That generator emits typed stubs directly from Rust
+# TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
+# `tools/stub-gen` binary using `pyo3-introspection`,
+# mirroring how `huggingface/tokenizers` does it (see PR #1928).
+# That generator emits typed stubs directly from Rust
 # signatures — no hand-editing, no drift.
 import os
 from typing import Dict, List, Optional, Sequence, Union
@@ -96,7 +96,7 @@ class TensorSpec:
 
     Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
     The dtype string is validated at construction; an unknown dtype raises
-    immediately rather than failing deep inside the serializer.
+    immediately rather than failing further inside the serializer.
 
     `shape` is the logical (header) shape — the number of elements along each
     axis as recorded in the safetensors header. For packed dtypes like

@@ -5,7 +5,14 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import paddle
 
-from safetensors import TensorSpec, numpy, deserialize, safe_open, serialize, serialize_file
+from safetensors import (
+    TensorSpec,
+    numpy,
+    deserialize,
+    safe_open,
+    serialize,
+    serialize_file,
+)
 
 
 def save(

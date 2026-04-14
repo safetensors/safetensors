@@ -246,7 +246,16 @@ class ReadmeTestCase(unittest.TestCase):
 
         # Raw dicts are no longer accepted by `serialize` (API moved to TensorSpec in 0.8.0).
         with self.assertRaises(TypeError):
-            serialize({"test": {"dtype": "float32", "shape": [1], "data_ptr": 0, "data_len": 0}})
+            serialize(
+                {
+                    "test": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_ptr": 0,
+                        "data_len": 0,
+                    }
+                }
+            )
 
     def test_torch_slice(self):
         A = torch.randn((10, 5))
