@@ -1,6 +1,6 @@
 [package]
 name = "safetensors"
-version = "0.8.0-dev.0"
+version = "0.8.0-rc.0"
 edition = "2021"
 rust-version = "1.80"
 homepage = "https://github.com/huggingface/safetensors"
