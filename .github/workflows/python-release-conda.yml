@@ -14,7 +14,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout repository
@@ -65,10 +65,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [39, 310, 311, 312, 313]
+        python: [310, 311, 312, 313]
         include:
-          - python: 39
-            checksum: d8d13344b46a057659397b9ca1a948d184bf59f04efa8864df8c01f7557e2baa
           - python: 310
             checksum: 04a8b03d8b0ec062d923e592201a6fd88b7247c309ef8848afb25c424c40ac39
           - python: 311
