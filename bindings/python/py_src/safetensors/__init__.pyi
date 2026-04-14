@@ -111,6 +111,7 @@ class TensorSpec:
     """
     def __init__(
         self,
+        *,
         dtype: str,
         shape: Sequence[int],
         data_ptr: int,
