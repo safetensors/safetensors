@@ -4,13 +4,14 @@ This document covers the full release process for the safetensors project. If an
 
 ## What gets released
 
-A single tag push triggers three releases:
+A single tag push triggers two releases:
 
 - **Rust core crate** on [crates.io](https://crates.io/crates/safetensors), via `.github/workflows/rust-release.yml`
 - **Python wheels + sdist** on [PyPI](https://pypi.org/project/safetensors), via `.github/workflows/python-release.yml` (with build-provenance attestations)
-- **Conda packages** for Python 3.9–3.13, via `.github/workflows/python-release-conda.yml`
 
-All three workflows trigger on tags matching `v*` (e.g. `v0.8.0`, `v0.8.0-rc.0`).
+Both workflows trigger on tags matching `v*` (e.g. `v0.8.0`, `v0.8.0-rc.0`).
+
+Conda packages are published separately via the [conda-forge/safetensors-feedstock](https://github.com/conda-forge/safetensors-feedstock), which picks up new PyPI releases automatically. No action is required from us.
 
 The Rust crate and the Python binding share a version number. They could be versioned independently, but in practice they've always moved together.
 
@@ -119,11 +120,10 @@ Click **Publish release**. This creates the tag, which triggers the three releas
 
 ### 5. Monitor the CI
 
-The tag triggers three workflow runs in the [Actions tab](https://github.com/huggingface/safetensors/actions):
+The tag triggers two workflow runs in the [Actions tab](https://github.com/huggingface/safetensors/actions):
 
 - **CI** (Python release) — builds wheels for every platform × Python version, uploads to PyPI. Can take up to over 30 minutes.
 - **Rust Release** — `cargo publish` to crates.io. A few seconds to minutes.
-- **Conda release** — conda packages for Python 3.9–3.13. 10–20 minutes.
 
 The Python release uses `--skip-existing`, so re-running a partially failed workflow is safe. If `main` was green, the release builds should be too.
 
@@ -202,5 +202,5 @@ If you're modifying the release workflows:
 
 - **PyPI upload failed mid-matrix.** `--skip-existing` makes re-runs safe. Re-run from the Actions UI.
 - **`cargo publish` says "already published".** You can't re-publish the same version. Bump to the next patch or pre-release and tag again.
-- **Conda not showing up.** Check [conda-forge/safetensors-feedstock](https://github.com/conda-forge/safetensors-feedstock) — it sometimes needs a separate feedstock PR.
+- **Conda package not updated.** Conda packages are published via [conda-forge/safetensors-feedstock](https://github.com/conda-forge/safetensors-feedstock), which tracks PyPI. The feedstock's bot usually opens an auto-update PR within a day of the PyPI release; if it hasn't, ping the feedstock maintainers or open the PR yourself.
 - **Workflow didn't trigger.** Verify the tag was pushed and that the name matches `v*`.
