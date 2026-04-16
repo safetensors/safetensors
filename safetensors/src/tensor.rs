@@ -13,6 +13,7 @@ const N_LEN: usize = size_of::<u64>();
 /// Possible errors that could occur while reading
 /// A Safetensor file.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SafeTensorError {
     /// The header is an invalid UTF-8 string and cannot be read.
     InvalidHeader(Utf8Error),
@@ -48,7 +49,7 @@ pub enum SafeTensorError {
     /// and standard functions will fail
     MisalignedSlice,
     /// A tensor name contains a null byte (`\0`), which could be used to
-    /// bypass C-string-based security scanners (CVE / Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155).
+    /// bypass C-string-based security scanners (Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155).
     InvalidTensorName(String),
     /// A `__metadata__` key or value contains a null byte (`\0`), enabling
     /// the same C-scanner bypass as InvalidTensorName but via the metadata map.

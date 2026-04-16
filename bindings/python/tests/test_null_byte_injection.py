@@ -2,27 +2,10 @@
 Regression tests for Null-Byte Injection Vulnerability
 =======================================================
 Issue: #748 / Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155
-
-An attacker can embed a hidden tensor whose name contains a null byte
-(e.g. "weights\\x00.hidden").  Python's json library and Rust's serde_json
-both treat \\x00 as valid string content, but C-string-based security
-scanners truncate at \\x00 – making the hidden portion invisible to them
-while it still executes at the Python / Rust runtime level.
-
-The same attack can be mounted via the __metadata__ dictionary: even if
-tensor names are validated, embedding \\x00 in a metadata key or value
-can confuse downstream C-string consumers that inspect that field.
-
-The Rust fix in safetensors/src/tensor.rs now rejects any tensor name
-containing \\x00 in both the serialisation (write) and deserialisation
-(read) paths, returning an InvalidTensorName error.  __metadata__
-keys/values are similarly rejected with InvalidMetadata.
-
-These tests verify that the rejection is correctly surfaced to Python
-callers as a SafetensorError.
 """
 
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -49,10 +32,10 @@ class NullByteInTensorNameTestCase(unittest.TestCase):
     def test_save_file_rejects_null_byte_in_tensor_name(self):
         """save_file() must raise SafetensorError for names containing \\x00."""
         data = np.array([1.0, 2.0], dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-            tmp_path = f.name
-        with self.assertRaises(SafetensorError):
-            save_file({"weights\x00.hidden": data}, tmp_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.safetensors")
+            with self.assertRaises(SafetensorError):
+                save_file({"weights\x00.hidden": data}, path)
 
     def test_save_rejects_null_byte_only_name(self):
         data = np.zeros((2,), dtype=np.int32)
@@ -112,20 +95,20 @@ class NullByteInTensorNameTestCase(unittest.TestCase):
 
 class NullByteInMetadataTestCase(unittest.TestCase):
     """
-    Phase 2 addition: verify __metadata__ key/value null-byte bypass is blocked.
+    Verify __metadata__ key/value null-byte bypass is blocked.
     """
 
     # ------------------------------------------------------------------
-    # Serialisation path – metadata with null byte in KEY
+    # Serialisation path – metadata with null byte in KEY / VALUE
     # ------------------------------------------------------------------
 
     def test_save_file_rejects_null_byte_in_metadata_key(self):
         """save_file() must raise when a __metadata__ key contains \\x00."""
         data = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-            tmp_path = f.name
-        with self.assertRaises(SafetensorError) as ctx:
-            save_file({"a": data}, tmp_path, metadata={"frame\x00work": "pt"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.safetensors")
+            with self.assertRaises(SafetensorError) as ctx:
+                save_file({"a": data}, path, metadata={"frame\x00work": "pt"})
         err = str(ctx.exception).lower()
         self.assertTrue(
             "null byte" in err or "invalid" in err,
@@ -135,10 +118,10 @@ class NullByteInMetadataTestCase(unittest.TestCase):
     def test_save_file_rejects_null_byte_in_metadata_value(self):
         """save_file() must raise when a __metadata__ value contains \\x00."""
         data = np.array([1.0], dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-            tmp_path = f.name
-        with self.assertRaises(SafetensorError) as ctx:
-            save_file({"a": data}, tmp_path, metadata={"framework": "pt\x00injected"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.safetensors")
+            with self.assertRaises(SafetensorError) as ctx:
+                save_file({"a": data}, path, metadata={"framework": "pt\x00injected"})
         err = str(ctx.exception).lower()
         self.assertTrue(
             "null byte" in err or "invalid" in err,
@@ -148,12 +131,12 @@ class NullByteInMetadataTestCase(unittest.TestCase):
     def test_save_accepts_clean_metadata(self):
         """Sanity-check: clean metadata must continue to work."""
         data = np.array([1.0], dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-            tmp_path = f.name
-        try:
-            save_file({"a": data}, tmp_path, metadata={"framework": "pt"})
-        except SafetensorError as e:
-            self.fail(f"save_file() raised unexpectedly with clean metadata: {e}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.safetensors")
+            try:
+                save_file({"a": data}, path, metadata={"framework": "pt"})
+            except SafetensorError as e:
+                self.fail(f"save_file() raised unexpectedly with clean metadata: {e}")
 
     # ------------------------------------------------------------------
     # Deserialisation path – crafted buffer with null in __metadata__
@@ -162,7 +145,7 @@ class NullByteInMetadataTestCase(unittest.TestCase):
     def _craft_safetensors_with_null_metadata_key(self) -> bytes:
         """
         Build a raw safetensors buffer whose __metadata__ dict contains a
-        null byte in a key.  Python json serialises \x00 as \\u0000 in JSON,
+        null byte in a key.  Python json serialises \\x00 as \\u0000 in JSON,
         which serde_json accepts, so only the explicit Rust guard blocks this.
         """
         header_dict = {
