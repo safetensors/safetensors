@@ -63,7 +63,12 @@ impl TensorSpec {
         // logical element count, so double the last dim.
         if dtype == Dtype::F4 && !shape.is_empty() {
             let n = shape.len();
-            shape[n - 1] *= 2;
+            shape[n - 1] = shape[n - 1].checked_mul(2).ok_or_else(|| {
+                SafetensorError::new_err(format!(
+                    "F4 last-dim {} doubled to logical shape overflows usize",
+                    shape[n - 1]
+                ))
+            })?;
         }
         Ok(Self {
             dtype,

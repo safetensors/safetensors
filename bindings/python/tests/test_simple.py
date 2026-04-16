@@ -257,6 +257,19 @@ class ReadmeTestCase(unittest.TestCase):
                 }
             )
 
+    def test_f4_shape_last_dim_overflow(self):
+        # The F4 branch doubles the last shape dim (storage -> logical). If the
+        # last dim > usize::MAX / 2, the multiplication must error rather than
+        # wrap silently (release) or panic (debug).
+        huge = 2**63 + 1
+        with self.assertRaises(SafetensorError):
+            TensorSpec(
+                dtype="float4_e2m1fn_x2",
+                shape=[huge],
+                data_ptr=0,
+                data_len=1,
+            )
+
     def test_torch_slice(self):
         A = torch.randn((10, 5))
         tensors = {
