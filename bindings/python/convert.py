@@ -181,7 +181,7 @@ def convert_multi(
     local_filenames.append(index)
 
     operations = [
-        CommitOperationAdd(path_in_repo=os.path.basename(local), path_or_fileobj=local)
+        CommitOperationAdd(path_in_repo=local.split("/")[-1], path_or_fileobj=local)
         for local in local_filenames
     ]
     errors: List[Tuple[str, "Exception"]] = []
@@ -218,7 +218,7 @@ def convert_file(
     sf_filename: str,
     discard_names: List[str],
 ):
-    loaded = torch.load(pt_filename, map_location="cpu")
+    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
     if "state_dict" in loaded:
         loaded = loaded["state_dict"]
     to_removes = _remove_duplicate_names(loaded, discard_names=discard_names)
@@ -292,6 +292,7 @@ def convert_generic(
     folder: str,
     filenames: Set[str],
     token: Optional[str],
+    discard_names: List[str],
 ) -> ConversionResult:
     operations = []
     errors = []
@@ -316,7 +317,7 @@ def convert_generic(
                 sf_in_repo = f"{prefix}.safetensors"
             sf_filename = os.path.join(folder, sf_in_repo)
             try:
-                convert_file(pt_filename, sf_filename, discard_names=[])
+                convert_file(pt_filename, sf_filename, discard_names=discard_names)
                 operations.append(
                     CommitOperationAdd(
                         path_in_repo=sf_in_repo, path_or_fileobj=sf_filename
@@ -338,11 +339,15 @@ def convert(
         folder = os.path.join(d, repo_folder_name(repo_id=model_id, repo_type="models"))
         os.makedirs(folder)
         new_pr = None
+        # Exception handling already happen inside this function
+        discard_names = get_discard_names(
+            model_id, revision=revision, folder=folder, token=api.token
+        )
         try:
             operations = None
             pr = previous_pr(api, model_id, pr_title, revision=revision)
-
             library_name = getattr(info, "library_name", None)
+
             if (
                 any(filename.endswith(".safetensors") for filename in filenames)
                 and not force
@@ -350,16 +355,13 @@ def convert(
                 raise AlreadyExists(
                     f"Model {model_id} is already converted, skipping.."
                 )
-            elif pr is not None and not force:
+            elif (pr is not None and pr.author == "SFconvertbot") and not force:
                 url = f"https://huggingface.co/{model_id}/discussions/{pr.num}"
                 new_pr = pr
                 raise AlreadyExists(
                     f"Model {model_id} already has an open PR check out {url}"
                 )
             elif library_name == "transformers":
-                discard_names = get_discard_names(
-                    model_id, revision=revision, folder=folder, token=api.token
-                )
                 if "pytorch_model.bin" in filenames:
                     operations, errors = convert_single(
                         model_id,
@@ -387,9 +389,19 @@ def convert(
                     folder=folder,
                     filenames=filenames,
                     token=api.token,
+                    discard_names=discard_names,
                 )
 
             if operations:
+                # Checking that no PR have been created during the conversion in case of duplicate conversion requests.
+                pr = previous_pr(api, model_id, pr_title, revision=revision)
+                if pr is not None and not force:
+                    url = f"https://huggingface.co/{model_id}/discussions/{pr.num}"
+                    new_pr = pr
+                    raise AlreadyExists(
+                        f"Model {model_id} already has an open PR check out {url}"
+                    )
+
                 new_pr = api.create_commit(
                     repo_id=model_id,
                     revision=revision,
