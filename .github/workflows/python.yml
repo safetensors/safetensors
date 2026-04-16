@@ -152,9 +152,6 @@ jobs:
 
   test_s390x_big_endian:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
     name: Test bigendian - S390X
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -162,41 +159,11 @@ jobs:
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
-      - name: Can push to GHCR?
-        id: canpush
-        shell: bash
-        run: |
-          echo "value=${{ github.event.pull_request.head.repo.fork == false }}" >> "$GITHUB_OUTPUT"
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
-        with:
-          # list of Docker images to use as base name for tags
-          images: |
-            ghcr.io/huggingface/safetensors/s390x
-          # generate Docker tags based on the following events/attributes
-          tags: |
-            type=schedule
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
-      - name: Login to Registry
-        if: steps.canpush.outputs.value == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Test big endian
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           platforms: linux/s390x
           file: Dockerfile.s390x.test
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          push: ${{ steps.canpush.outputs.value == 'true' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: false
