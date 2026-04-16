@@ -47,6 +47,12 @@ pub enum SafeTensorError {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// A tensor name contains a null byte (`\0`), which could be used to
+    /// bypass C-string-based security scanners (CVE / Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155).
+    InvalidTensorName(String),
+    /// A `__metadata__` key or value contains a null byte (`\0`), enabling
+    /// the same C-scanner bypass as InvalidTensorName but via the metadata map.
+    InvalidMetadata(String),
 }
 
 #[cfg(feature = "std")]
@@ -87,7 +93,10 @@ impl Display for SafeTensorError {
             }
             MetadataIncompleteBuffer => write!(f, "incomplete metadata, file not fully covered"),
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
-            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
+            // escape_debug() sanitises invisible bytes/ANSI sequences – prevents log injection.
+            InvalidTensorName(name) => write!(f, "tensor name '{}' contains a null byte, which is not allowed", name.escape_debug()),
+            InvalidMetadata(key) => write!(f, "__metadata__ key/value '{}' contains a null byte, which is not allowed", key.escape_debug())
         }
     }
 }
@@ -236,6 +245,13 @@ where
     let mut offset = 0;
 
     for (name, tensor) in data {
+        // Null-byte injection guard: reject names that contain \0.
+        // serde_json / Python's json both treat \0 as valid string content,
+        // but C-string-based scanners truncate at \0, enabling hidden tensors.
+        // See: Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155
+        if name.as_ref().contains('\0') {
+            return Err(SafeTensorError::InvalidTensorName(name.to_string()));
+        }
         let n = tensor.data_len();
         let tensor_info = TensorInfo {
             dtype: tensor.dtype(),
@@ -597,6 +613,27 @@ impl Metadata {
         tensors: Vec<(String, TensorInfo)>,
     ) -> Result<Self, SafeTensorError> {
         let mut index_map = HashMap::with_capacity(tensors.len());
+
+        // Null-byte injection guard (tensor names): reject names containing \0.
+        // See: Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155
+        for (name, _) in &tensors {
+            if name.contains('\0') {
+                return Err(SafeTensorError::InvalidTensorName(name.clone()));
+            }
+        }
+
+        // Null-byte injection guard (__metadata__): reject any key or value
+        // in the optional metadata map that contains \0.  An attacker who
+        // cannot hide a tensor name can still embed \0 in metadata to confuse
+        // C-string-based scanners reading the metadata fields.
+        if let Some(ref meta) = metadata {
+            for (key, value) in meta {
+                if key.contains('\0') || value.contains('\0') {
+                    let bad = if key.contains('\0') { key } else { value };
+                    return Err(SafeTensorError::InvalidMetadata(bad.clone()));
+                }
+            }
+        }
 
         let tensors: Vec<_> = tensors
             .into_iter()
