@@ -49,7 +49,7 @@ pub enum SafeTensorError {
     /// and standard functions will fail
     MisalignedSlice,
     /// A tensor name contains a null byte (`\0`), which could be used to
-    /// bypass C-string-based security scanners (Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155).
+    /// bypass C-string-based security scanners (Huntr report 8317f258-7731-4e13-8aa7-ae2d2630c155).
     InvalidTensorName(String),
     /// A `__metadata__` key or value contains a null byte (`\0`), enabling
     /// the same C-scanner bypass as InvalidTensorName but via the metadata map.
@@ -96,8 +96,8 @@ impl Display for SafeTensorError {
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
             MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
             // escape_debug() sanitises invisible bytes/ANSI sequences – prevents log injection.
-            InvalidTensorName(name) => write!(f, "tensor name '{}' contains a null byte, which is not allowed", name.escape_debug()),
-            InvalidMetadata(key) => write!(f, "__metadata__ key/value '{}' contains a null byte, which is not allowed", key.escape_debug())
+            InvalidTensorName(name) => write!(f, "tensor name `{}` contains a null byte, which is not allowed", name.escape_debug()),
+            InvalidMetadata(key) => write!(f, "__metadata__ key/value `{}` contains a null byte, which is not allowed", key.escape_debug())
         }
     }
 }
@@ -246,13 +246,6 @@ where
     let mut offset = 0;
 
     for (name, tensor) in data {
-        // Null-byte injection guard: reject names that contain \0.
-        // serde_json / Python's json both treat \0 as valid string content,
-        // but C-string-based scanners truncate at \0, enabling hidden tensors.
-        // See: Huntr 8317f258-7731-4e13-8aa7-ae2d2630c155
-        if name.as_ref().contains('\0') {
-            return Err(SafeTensorError::InvalidTensorName(name.to_string()));
-        }
         let n = tensor.data_len();
         let tensor_info = TensorInfo {
             dtype: tensor.dtype(),

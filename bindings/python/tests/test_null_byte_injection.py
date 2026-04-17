@@ -33,9 +33,9 @@ class NullByteInTensorNameTestCase(unittest.TestCase):
         """save_file() must raise SafetensorError for names containing \\x00."""
         data = np.array([1.0, 2.0], dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.safetensors")
+            tmp_path = f"{tmpdir}/test.safetensors"
             with self.assertRaises(SafetensorError):
-                save_file({"weights\x00.hidden": data}, path)
+                save_file({"weights\x00.hidden": data}, tmp_path)
 
     def test_save_rejects_null_byte_only_name(self):
         data = np.zeros((2,), dtype=np.int32)
@@ -106,9 +106,9 @@ class NullByteInMetadataTestCase(unittest.TestCase):
         """save_file() must raise when a __metadata__ key contains \\x00."""
         data = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.safetensors")
+            tmp_path = f"{tmpdir}/test.safetensors"
             with self.assertRaises(SafetensorError) as ctx:
-                save_file({"a": data}, path, metadata={"frame\x00work": "pt"})
+                save_file({"a": data}, tmp_path, metadata={"frame\x00work": "pt"})
         err = str(ctx.exception).lower()
         self.assertTrue(
             "null byte" in err or "invalid" in err,
@@ -119,9 +119,9 @@ class NullByteInMetadataTestCase(unittest.TestCase):
         """save_file() must raise when a __metadata__ value contains \\x00."""
         data = np.array([1.0], dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.safetensors")
+            tmp_path = f"{tmpdir}/test.safetensors"
             with self.assertRaises(SafetensorError) as ctx:
-                save_file({"a": data}, path, metadata={"framework": "pt\x00injected"})
+                save_file({"a": data}, tmp_path, metadata={"framework": "pt\x00injected"})
         err = str(ctx.exception).lower()
         self.assertTrue(
             "null byte" in err or "invalid" in err,
@@ -132,9 +132,9 @@ class NullByteInMetadataTestCase(unittest.TestCase):
         """Sanity-check: clean metadata must continue to work."""
         data = np.array([1.0], dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.safetensors")
+            tmp_path = f"{tmpdir}/test.safetensors"
             try:
-                save_file({"a": data}, path, metadata={"framework": "pt"})
+                save_file({"a": data}, tmp_path, metadata={"framework": "pt"})
             except SafetensorError as e:
                 self.fail(f"save_file() raised unexpectedly with clean metadata: {e}")
 
