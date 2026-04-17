@@ -166,6 +166,22 @@ jobs:
         shell: bash
         run: |
           echo "value=${{ github.event.pull_request.head.repo.fork == false }}" >> "$GITHUB_OUTPUT"
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            ghcr.io/safetensors/safetensors/s390x
+          # generate Docker tags based on the following events/attributes
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
       - name: Login to Registry
         if: steps.canpush.outputs.value == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
@@ -178,6 +194,8 @@ jobs:
         with:
           platforms: linux/s390x
           file: Dockerfile.s390x.test
-          cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
+          cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
+          push: ${{ steps.canpush.outputs.value == 'true' }}
