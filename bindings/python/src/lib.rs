@@ -43,7 +43,7 @@ static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 /// SAFETY: `data_ptr` is a raw memory address. The caller must ensure the
 /// underlying buffer stays alive for the duration of every `serialize` /
 /// `serialize_file` call that consumes this spec.
-#[pyclass(frozen)]
+#[pyclass(frozen, from_py_object)]
 #[derive(Clone, Debug)]
 struct TensorSpec {
     dtype: Dtype,
