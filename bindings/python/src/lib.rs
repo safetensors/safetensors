@@ -260,6 +260,7 @@ fn serialize_file(
 /// b"\0\0.." }), (...)]
 #[pyfunction]
 #[pyo3(signature = (bytes))]
+#[allow(clippy::type_complexity)]
 fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String, Py<PyAny>>)>> {
     let safetensor = SafeTensors::deserialize(bytes)
         .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e}")))?;
