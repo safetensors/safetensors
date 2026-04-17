@@ -546,7 +546,7 @@ impl TryFrom<HashMetadata> for Metadata {
         // Previous versions might have a different ordering
         // Than we expect (Not aligned ordered, but purely name ordered,
         // or actually any order).
-        tensors.sort_by(|(_, left), (_, right)| left.data_offsets.cmp(&right.data_offsets));
+        tensors.sort_by_key(|(_, left)| left.data_offsets);
         Metadata::new(metadata, tensors)
     }
 }
