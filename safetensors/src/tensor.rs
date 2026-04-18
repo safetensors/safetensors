@@ -16,8 +16,6 @@ const N_LEN: usize = size_of::<u64>();
 pub enum SafeTensorError {
     /// The header is an invalid UTF-8 string and cannot be read.
     InvalidHeader(Utf8Error),
-    /// The header's first byte is not the expected `{`.
-    InvalidHeaderStart,
     /// The header does contain a valid string, but it is not valid JSON.
     InvalidHeaderDeserialization(serde_json::Error),
     /// The header is large than 100Mo which is considered too large (Might evolve in the future).
@@ -70,7 +68,6 @@ impl Display for SafeTensorError {
 
         match self {
             InvalidHeader(error) => write!(f, "invalid UTF-8 in header: {error}"),
-            InvalidHeaderStart => write!(f, "invalid start character in header, must be `{{`"),
             InvalidHeaderDeserialization(error) => write!(f, "invalid JSON in header: {error}"),
             JsonError(error) => write!(f, "JSON error: {error}"),
             HeaderTooLarge => write!(f, "header too large"),
@@ -408,11 +405,6 @@ impl<'data> SafeTensors<'data> {
             return Err(SafeTensorError::InvalidHeaderLength);
         };
         let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
-        // Assert the string starts with {
-        // NOTE: Add when we move to 0.4.0
-        // if !string.starts_with('{') {
-        //     return Err(SafeTensorError::InvalidHeaderStart);
-        // }
         let metadata: HashMetadata =
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
@@ -554,7 +546,7 @@ impl TryFrom<HashMetadata> for Metadata {
         // Previous versions might have a different ordering
         // Than we expect (Not aligned ordered, but purely name ordered,
         // or actually any order).
-        tensors.sort_by(|(_, left), (_, right)| left.data_offsets.cmp(&right.data_offsets));
+        tensors.sort_by_key(|(_, left)| left.data_offsets);
         Metadata::new(metadata, tensors)
     }
 }
@@ -832,6 +824,12 @@ pub enum Dtype {
     /// F8_E8M0 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
     #[allow(non_camel_case_types)]
     F8_E8M0,
+    /// FP8 E4M3 (FNUZ) <https://arxiv.org/pdf/2206.02915.pdf>_
+    #[allow(non_camel_case_types)]
+    F8_E4M3FNUZ,
+    /// FP8 E5M2 (FNUZ) <https://arxiv.org/pdf/2206.02915.pdf>_
+    #[allow(non_camel_case_types)]
+    F8_E5M2FNUZ,
     /// Signed integer (16-bit)
     I16,
     /// Unsigned integer (16-bit)
@@ -869,6 +867,8 @@ impl Dtype {
             Dtype::F8_E5M2 => 8,
             Dtype::F8_E4M3 => 8,
             Dtype::F8_E8M0 => 8,
+            Dtype::F8_E4M3FNUZ => 8,
+            Dtype::F8_E5M2FNUZ => 8,
             Dtype::I16 => 16,
             Dtype::U16 => 16,
             Dtype::I32 => 32,
@@ -904,6 +904,8 @@ impl Display for Dtype {
             Dtype::F8_E5M2 => "F8_E5M2",
             Dtype::F8_E4M3 => "F8_E4M3",
             Dtype::F8_E8M0 => "F8_E8M0",
+            Dtype::F8_E4M3FNUZ => "F8_E4M3FNUZ",
+            Dtype::F8_E5M2FNUZ => "F8_E5M2FNUZ",
             Dtype::I16 => "I16",
             Dtype::U16 => "U16",
             Dtype::I32 => "I32",
@@ -1477,18 +1479,15 @@ mod tests {
         assert_eq!(loaded.len(), 0);
     }
 
-    // Reserver for 0.4.0
-    // #[test]
-    // /// Test that the JSON header must begin with a `{` character.
-    // fn test_whitespace_start_padded_header_is_not_allowed() {
-    //     let serialized = b"\x06\x00\x00\x00\x00\x00\x00\x00\x09\x0A{}\x0D\x20";
-    //     match SafeTensors::deserialize(serialized) {
-    //         Err(SafeTensorError::InvalidHeaderStart) => {
-    //             // Correct error
-    //         }
-    //         _ => panic!("This should not be able to be deserialized"),
-    //     }
-    // }
+    #[test]
+    /// Test that the JSON header may be leading-padded with JSON whitespace characters.
+    /// This is intentional: writers may pad the header to align the data section to a
+    /// page boundary, so readers must tolerate leading whitespace.
+    fn test_whitespace_leading_padded_header() {
+        let serialized = b"\x06\x00\x00\x00\x00\x00\x00\x00\x09\x0A{}\x0D\x20";
+        let loaded = SafeTensors::deserialize(serialized).unwrap();
+        assert_eq!(loaded.len(), 0);
+    }
 
     #[test]
     fn test_zero_sized_tensor() {

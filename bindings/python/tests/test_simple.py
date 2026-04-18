@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from safetensors import SafetensorError, safe_open, serialize
+from safetensors import SafetensorError, TensorSpec, safe_open, serialize
 from safetensors.numpy import load, load_file, save, save_file
 from safetensors.torch import _find_shared_tensors
 from safetensors.torch import load_file as load_file_pt
@@ -240,10 +240,22 @@ class ReadmeTestCase(unittest.TestCase):
         self.assertTensorEqual(tensors2, loaded, torch.allclose)
 
     def test_exception(self):
-        flattened = {"test": {"dtype": "float32", "shape": [1]}}
-
+        # Unknown dtype is rejected by TensorSpec's constructor.
         with self.assertRaises(SafetensorError):
-            serialize(flattened)
+            TensorSpec(dtype="nonsense", shape=[1], data_ptr=0, data_len=0)
+
+        # Raw dicts are no longer accepted by `serialize` (API moved to TensorSpec in 0.8.0).
+        with self.assertRaises(TypeError):
+            serialize(
+                {
+                    "test": {
+                        "dtype": "float32",
+                        "shape": [1],
+                        "data_ptr": 0,
+                        "data_len": 0,
+                    }
+                }
+            )
 
     def test_torch_slice(self):
         A = torch.randn((10, 5))

@@ -153,7 +153,6 @@ jobs:
   test_s390x_big_endian:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
       packages: write
     name: Test bigendian - S390X
     steps:
@@ -173,7 +172,7 @@ jobs:
         with:
           # list of Docker images to use as base name for tags
           images: |
-            ghcr.io/huggingface/safetensors/s390x
+            ghcr.io/safetensors/safetensors/s390x
           # generate Docker tags based on the following events/attributes
           tags: |
             type=schedule
@@ -197,6 +196,6 @@ jobs:
           file: Dockerfile.s390x.test
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/huggingface/safetensors/s390x:cache,mode=max' || 'type=gha' }}
+          cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
+          cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
           push: ${{ steps.canpush.outputs.value == 'true' }}
