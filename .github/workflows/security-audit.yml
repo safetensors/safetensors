@@ -78,8 +78,10 @@ jobs:
 
           if grep -q "NO_FINDINGS" /tmp/audit_result.txt; then
             echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            echo "Security audit complete — no findings."
           else
             echo "has_findings=true" >> "$GITHUB_OUTPUT"
+            echo "Security audit complete — findings detected, notifying Slack."
           fi
 
       - name: Notify Slack
