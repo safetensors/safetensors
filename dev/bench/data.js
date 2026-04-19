@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776599954752,
+  "lastUpdate": 1776602279787,
   "repoUrl": "https://github.com/safetensors/safetensors",
   "entries": {
     "Benchmark": [
@@ -42403,6 +42403,107 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.008254466931256517",
             "extra": "mean: 121.32742000000007 msec\nrounds: 7"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "willardjansen@me.com",
+            "name": "Willard",
+            "username": "willardjansen"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "76e0f9ff74cd6ea39229c422f62de209911b1518",
+          "message": "fix(python): use checked_mul for F4 last-dim doubling (#749)\n\n* fix(python): use checked_mul for F4 last-dim doubling\n\nTensorSpec::new doubles the last shape dim for float4_e2m1fn_x2 (F4)\nto convert the storage shape into the logical element count recorded\nin the safetensors header. The multiplication used raw `*=` on usize,\nso a last dim greater than usize::MAX / 2 panicked in debug builds\n(\"attempt to multiply with overflow\" at lib.rs:66:13) and wrapped\nsilently in release builds, producing a TensorSpec with a corrupted\nshape field.\n\nReplace the raw multiplication with checked_mul(2) and return a clear\nSafetensorError on overflow. Add a regression test covering both the\noverflow case and the valid-small-shape round-trip.\n\n* Remove test_f4_shape_last_dim_overflow per maintainer feedback",
+          "timestamp": "2026-04-19T14:35:50+02:00",
+          "tree_id": "578fee29825c55ae975dc91216e6b3c5676f2866",
+          "url": "https://github.com/safetensors/safetensors/commit/76e0f9ff74cd6ea39229c422f62de209911b1518"
+        },
+        "date": 1776602277566,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "benches/test_flax.py::test_flax_flax_load",
+            "value": 2.456515584063582,
+            "unit": "iter/sec",
+            "range": "stddev: 0.002196587914199805",
+            "extra": "mean: 407.08066600000734 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_flax.py::test_flax_sf_load",
+            "value": 5.3394985604281935,
+            "unit": "iter/sec",
+            "range": "stddev: 0.002887411031615263",
+            "extra": "mean: 187.28350400000977 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_paddle_load",
+            "value": 7.478676514733629,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0009788607544538232",
+            "extra": "mean: 133.7134983750019 msec\nrounds: 8"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_sf_load",
+            "value": 6.5365193008204345,
+            "unit": "iter/sec",
+            "range": "stddev: 0.003795656402112436",
+            "extra": "mean: 152.98662085714096 msec\nrounds: 7"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu",
+            "value": 10.987649146186499,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0015919941177261366",
+            "extra": "mean: 91.01127881818756 msec\nrounds: 11"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu",
+            "value": 310.979370049759,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00010285648748301315",
+            "extra": "mean: 3.2156473911436394 msec\nrounds: 271"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu_small",
+            "value": 10.794326542790701,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0008154078631811044",
+            "extra": "mean: 92.64125890909595 msec\nrounds: 11"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small",
+            "value": 60.85913353852044,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00009045011260378304",
+            "extra": "mean: 16.431387400003906 msec\nrounds: 60"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_save_cpu",
+            "value": 7.512111145782781,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00036283572137747635",
+            "extra": "mean: 133.11837120000405 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_tf_load",
+            "value": 3.7495655622106976,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00218793750736823",
+            "extra": "mean: 266.69756359998473 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_sf_load",
+            "value": 4.6130415039874295,
+            "unit": "iter/sec",
+            "range": "stddev: 0.006049405900658233",
+            "extra": "mean: 216.77671859999919 msec\nrounds: 5"
           }
         ]
       }
