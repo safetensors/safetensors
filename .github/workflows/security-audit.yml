@@ -1,0 +1,103 @@
+name: Security Audit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate PR diff
+        run: git diff ${{ github.event.pull_request.base.sha }}...${{ github.sha }} > /tmp/pr.diff
+
+      - name: Run security audit
+        id: audit
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          {
+            cat <<'PROMPT'
+          You are a senior security engineer performing a penetration-test-style review of a pull
+          request for the safetensors project — a Rust library with Python bindings for safely
+          storing and loading ML model tensors. The library parses untrusted input (user-provided
+          .safetensors files), so treat the attack surface accordingly.
+
+          The PR diff follows below. You also have access to the full repository — explore it when
+          the diff alone is not sufficient to assess impact (e.g. to check whether a removed guard
+          is relied upon elsewhere, or to understand the data flow around a changed function).
+
+          Think like an attacker. Consider the full serialization pipeline end-to-end: check
+          whether an attacker could use the legitimate write/serialization API to craft a
+          .safetensors file that exploits or confuses downstream readers, scanners, or tooling.
+          If the write path accepts something dangerous, every reader inherits that risk.
+
+          Focus on:
+          - Memory safety: buffer overflows, use-after-free, out-of-bounds reads/writes, unsafe blocks
+          - Integer overflows/underflows in size or offset calculations
+          - Input validation: malformed headers, oversized allocations, type confusion
+          - Write-to-read pipeline: can the serialization API produce files with payloads (e.g.
+            in tensor names, metadata keys/values, or shape/dtype fields) that would be
+            misinterpreted, truncated, or weaponized by readers or downstream tools?
+          - Path traversal or injection via tensor names / metadata
+          - CI/CD security: workflow permissions, secret exposure, unpinned actions, script injection
+          - Supply chain: dependency changes, lockfile manipulation
+          - Denial of service: algorithmic complexity, resource exhaustion
+          - Information disclosure
+
+          For each finding, assess exploitability — not just theoretical presence.
+
+          If you find security issues, output your report formatted for Slack using mrkdwn syntax.
+          Use this structure:
+
+          *[SEVERITY]* `file:lines` — Title
+          Description of the vulnerability and how it could be exploited.
+          _Suggestion:_ How to fix.
+
+          Separate multiple findings with blank lines. Be concise but specific.
+
+          If no security issues are found, output exactly: NO_FINDINGS
+
+          === PR DIFF ===
+          PROMPT
+            cat /tmp/pr.diff
+          } | claude -p --model claude-opus-4-6 > /tmp/audit_result.txt
+
+          if grep -q "NO_FINDINGS" /tmp/audit_result.txt; then
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack
+        if: steps.audit.outputs.has_findings == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          FINDINGS=$(cat /tmp/audit_result.txt)
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+
+          HEADER="*Security Audit Finding*\n*PR:* <${PR_URL}|${PR_TITLE}>\n*Author:* ${PR_AUTHOR}\n\n---\n\n"
+
+          jq -n \
+            --arg text "${HEADER}${FINDINGS}" \
+            '{"text": $text}' > /tmp/slack_payload.json
+
+          curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d @/tmp/slack_payload.json
