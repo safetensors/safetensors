@@ -1707,12 +1707,200 @@ impl _safe_open_handle {
     }
 }
 
+/// Parallel safetensors loader targeting Apple Silicon MPS.
+///
+/// Approach modeled on pytorch/pytorch#179190 (`MPSBulkLoad.mm`):
+///
+/// 1. parse the safetensors header,
+/// 2. bulk-allocate every output tensor directly on MPS and, for each one,
+///    call `torch.mps._writable_shared_buffer_ptr(tensor)` to get the
+///    host-writable MTLBuffer `[contents]` pointer — this is the allocator
+///    hook the MPS bulk-loader PR added,
+/// 3. `torch.mps.synchronize()` to flush any pending GPU work,
+/// 4. release the GIL and fan `pread(2)` out across OS threads, writing
+///    straight into the shared-storage MTLBuffers (no CPU staging copy),
+/// 5. `torch.mps.synchronize()` so subsequent GPU reads see the CPU writes.
+///
+/// Callers are expected to check that `torch.mps._writable_shared_buffer_ptr`
+/// exists before dispatching here — the Python `load_file` wrapper handles
+/// that and falls back to the standard `safe_open` path on stock PyTorch.
+#[cfg(target_os = "macos")]
+#[pyfunction]
+fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict>> {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Job {
+        name: String,
+        file_offset: u64,
+        nbytes: usize,
+        // Host-writable ptr into the MTLBuffer contents backing the tensor.
+        write_ptr: usize,
+    }
+
+    let file = File::open(&filename).map_err(|e| {
+        PyFileNotFoundError::new_err(format!("Could not open {}: {e}", filename.display()))
+    })?;
+    let mmap = unsafe {
+        MmapOptions::new().map(&file).map_err(|e| {
+            SafetensorError::new_err(format!("Could not mmap {}: {e}", filename.display()))
+        })?
+    };
+    let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|e| {
+        SafetensorError::new_err(format!("Could not read safetensors header: {e:?}"))
+    })?;
+    let data_start = header_len + 8;
+
+    let torch = PyModule::import(py, intern!(py, "torch"))?;
+    let mps_mod = torch.getattr(intern!(py, "mps"))?;
+    let writable_ptr_fn = mps_mod.getattr(intern!(py, "_writable_shared_buffer_ptr"))?;
+    let mps_device: Py<PyAny> = "mps".into_pyobject(py)?.into();
+
+    // Bulk-allocate every tensor on MPS and grab its writable storage pointer
+    // in one GIL acquisition.
+    let keys = metadata.offset_keys();
+    let mut mps_tensors: Vec<PyBound<'_, PyAny>> = Vec::with_capacity(keys.len());
+    let mut jobs: Vec<Job> = Vec::with_capacity(keys.len());
+    for name in keys {
+        let info = metadata.info(&name).ok_or_else(|| {
+            SafetensorError::new_err(format!("Missing tensor info for {name}"))
+        })?;
+        let dtype_obj: Py<PyAny> = get_pydtype(&torch, info.dtype, false)?;
+
+        // Packed dtypes (F4: two elements per byte) record the logical element
+        // count in the safetensors header, but torch stores them at half the
+        // last-dim length. Mirror the halving done by the `safe_open` path.
+        let mut torch_shape = info.shape.clone();
+        if info.dtype == Dtype::F4 {
+            let n = torch_shape.len();
+            if n == 0 || torch_shape[n - 1] % 2 != 0 {
+                return Err(SafetensorError::new_err(format!(
+                    "f4_x2 dtype requires the last dim be divisible by 2 in torch: got {:?}",
+                    info.shape,
+                )));
+            }
+            torch_shape[n - 1] /= 2;
+        }
+        let shape_obj: Py<PyAny> = torch_shape.into_pyobject(py)?.into();
+
+        let kwargs = [
+            (intern!(py, "dtype"), dtype_obj),
+            (intern!(py, "device"), mps_device.clone_ref(py)),
+        ]
+        .into_py_dict(py)?;
+        let tensor = torch.call_method("empty", (shape_obj,), Some(&kwargs))?;
+
+        let (begin, end) = info.data_offsets;
+        let nbytes = end - begin;
+
+        let write_ptr: usize = if nbytes == 0 {
+            0
+        } else {
+            writable_ptr_fn.call1((tensor.clone(),))?.extract()?
+        };
+        if nbytes > 0 && write_ptr == 0 {
+            return Err(SafetensorError::new_err(format!(
+                "torch.mps._writable_shared_buffer_ptr returned 0 for tensor {name} \
+                 (non-shared-storage MPS allocation?)",
+            )));
+        }
+
+        jobs.push(Job {
+            name: name.clone(),
+            file_offset: (data_start + begin) as u64,
+            nbytes,
+            write_ptr,
+        });
+        mps_tensors.push(tensor);
+    }
+
+    drop(mmap);
+
+    // Flush any GPU work that might have been queued so CPU writes below
+    // don't race in-flight ops on the freshly-allocated buffers.
+    let _ = mps_mod.call_method0(intern!(py, "synchronize"));
+
+    let read_result: Result<(), (String, std::io::Error)> = py.detach(|| {
+        let jobs = &jobs;
+        let file = &file;
+        let next = AtomicUsize::new(0);
+        // Cap worker count. `available_parallelism()` includes E-cores on
+        // Apple silicon; the upstream PyTorch MPS loader pins GCD to
+        // `QOS_CLASS_USER_INITIATED` which sticks to P-cores. std can't
+        // express that, so cap at 8 — past that, parallel pread is SSD-bound
+        // rather than CPU-bound on Apple silicon.
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8)
+            .min(jobs.len().max(1));
+
+        std::thread::scope(|s| -> Result<(), (String, std::io::Error)> {
+            let mut handles = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers {
+                let next = &next;
+                handles.push(s.spawn(move || -> Result<(), (String, std::io::Error)> {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= jobs.len() {
+                            return Ok(());
+                        }
+                        let job = &jobs[i];
+                        if job.nbytes == 0 {
+                            continue;
+                        }
+                        // SAFETY: `write_ptr` is the MTLBuffer `[contents]`
+                        // pointer of an MPS tensor kept alive by `mps_tensors`
+                        // until after `py.detach` returns. Each job owns a
+                        // distinct tensor so workers never alias.
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                job.write_ptr as *mut u8,
+                                job.nbytes,
+                            )
+                        };
+                        file.read_exact_at(buf, job.file_offset)
+                            .map_err(|e| (job.name.clone(), e))?;
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().map_err(|_| {
+                    (
+                        "<worker panic>".to_string(),
+                        std::io::Error::other("worker panicked"),
+                    )
+                })??;
+            }
+            Ok(())
+        })
+    });
+
+    if let Err((name, e)) = read_result {
+        return Err(SafetensorError::new_err(format!(
+            "pread failed for tensor {name}: {e}"
+        )));
+    }
+
+    // Synchronize so subsequent GPU reads see the CPU writes.
+    let _ = mps_mod.call_method0(intern!(py, "synchronize"));
+
+    let result = PyDict::new(py);
+    for (job, tensor) in jobs.iter().zip(mps_tensors.into_iter()) {
+        result.set_item(&job.name, tensor)?;
+    }
+
+    Ok(result.into())
+}
+
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
 fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    #[cfg(target_os = "macos")]
+    m.add_function(wrap_pyfunction!(mps_load_safetensors, m)?)?;
     m.add_class::<TensorSpec>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;

@@ -260,6 +260,47 @@ class TorchTestCase(unittest.TestCase):
             assert reloaded["test"].device == torch.device("cuda:0")
             self.assertTrue(torch.equal(torch.arange(4).view((2, 2)), reloaded["test"]))
 
+    @unittest.skipIf(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        "MPS is not available",
+    )
+    def test_mps(self):
+        data = {
+            "test1": torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            "test2": torch.arange(8, dtype=torch.float16).reshape(2, 4),
+            "test3": torch.tensor([True, False, True, False]),
+            "empty": torch.empty((0, 4), dtype=torch.float32),
+        }
+        local = "./tests/data/out_safe_pt_mmap_small_mps.safetensors"
+        save_file(data, local)
+
+        reloaded = load_file(local, device="mps")
+        for k, v in data.items():
+            self.assertEqual(reloaded[k].device.type, "mps")
+            self.assertTrue(torch.equal(v.to("mps"), reloaded[k]))
+
+    @unittest.skipIf(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        "MPS is not available",
+    )
+    @unittest.skipIf(
+        not hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
+    )
+    def test_mps_fp4(self):
+        # Packed dtype: safetensors records the logical element count, torch
+        # stores it at half the last-dim length. The MPS loader must halve the
+        # last dim before calling torch.empty; otherwise the resulting tensor
+        # is 2x the correct storage and only half the bytes get filled.
+        data = {
+            "packed": torch.empty(2, 4, device="cpu", dtype=torch.float4_e2m1fn_x2),
+        }
+        local = "./tests/data/out_safe_pt_mmap_small_mps_fp4.safetensors"
+        save_file(data, local)
+        reloaded = load_file(local, device="mps")
+        self.assertEqual(reloaded["packed"].dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(reloaded["packed"].device.type, "mps")
+        self.assertEqual(tuple(reloaded["packed"].shape), (2, 4))
+
     @unittest.skipIf(not npu_present, "Npu is not available")
     def test_npu(self):
         data = {

@@ -11,7 +11,10 @@
 # That generator emits typed stubs directly from Rust
 # signatures — no hand-editing, no drift.
 import os
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    import torch
 
 __version__: str
 
@@ -28,6 +31,18 @@ def deserialize(bytes):
         (`List[str, Dict[str, Dict[str, any]]]`):
             The deserialized content is like:
                 [("tensor_name", {"shape": [2, 3], "dtype": "F32", "data": b"\0\0.." }), (...)]
+    """
+    pass
+
+@staticmethod
+def mps_load_safetensors(filename: Union[str, "os.PathLike[str]"]) -> Dict[str, "torch.Tensor"]:
+    """
+    macOS/MPS only. Parses the safetensors header, bulk-allocates every tensor
+    on the MPS device, then releases the GIL and uses multiple OS threads that
+    each call `pread(2)` to fill the pre-allocated unified-memory buffers in
+    parallel. Mirrors pytorch/pytorch#179190 (`MPSBulkLoad.mm`).
+
+    Returns a `{name: torch.Tensor(device='mps')}` dict.
     """
     pass
 

@@ -7,6 +7,7 @@ import torch
 from safetensors import (
     TensorSpec,
     deserialize,
+    mps_load_safetensors as _mps_load_safetensors,
     safe_open,
     serialize,
     serialize_file,
@@ -320,6 +321,14 @@ def save_file(
     )
 
 
+def _is_mps_device(device: Union[str, int, torch.device]) -> bool:
+    if isinstance(device, torch.device):
+        return device.type == "mps"
+    if isinstance(device, str):
+        return device == "mps" or device.startswith("mps:")
+    return False
+
+
 def load_file(
     filename: Union[str, os.PathLike], device: Union[str, int] = "cpu"
 ) -> Dict[str, torch.Tensor]:
@@ -345,6 +354,21 @@ def load_file(
     loaded = load_file(file_path)
     ```
     """
+    # Fast path: parse the header, bulk-allocate every tensor on the MPS device,
+    # then release the GIL and fill the pre-allocated MPS (shared-storage)
+    # buffers in parallel with pread(2). Modeled on
+    # https://github.com/pytorch/pytorch/issues/179190 (MPSBulkLoad.mm).
+    # Requires `torch.mps._writable_shared_buffer_ptr`, which exposes the
+    # writable MTLBuffer contents pointer; without it the loader would have
+    # to double-allocate (MPS + CPU staging), so we defer to the standard
+    # path on stock PyTorch.
+    if (
+        _is_mps_device(device)
+        and _mps_load_safetensors is not None
+        and hasattr(torch, "mps")
+        and hasattr(torch.mps, "_writable_shared_buffer_ptr")
+    ):
+        return _mps_load_safetensors(os.fspath(filename))
     result = {}
     with safe_open(filename, framework="pt", device=device) as f:
         for k in f.offset_keys():
