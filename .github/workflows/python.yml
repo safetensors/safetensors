@@ -20,7 +20,7 @@ jobs:
           - os: ubuntu-latest
             version:
               torch: torch
-              python: "3.13"
+              python: "3.14"
               numpy: numpy
               arch: "x64-freethreaded"
           - os: macos-15-intel
@@ -76,16 +76,10 @@ jobs:
         run: cargo audit -D warnings
 
       - name: Install (torch)
-        if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
+        if: matrix.os != 'windows-11-arm'
         run: |
           pip install ${{ matrix.version.numpy }}
           pip install ${{ matrix.version.torch }}
-        shell: bash
-
-      - name: Install (torch freethreaded)
-        if: matrix.version.arch == 'x64-freethreaded'
-        run: |
-          pip install ${{ matrix.version.torch }} --index-url https://download.pytorch.org/whl/cu126
         shell: bash
 
       - name: Install (torch windows arm64)
@@ -96,7 +90,7 @@ jobs:
         shell: bash
 
       - name: Install (hdf5 non windows)
-        if: matrix.os == 'ubuntu-latest' && matrix.version.arch != 'x64-freethreaded'
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install libhdf5-dev
@@ -114,6 +108,14 @@ jobs:
         if: runner.os != 'Windows' && matrix.version.arch != 'x64-freethreaded'
         run:
           pip install .[jax]
+        shell: bash
+
+      - name: Install (jax, flax from source)
+        if: matrix.version.arch == 'x64-freethreaded'
+        run: |
+          # https://github.com/google/flax/issues/5027#issuecomment-3771977410
+          pip install git+https://github.com/google/flax.git
+          pip install jax jaxlib
         shell: bash
 
       - name: Install (mlx)
@@ -145,10 +147,10 @@ jobs:
         if: matrix.version.arch == 'x64-freethreaded'
         run: |
           cargo test
-          pip install ".[testingfree]"
-          pip install pytest numpy
-          pytest -sv tests/test_pt*
-          pytest -sv tests/test_simple.py
+          pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
+          # importing msgpack._cmsgpack re-enables the GIL, so force-disable
+          # until msgpack declares support
+          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py
 
   test_s390x_big_endian:
     runs-on: ubuntu-latest
