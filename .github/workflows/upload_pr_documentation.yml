@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    uses: huggingface/doc-builder/.github/workflows/upload_pr_documentation.yml@9ad2de8582b56c017cb530c1165116d40433f1c6  # main
+    uses: huggingface/doc-builder/.github/workflows/upload_pr_documentation.yml@2f8115f4d677905552b45ae1a67c799759fc8001  # main
     with:
       package_name: safetensors
     secrets:
