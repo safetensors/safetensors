@@ -16,3 +16,13 @@ serde_json = "1.0"
 
 [dependencies.safetensors]
 path = "../../safetensors"
+
+# Pipeline backend: Linux-only (io_uring is a Linux interface). On other OSes
+# the whole `pipeline` module is cfg-gated out and `safe_open.prefetch()` is
+# absent from the class — callers can `hasattr` to detect support. CUDA is
+# discovered at runtime via libloading, not linked at build time, so one
+# wheel works on Linux with and without CUDA present.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+libloading = "0.8"

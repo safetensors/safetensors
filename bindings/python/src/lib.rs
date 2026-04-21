@@ -20,6 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+mod pipeline;
+
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static TENSORFLOW_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -1292,6 +1295,43 @@ impl safe_open {
         self.inner()?.get_slice(name)
     }
 
+    /// Bulk-load a set of tensors through an opt-in fast path.
+    ///
+    /// Linux-only. Absent on other platforms (use `hasattr(sf, "prefetch")`
+    /// to detect). CUDA-targeted loads require `libcuda.so.1` discoverable at
+    /// runtime; CPU targets work without CUDA. P1 ships an eager fallback
+    /// with the final API shape — subsequent releases accelerate the internals.
+    ///
+    /// The returned handle is a single-use iterator yielding `(name, tensor)`
+    /// pairs in backend-chosen order (not submission order). Iterating drains
+    /// the handle; re-iterating yields nothing. Use `dict(handle)` to
+    /// materialize all tensors into a dict in one shot. `len(handle)` reports
+    /// remaining tensor count.
+    ///
+    /// Args:
+    ///     names (`List[str]`): tensor names to prefetch.
+    ///     dtype: optional target dtype (ignored until P5).
+    ///     max_inflight (`int`, default 8): soft cap on concurrent in-flight
+    ///         reads. Ignored until P3.
+    ///
+    /// Example:
+    /// ```python
+    /// with safe_open("model.safetensors", framework="pt", device="cuda:0") as sf:
+    ///     for name, tensor in sf.prefetch(sf.keys()):
+    ///         model.load_param(name, tensor)
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (names, dtype=None, max_inflight=8))]
+    pub fn prefetch(
+        &self,
+        names: Vec<String>,
+        dtype: Option<Py<PyAny>>,
+        max_inflight: usize,
+    ) -> PyResult<pipeline::PrefetchHandle> {
+        let _ = (dtype, max_inflight);
+        pipeline::PrefetchHandle::build_trivial(self.inner()?, names)
+    }
+
     /// Start the context manager
     pub fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
@@ -1940,6 +1980,21 @@ impl _safe_open_handle {
         self.inner()?.get_slice(name)
     }
 
+    /// Bulk-load a set of tensors through the opt-in fast path. See
+    /// `safe_open.prefetch` for full docs — the returned handle is a
+    /// single-use iterator over `(name, tensor)` pairs.
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (names, dtype=None, max_inflight=8))]
+    pub fn prefetch(
+        &self,
+        names: Vec<String>,
+        dtype: Option<Py<PyAny>>,
+        max_inflight: usize,
+    ) -> PyResult<pipeline::PrefetchHandle> {
+        let _ = (dtype, max_inflight);
+        pipeline::PrefetchHandle::build_trivial(self.inner()?, names)
+    }
+
     /// Start the context manager
     pub fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
@@ -1960,6 +2015,8 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorSpec>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
+    #[cfg(target_os = "linux")]
+    pipeline::register(m)?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

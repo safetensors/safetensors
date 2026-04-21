@@ -237,35 +237,41 @@ Relevant pieces (verified against `refactor-tp-loading` at commit
 
 ```python
 with safe_open(path, framework="pt", device="cuda:0") as sf:
-    handle = sf.prefetch(
+    # Returns a single-use iterator over (name, tensor) pairs.
+    for name, tensor in sf.prefetch(
         names,                # list[str]  (or  dict[str, slice-spec]  later)
         dtype=None,           # optional, scalar or per-name dict
         max_inflight=8,       # bounded backpressure
-    )
-
-    # As-completed iteration (backend picks the order)
-    for name, tensor in handle:
+    ):
         ...
 
-    # Or explicit blocking lookup
-    t = handle.get("layer.weight")
+    # Or materialize all at once:
+    weights = dict(sf.prefetch(names))
 
-    # Or drain everything
-    handle.wait_all()
-
-# __exit__ on sf also drains handle and syncs the stream
+# __exit__ on sf cancels in-flight work and syncs the stream.
 ```
 
 Design decisions locked in:
 
+- **Iterator-only API.** `prefetch()` returns a `PrefetchHandle` that's
+  a single-use iterator — no `.get(name)`, no `.wait_all()`. One idiom,
+  matches `concurrent.futures.as_completed`. If you need a specific
+  tensor by name, use the existing `sf.get_tensor(name)`; it doesn't
+  benefit from pipelining but the API is already there.
 - **As-completed iteration, not request-order.** Backend is free to
   yield in whatever order tensors become ready. Same API works for
   mmap+threadpool (finish order), pread+prefetcher (offset order),
-  future FFI backends (transfer-done order). Caller code doesn't care.
+  future FFI backends (transfer-done order). Callers that need a
+  specific order should sort the stream themselves.
+- **Drain-on-delivery.** Once a tensor is yielded, the handle releases
+  its reference. Peak memory stays at 1× the model size rather than 2×
+  while the handle is alive.
+- **Cleanup on drop.** Handle's `Drop` cancels in-flight io_uring ops,
+  joins the DMA worker, and syncs the CUDA stream. No explicit
+  `.close()` or `.wait_all()` needed; if the user breaks out of the
+  iteration early, cleanup still runs deterministically.
 - **Bounded `max_inflight`.** Reader workers block when the ready-queue
   is full. Natural backpressure; prevents runaway memory usage.
-- **`handle.get(name)` as escape hatch** for callers that need a
-  specific tensor right now.
 - **Sync-on-next contract for CUDA in PR 3.** `next()` synchronizes
   on the tensor's H2D completion before yielding. Loses a touch of
   overlap; keeps semantics foolproof. A `strict_sync=False` variant
