@@ -1,8 +1,8 @@
 name: Security Audit
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
 
 jobs:
   security-audit:
@@ -21,8 +21,8 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Generate PR diff
-        run: git diff ${{ github.event.pull_request.base.sha }}...${{ github.sha }} > /tmp/pr.diff
+      - name: Generate diff
+        run: git diff ${{ github.event.before }}...${{ github.sha }} > /tmp/changes.diff
 
       - name: Run security audit
         id: audit
@@ -31,14 +31,16 @@ jobs:
         run: |
           {
             cat <<'PROMPT'
-          You are a senior security engineer performing a penetration-test-style review of a pull
-          request for the safetensors project — a Rust library with Python bindings for safely
-          storing and loading ML model tensors. The library parses untrusted input (user-provided
-          .safetensors files), so treat the attack surface accordingly.
+          You are a senior security engineer performing a penetration-test-style review of a
+          change that just landed on the main branch of the safetensors project — a Rust library
+          with Python bindings for safely storing and loading ML model tensors. The library parses
+          untrusted input (user-provided .safetensors files), so treat the attack surface
+          accordingly.
 
-          The PR diff follows below. You also have access to the full repository — explore it when
-          the diff alone is not sufficient to assess impact (e.g. to check whether a removed guard
-          is relied upon elsewhere, or to understand the data flow around a changed function).
+          The diff of the change follows below. You also have access to the full repository —
+          explore it when the diff alone is not sufficient to assess impact (e.g. to check whether
+          a removed guard is relied upon elsewhere, or to understand the data flow around a
+          changed function).
 
           Think like an attacker. Consider the full serialization pipeline end-to-end: check
           whether an attacker could use the legitimate write/serialization API to craft a
@@ -71,9 +73,9 @@ jobs:
 
           If no security issues are found, output exactly: NO_FINDINGS
 
-          === PR DIFF ===
+          === DIFF ===
           PROMPT
-            cat /tmp/pr.diff
+            cat /tmp/changes.diff
           } | claude -p --model claude-opus-4-6 > /tmp/audit_result.txt
 
           if grep -q "NO_FINDINGS" /tmp/audit_result.txt; then
@@ -88,13 +90,14 @@ jobs:
         if: steps.audit.outputs.has_findings == 'true'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.username || github.event.head_commit.author.name }}
         run: |
           FINDINGS=$(cat /tmp/audit_result.txt)
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          COMMIT_TITLE=$(printf '%s\n' "$COMMIT_MESSAGE" | head -n1)
 
-          HEADER="*Security Audit Finding*\n*PR:* <${PR_URL}|${PR_TITLE}>\n*Author:* ${PR_AUTHOR}\n\n---\n\n"
+          HEADER="*Security Audit Finding*\n*Commit:* <${COMMIT_URL}|${COMMIT_TITLE}>\n*Author:* ${COMMIT_AUTHOR}\n\n---\n\n"
 
           jq -n \
             --arg text "${HEADER}${FINDINGS}" \
