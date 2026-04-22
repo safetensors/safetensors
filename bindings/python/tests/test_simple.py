@@ -1,3 +1,4 @@
+import importlib
 import os
 import tempfile
 import threading
@@ -13,6 +14,10 @@ from safetensors.torch import _find_shared_tensors
 from safetensors.torch import load_file as load_file_pt
 from safetensors.torch import save_file as save_file_pt
 from safetensors.torch import storage_ptr, storage_size
+
+
+def test_safetensor_error_module_is_importable():
+    importlib.import_module(SafetensorError.__module__)
 
 
 class TestCase(unittest.TestCase):
