@@ -33,7 +33,7 @@ static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 /// The dtype string is validated at construction; an unknown dtype raises
 /// immediately rather than failing further inside the serializer.
 ///
-/// `shape` is the logical (header) shape — the number of elements along each
+/// `shape` is the logical (header) shape - the number of elements along each
 /// axis as recorded in the safetensors header. For packed dtypes like
 /// `float4_e2m1fn_x2` (two F4 values per byte), callers may pass the storage
 /// shape reported by their framework (e.g. `torch.Size`); the constructor
@@ -86,7 +86,7 @@ impl TensorSpec {
         format!("{}", self.dtype)
     }
 
-    /// The tensor's logical shape — the element-count shape recorded in the
+    /// The tensor's logical shape - the element-count shape recorded in the
     /// safetensors header. For packed dtypes like `float4_e2m1fn_x2`, this is
     /// the last-dim-doubled version of whatever was passed to the constructor.
     #[getter]
@@ -1713,23 +1713,9 @@ impl _safe_open_handle {
     }
 }
 
-/// Parallel safetensors loader targeting Apple Silicon MPS.
-///
-/// Approach modeled on pytorch/pytorch#179190 (`MPSBulkLoad.mm`):
-///
-/// 1. parse the safetensors header,
-/// 2. bulk-allocate every output tensor directly on MPS and, for each one,
-///    call `torch.mps._writable_shared_buffer_ptr(tensor)` to get the
-///    host-writable MTLBuffer `[contents]` pointer — this is the allocator
-///    hook the MPS bulk-loader PR added,
-/// 3. `torch.mps.synchronize()` to flush any pending GPU work,
-/// 4. release the GIL and fan `pread(2)` out across OS threads, writing
-///    straight into the shared-storage MTLBuffers (no CPU staging copy),
-/// 5. `torch.mps.synchronize()` so subsequent GPU reads see the CPU writes.
-///
-/// Callers are expected to check that `torch.mps._writable_shared_buffer_ptr`
-/// exists before dispatching here — the Python `load_file` wrapper handles
-/// that and falls back to the standard `safe_open` path on stock PyTorch.
+/// Bulk-allocates MPS tensors, then parallel-`pread`s straight into their
+/// host-aliased MTLBuffers (via `torch.mps._host_alias_storage`). Caller
+/// must confirm the API exists. See pytorch/pytorch#179190.
 #[cfg(target_os = "macos")]
 #[pyfunction]
 fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict>> {
@@ -1740,7 +1726,7 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
         name: String,
         file_offset: u64,
         nbytes: usize,
-        // Host-writable ptr into the MTLBuffer contents backing the tensor.
+        // Host-writable MTLBuffer pointer.
         write_ptr: usize,
     }
 
@@ -1759,13 +1745,14 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
 
     let torch = PyModule::import(py, intern!(py, "torch"))?;
     let mps_mod = torch.getattr(intern!(py, "mps"))?;
-    let writable_ptr_fn = mps_mod.getattr(intern!(py, "_writable_shared_buffer_ptr"))?;
+    let host_alias_fn = mps_mod.getattr(intern!(py, "_host_alias_storage"))?;
     let mps_device: Py<PyAny> = "mps".into_pyobject(py)?.into();
 
-    // Bulk-allocate every tensor on MPS and grab its writable storage pointer
-    // in one GIL acquisition.
+    // Allocate every tensor and collect host-alias pointers under the GIL.
     let keys = metadata.offset_keys();
     let mut mps_tensors: Vec<PyBound<'_, PyAny>> = Vec::with_capacity(keys.len());
+    // Aliases pin the source MPS storages; keep alive across parallel writes.
+    let mut host_aliases: Vec<PyBound<'_, PyAny>> = Vec::with_capacity(keys.len());
     let mut jobs: Vec<Job> = Vec::with_capacity(keys.len());
     for name in keys {
         let info = metadata.info(&name).ok_or_else(|| {
@@ -1773,9 +1760,7 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
         })?;
         let dtype_obj: Py<PyAny> = get_pydtype(&torch, info.dtype, false)?;
 
-        // Packed dtypes (F4: two elements per byte) record the logical element
-        // count in the safetensors header, but torch stores them at half the
-        // last-dim length. Mirror the halving done by the `safe_open` path.
+        // F4 stores two elements per byte; torch shape halves the last dim.
         let mut torch_shape = info.shape.clone();
         if info.dtype == Dtype::F4 {
             let n = torch_shape.len();
@@ -1802,11 +1787,15 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
         let write_ptr: usize = if nbytes == 0 {
             0
         } else {
-            writable_ptr_fn.call1((tensor.clone(),))?.extract()?
+            let mps_storage = tensor.call_method0(intern!(py, "untyped_storage"))?;
+            let cpu_alias = host_alias_fn.call1((mps_storage,))?;
+            let ptr: usize = cpu_alias.call_method0(intern!(py, "data_ptr"))?.extract()?;
+            host_aliases.push(cpu_alias);
+            ptr
         };
         if nbytes > 0 && write_ptr == 0 {
             return Err(SafetensorError::new_err(format!(
-                "torch.mps._writable_shared_buffer_ptr returned 0 for tensor {name} \
+                "torch.mps._host_alias_storage returned a null data_ptr for tensor {name} \
                  (non-shared-storage MPS allocation?)",
             )));
         }
@@ -1822,19 +1811,14 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
 
     drop(mmap);
 
-    // Flush any GPU work that might have been queued so CPU writes below
-    // don't race in-flight ops on the freshly-allocated buffers.
+    // Drain in-flight GPU work before writing through the CPU alias.
     let _ = mps_mod.call_method0(intern!(py, "synchronize"));
 
     let read_result: Result<(), (String, std::io::Error)> = py.detach(|| {
         let jobs = &jobs;
         let file = &file;
         let next = AtomicUsize::new(0);
-        // Cap worker count. `available_parallelism()` includes E-cores on
-        // Apple silicon; the upstream PyTorch MPS loader pins GCD to
-        // `QOS_CLASS_USER_INITIATED` which sticks to P-cores. std can't
-        // express that, so cap at 8 — past that, parallel pread is SSD-bound
-        // rather than CPU-bound on Apple silicon.
+        // Cap at 8: beyond P-core count reads are SSD-bound on Apple silicon.
         let n_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -1855,10 +1839,8 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
                         if job.nbytes == 0 {
                             continue;
                         }
-                        // SAFETY: `write_ptr` is the MTLBuffer `[contents]`
-                        // pointer of an MPS tensor kept alive by `mps_tensors`
-                        // until after `py.detach` returns. Each job owns a
-                        // distinct tensor so workers never alias.
+                        // SAFETY: each job owns a distinct tensor kept alive
+                        // by `mps_tensors` until after `py.detach` returns.
                         let buf = unsafe {
                             std::slice::from_raw_parts_mut(
                                 job.write_ptr as *mut u8,
@@ -1888,13 +1870,16 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
         )));
     }
 
-    // Synchronize so subsequent GPU reads see the CPU writes.
+    // Make CPU writes visible to subsequent GPU reads.
     let _ = mps_mod.call_method0(intern!(py, "synchronize"));
 
     let result = PyDict::new(py);
     for (job, tensor) in jobs.iter().zip(mps_tensors.into_iter()) {
         result.set_item(&job.name, tensor)?;
     }
+
+    // Drop aliases after synchronize so pinned MPS storages outlive writes.
+    drop(host_aliases);
 
     Ok(result.into())
 }
