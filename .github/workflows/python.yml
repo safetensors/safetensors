@@ -14,9 +14,15 @@ jobs:
         # new releases get automatically tested against
         version: [
           {torch: torch==2.4, python: "3.10", arch: "x64", numpy: numpy==1.26.4},
-          {torch: torch, python: "3.14", arch: "x64", numpy: numpy}
+          {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
         ]
         include:
+          - os: ubuntu-latest
+            version:
+              torch: torch
+              python: "3.14"
+              numpy: numpy
+              arch: "x64-freethreaded"
           - os: ubuntu-latest
             version:
               torch: torch
@@ -32,14 +38,12 @@ jobs:
           - os: macos-latest
             version:
               torch: torch
-              python: "3.14"
+              python: "3.13"
               numpy: numpy
               arch: "arm64"
           - os: windows-11-arm
             version:
               torch: torch
-              # PyTorch doesn't ship win_arm64 3.14 wheels
-              # https://github.com/pytorch/pytorch/issues/161516
               python: "3.13"
               numpy: numpy
               arch: "arm64"
