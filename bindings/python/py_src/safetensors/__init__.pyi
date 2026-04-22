@@ -42,7 +42,7 @@ def mps_load_safetensors(
     macOS/MPS only. Parses the safetensors header, bulk-allocates every tensor
     on the MPS device, then releases the GIL and uses multiple OS threads that
     each call `pread(2)` to fill the pre-allocated unified-memory buffers in
-    parallel. Mirrors pytorch/pytorch#179190 (`MPSBulkLoad.mm`).
+    parallel.
 
     Returns a `{name: torch.Tensor(device='mps')}` dict.
     """
