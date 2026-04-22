@@ -14,7 +14,7 @@ jobs:
         # new releases get automatically tested against
         version: [
           {torch: torch==2.4, python: "3.10", arch: "x64", numpy: numpy==1.26.4},
-          {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
+          {torch: torch, python: "3.14", arch: "x64", numpy: numpy}
         ]
         include:
           - os: ubuntu-latest
@@ -32,13 +32,13 @@ jobs:
           - os: macos-latest
             version:
               torch: torch
-              python: "3.13"
+              python: "3.14"
               numpy: numpy
               arch: "arm64"
           - os: windows-11-arm
             version:
               torch: torch
-              python: "3.13"
+              python: "3.14"
               numpy: numpy
               arch: "arm64"
     defaults:
@@ -96,8 +96,18 @@ jobs:
           sudo apt-get install libhdf5-dev
 
       - name: Install (tensorflow)
-        if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
+        if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm' && matrix.python != "3.14"
         run: |
+          pip install .[tensorflow]
+          # XXX: I assume this is still the case for 3.10
+          # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
+          pip install ${{ matrix.version.numpy }}
+        shell: bash
+
+      - name: Install (tensorflow) (Python 3.14)
+        if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm' && matrix.python == "3.14"
+        run: |
+          pip install tf-nightly
           pip install .[tensorflow]
           # XXX: I assume this is still the case for 3.10
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
