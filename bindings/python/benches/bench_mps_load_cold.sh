@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PYTHON="${PYTHON:-/Users/salia/Desktop/pytorch/.venv/bin/python}"
+PYTHON="${PYTHON:-python3}"
 SIZE_GB="${SIZE_GB:-16}"
 ITERS="${ITERS:-3}"
 CACHE_FILE="${CACHE_FILE:-/tmp/mps_bench_llm_${SIZE_GB}gb.safetensors}"

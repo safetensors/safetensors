@@ -1812,7 +1812,7 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
     drop(mmap);
 
     // Drain in-flight GPU work before writing through the CPU alias.
-    let _ = mps_mod.call_method0(intern!(py, "synchronize"));
+    mps_mod.call_method0(intern!(py, "synchronize"))?;
 
     let read_result: Result<(), (String, std::io::Error)> = py.detach(|| {
         let jobs = &jobs;
@@ -1868,7 +1868,7 @@ fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict
     }
 
     // Make CPU writes visible to subsequent GPU reads.
-    let _ = mps_mod.call_method0(intern!(py, "synchronize"));
+    mps_mod.call_method0(intern!(py, "synchronize"))?;
 
     let result = PyDict::new(py);
     for (job, tensor) in jobs.iter().zip(mps_tensors) {
