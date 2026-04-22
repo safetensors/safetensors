@@ -1715,7 +1715,7 @@ impl _safe_open_handle {
 
 /// Bulk-allocates MPS tensors, then parallel-`pread`s straight into their
 /// host-aliased MTLBuffers (via `torch.mps._host_alias_storage`). Caller
-/// must confirm the API exists. See pytorch/pytorch#179190.
+/// must confirm the API exists. See pytorch/pytorch#180961.
 #[cfg(target_os = "macos")]
 #[pyfunction]
 fn mps_load_safetensors(py: Python<'_>, filename: PathBuf) -> PyResult<Py<PyDict>> {

@@ -355,7 +355,6 @@ def load_file(
     ```
     """
     # Fast path: parallel pread straight into MPS buffers via host-alias storage
-    # (pytorch/pytorch#179190, PR #180961). Falls through on stock PyTorch.
     if (
         _is_mps_device(device)
         and _mps_load_safetensors is not None
