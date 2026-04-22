@@ -22,7 +22,6 @@ jobs:
               torch: torch
               python: "3.14"
               numpy: numpy
-              arch: "x64-freethreaded"
           - os: ubuntu-latest
             version:
               torch: torch
