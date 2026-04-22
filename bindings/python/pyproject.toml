@@ -32,6 +32,7 @@ Source = 'https://github.com/huggingface/safetensors'
 numpy = ["numpy>=1.24.6"]
 torch = ["safetensors[numpy]", "torch>=2.4"]
 tensorflow = ["safetensors[numpy]", "tensorflow>=2.11.0"]
+tf-nightly = ["safetensors[numpy]", "tf-nightly>=2.11.0"]
 # pinning tf version 2.11.0 for doc-builder
 pinned-tf = ["safetensors[numpy]", "tensorflow==2.18.0"]
 jax = ["safetensors[numpy]", "flax>=0.6.3", "jax>=0.3.25", "jaxlib>=0.3.25"]

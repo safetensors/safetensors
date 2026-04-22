@@ -109,8 +109,7 @@ jobs:
       - name: Install (tensorflow) (Python 3.14)
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm' && matrix.python == '3.14'
         run: |
-          pip install tf-nightly
-          pip install .[tensorflow]
+          pip install .[tf-nightly]
           # XXX: I assume this is still the case for 3.10
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
           pip install ${{ matrix.version.numpy }}
