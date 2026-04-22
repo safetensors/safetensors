@@ -38,7 +38,9 @@ jobs:
           - os: windows-11-arm
             version:
               torch: torch
-              python: "3.14"
+              # PyTorch doesn't ship win_arm64 3.14 wheels
+              # https://github.com/pytorch/pytorch/issues/161516
+              python: "3.13"
               numpy: numpy
               arch: "arm64"
     defaults:
