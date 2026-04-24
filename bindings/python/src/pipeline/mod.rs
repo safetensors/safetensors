@@ -90,7 +90,93 @@ impl PrefetchHandle {
     }
 }
 
+// ── Debug probes ───────────────────────────────────────────────────────
+//
+// Leading-underscore pyfunctions — internal, may change or disappear. These
+// exist so tests under `bindings/python/tests/test_pipeline.py` can exercise
+// the CUDA wrapper stack without depending on the real prefetch integration
+// (which doesn't arrive until P4). A production caller should never import
+// these.
+
+use pyo3::types::{PyDict, PyList};
+
+/// Enumerate visible CUDA devices and their sysfs-derived NUMA mapping.
+///
+/// Returns a list of dicts: `{"ordinal": int, "name": str, "pci_bus_id": str,
+/// "numa_node": int, "numa_cpus": list[int]}`. If the CUDA driver is not
+/// loadable, returns a one-element list with `{"error": "..."}` so tests
+/// can skip cleanly rather than raising.
+#[pyfunction]
+fn _debug_cuda_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let list = PyList::empty(py);
+
+    let count = match cuda::CuDevice::count() {
+        Ok(n) => n,
+        Err(e) => {
+            let d = PyDict::new(py);
+            d.set_item("error", e.to_string())?;
+            list.append(d)?;
+            return Ok(list.into());
+        }
+    };
+
+    for ordinal in 0..count {
+        let d = PyDict::new(py);
+        d.set_item("ordinal", ordinal)?;
+
+        match cuda::CuDevice::get(ordinal) {
+            Ok(dev) => {
+                d.set_item("name", dev.name().unwrap_or_else(|e| format!("<err: {e}>")))?;
+                let bdf = dev.pci_bus_id().unwrap_or_else(|e| format!("<err: {e}>"));
+                d.set_item("pci_bus_id", &bdf)?;
+
+                let node = numa::numa_node_for_pci(&bdf).unwrap_or(-1);
+                d.set_item("numa_node", node)?;
+                let cpus = if node >= 0 {
+                    numa::cpulist_for_node(node).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                d.set_item("numa_cpus", cpus)?;
+            }
+            Err(e) => {
+                d.set_item("error", e.to_string())?;
+            }
+        }
+        list.append(d)?;
+    }
+
+    Ok(list.into())
+}
+
+/// End-to-end smoke of the CUDA wrapper stack: retain primary context,
+/// push/pop, create stream + event, allocate pinned + device, H2D copy,
+/// synchronize, release. Returns bytes copied on success. Raises
+/// `SafetensorError` if any CUDA call fails.
+#[pyfunction]
+fn _debug_cuda_ctx_smoke(ordinal: i32) -> PyResult<usize> {
+    const BYTES: usize = 4096;
+    let dev = cuda::CuDevice::get(ordinal)?;
+    let ctx = cuda::CuContext::primary_retain(dev)?;
+    let bytes = ctx.with_current(|| {
+        let stream = cuda::CuStream::new()?;
+        let event = cuda::CuEvent::new()?;
+        let mut pinned = cuda::PinnedBuf::alloc(BYTES)?;
+        let dev_buf = cuda::DeviceBuf::alloc(BYTES)?;
+        for (i, b) in pinned.as_mut_slice().iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        cuda::memcpy_h2d_async(dev_buf.as_device_ptr(), pinned.as_ptr(), BYTES, &stream)?;
+        event.record(&stream)?;
+        event.synchronize()?;
+        Ok(BYTES)
+    })?;
+    Ok(bytes)
+}
+
 pub(crate) fn register(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<PrefetchHandle>()?;
+    m.add_function(wrap_pyfunction!(_debug_cuda_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(_debug_cuda_ctx_smoke, m)?)?;
     Ok(())
 }

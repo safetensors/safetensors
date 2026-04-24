@@ -5,13 +5,8 @@
 //! and pins the calling thread to the full cpulist of that node. The io_uring
 //! SQPOLL kernel thread gets pinned separately via
 //! `io_uring::Builder::setup_sqpoll_cpu` in the iouring module.
-//!
-//! TODO(P2): fill in once the CUDA FFI wrappers land — we need
-//! `cuDeviceGetPCIBusId` from `cuda::CuDevice::pci_bus_id()` before we can
-//! resolve the GPU's NUMA node. The sysfs parsing can be written and unit
-//! tested independently; that's what lives here for now.
 
-#![allow(dead_code)] // scaffolding; wired up in P2.
+#![allow(dead_code)] // `pin_current_thread` used by P3 onwards.
 
 use crate::pipeline::error::{PipelineError, PipelineResult};
 
@@ -64,9 +59,31 @@ fn parse_cpulist(s: &str) -> PipelineResult<Vec<usize>> {
     Ok(cpus)
 }
 
+/// Resolve the NUMA node for a CUDA device ordinal. Returns -1 if the node
+/// is unknown (virtualized GPUs, unusual topologies) or if CUDA isn't
+/// available — both are non-fatal; callers degrade to not pinning.
+pub fn numa_node_for_device(device_ordinal: i32) -> PipelineResult<i32> {
+    let dev = crate::pipeline::cuda::CuDevice::get(device_ordinal)?;
+    let bdf = dev.pci_bus_id()?;
+    numa_node_for_pci(&bdf)
+}
+
+/// Pin the calling thread to all CPUs on the GPU's NUMA node. Returns the
+/// resolved node id on success, or `Ok(-1)` when the node is unknown (in
+/// which case nothing was pinned — caller sees a best-effort result, not
+/// an error).
+pub fn bind_to_gpu_node(device_ordinal: i32) -> PipelineResult<i32> {
+    let node = numa_node_for_device(device_ordinal)?;
+    if node < 0 {
+        return Ok(-1);
+    }
+    let cpus = cpulist_for_node(node)?;
+    pin_current_thread(&cpus)?;
+    Ok(node)
+}
+
 /// Pin the current thread to the given CPU set via `sched_setaffinity`.
-/// TODO(P2): expose + call from the DMA worker. Returns Ok(()) and does
-/// nothing if `cpus` is empty.
+/// Returns Ok(()) and does nothing if `cpus` is empty.
 pub fn pin_current_thread(cpus: &[usize]) -> PipelineResult<()> {
     if cpus.is_empty() {
         return Ok(());
