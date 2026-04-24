@@ -97,7 +97,8 @@ jobs:
           FINDINGS=$(cat /tmp/audit_result.txt)
           COMMIT_TITLE=$(printf '%s\n' "$COMMIT_MESSAGE" | head -n1)
 
-          HEADER="*Security Audit Finding*\n*Commit:* <${COMMIT_URL}|${COMMIT_TITLE}>\n*Author:* ${COMMIT_AUTHOR}\n\n---\n\n"
+          printf -v HEADER '*Security Audit Finding*\n*Commit:* <%s|%s>\n*Author:* %s\n\n---\n\n' \
+            "$COMMIT_URL" "$COMMIT_TITLE" "$COMMIT_AUTHOR"
 
           jq -n \
             --arg text "${HEADER}${FINDINGS}" \
