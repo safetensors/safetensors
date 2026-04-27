@@ -103,6 +103,43 @@ def file_size_mb(llm_file):
     return os.path.getsize(llm_file) / (1024 * 1024)
 
 
+@pytest.fixture(scope="module")
+def real_model_dir():
+    """Directory containing a real HF model checkpoint (multi-source
+    `*.safetensors` files). Set via REAL_MODEL_DIR env var; tests that
+    need it `skip` if it's unset or empty."""
+    p = os.environ.get("REAL_MODEL_DIR")
+    if not p or not os.path.isdir(p):
+        return None
+    return p
+
+
+@pytest.fixture(scope="module")
+def real_sources(real_model_dir):
+    """List of all `*.safetensors` source-file paths in `real_model_dir`,
+    sorted so runs are reproducible. Falls through to None if the model
+    dir isn't set; tests skip in that case."""
+    if real_model_dir is None:
+        return None
+    paths = sorted(
+        os.path.join(real_model_dir, f)
+        for f in os.listdir(real_model_dir)
+        if f.endswith(".safetensors")
+    )
+    if not paths:
+        return None
+    if hasattr(os, "sync"):
+        os.sync()
+    return paths
+
+
+@pytest.fixture(scope="module")
+def real_total_size_mb(real_sources):
+    if real_sources is None:
+        return 0.0
+    return sum(os.path.getsize(p) for p in real_sources) / (1024 * 1024)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cuda_warmup():
     # Prevents the first benchmark round from absorbing CUDA context init cost.
@@ -110,6 +147,24 @@ def _cuda_warmup():
         x = torch.zeros(1024, device="cuda:0")
         torch.cuda.synchronize()
         del x
+
+
+@pytest.fixture(autouse=True)
+def _gpu_cleanup_between_tests():
+    """Force a full GPU/Python cleanup between bench tests. Real-model
+    tests allocate tens of GB per round; without an explicit barrier
+    pytest moves to the next test before the previous one's `cuMemFree_v2`
+    calls have all settled, and cumulative pressure on an 80 GB card OOMs
+    the cold-cache-runs-last variants. `gc.collect` drains any cycles
+    holding torch tensors; `torch.cuda.synchronize` waits for in-flight
+    work; `empty_cache` returns torch's allocator pool to the driver.
+    """
+    yield
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def _evict_page_cache(path: str) -> None:
@@ -130,13 +185,13 @@ def _warm_page_cache(path: str) -> None:
 
 
 @pytest.fixture(params=["warm", "cold"])
-def cache_state(request, llm_file):
+def cache_state(request):
+    """Pure parametrize on the cache mode — tests do their own setup. We
+    used to also warm/evict `llm_file` here, but that pulled in the 2 GB
+    synthetic-file fixture for real-model tests that don't need it.
+    """
     if request.param == "cold" and not _FADVISE_AVAILABLE:
         pytest.skip("cold-cache variant requires Linux posix_fadvise")
-    if request.param == "warm":
-        _warm_page_cache(llm_file)
-    else:
-        _evict_page_cache(llm_file)
     return request.param
 
 
@@ -147,9 +202,9 @@ def _record_throughput(benchmark, file_size_mb, cache_state=None):
 
 
 def _run_parametrized(benchmark, llm_file, file_size_mb, cache_state, fn):
-    # Per-round setup evicts before each cold round; warm rounds rely on the
-    # module-scope warm-up in the fixture. Pedantic gives us explicit control
-    # over rounds/iterations so the eviction cost doesn't bleed into timings.
+    # cache_state is now just the mode string — set up state here so
+    # synthetic-file tests still get the per-round cold eviction.
+    _setup_cache([llm_file], cache_state)
     setup = (lambda: _evict_page_cache(llm_file)) if cache_state == "cold" else None
     benchmark.pedantic(fn, setup=setup, rounds=5, iterations=1, warmup_rounds=0)
     _record_throughput(benchmark, file_size_mb, cache_state)
@@ -195,6 +250,133 @@ def test_safe_open_cpu_then_to_cuda(benchmark, llm_file, file_size_mb, cache_sta
         return out
 
     _run_parametrized(benchmark, llm_file, file_size_mb, cache_state, _load)
+
+
+@cuda_required
+def test_safe_open_prefetch(benchmark, llm_file, file_size_mb, cache_state):
+    # P4 fast path: ionic-rs CUDA pipeline (io_uring + dedicated stream).
+    # No `torch.cuda.synchronize()` here — the pipeline ends `run()` with
+    # `cuStreamSynchronize` on both producer streams, which is a host-side
+    # barrier promoting the H2Ds to a happens-before edge any subsequent
+    # CUDA work can rely on. The other cells (asarray/to-cuda paths) need
+    # an outer sync because their async copies don't barrier internally;
+    # this one doesn't.
+    def _load():
+        out = {}
+        with safe_open(llm_file, framework="pt", device="cuda:0") as sf:
+            for name, tensor in sf.prefetch(sf.keys()):
+                out[name] = tensor
+        return out
+
+    _run_parametrized(benchmark, llm_file, file_size_mb, cache_state, _load)
+
+
+def _setup_cache(paths, mode):
+    """Set page-cache state for all source files: 'warm' reads them
+    through, 'cold' drops their pages via fadvise."""
+    if mode == "warm":
+        for p in paths:
+            _warm_page_cache(p)
+    else:
+        for p in paths:
+            _evict_page_cache(p)
+
+
+def _load_sources_threaded(paths, max_workers, use_prefetch):
+    """Threadpool-per-source load: one safe_open + prefetch (or
+    get_tensor) per source, fanning out across `max_workers` threads.
+    This is what transformers' TP loader does. Each thread spins up its
+    own pipeline — N threads = N io_uring rings + N DMA workers
+    competing for the GPU's two physical copy engines.
+
+    Returns the tensor count, not the dict, so pedantic's per-round
+    `result` slot doesn't pin gigabytes across rounds (52 GB on an 80 GB
+    card OOMs immediately if a previous round's tensors haven't dropped).
+    Clearing the dict inside the timed window is ~one cuMemFree_v2 per
+    tensor — microseconds each, sub-ms total.
+    """
+    def _one_source(path):
+        out = {}
+        with safe_open(path, framework="pt", device="cuda:0") as sf:
+            if use_prefetch:
+                for name, tensor in sf.prefetch(sf.keys()):
+                    out[name] = tensor
+            else:
+                for name in sf.keys():
+                    out[name] = sf.get_tensor(name)
+        return out
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for chunk in pool.map(_one_source, paths):
+            out.update(chunk)
+    # The prefetch path syncs its own streams in `pipeline.run()`; only
+    # the get_tensor variant needs an outer barrier here (its async H2Ds
+    # ride torch's default stream and don't internally synchronize).
+    if not use_prefetch:
+        torch.cuda.synchronize()
+    n = len(out)
+    out.clear()
+    return n
+
+
+def _load_sources_unified(paths):
+    """Single-pipeline multi-source load: one safe_open over the full
+    source list, one prefetch call across the union of keys. Goes through
+    the new ionic-rs CudaPipeline path with all sources registered on
+    one io_uring ring — what ionic does.
+    """
+    with safe_open(paths, framework="pt", device="cuda:0") as sf:
+        out = dict(sf.prefetch(sf.keys()))
+    # No outer sync — pipeline.run() ended with cuStreamSynchronize on
+    # both producer streams, which is a host-side barrier ensuring all
+    # H2Ds are globally visible before the iterator yields.
+    n = len(out)
+    out.clear()
+    return n
+
+
+@cuda_required
+@pytest.mark.parametrize(
+    "variant", ["unified_prefetch", "threaded_prefetch", "threaded_get_tensor"]
+)
+def test_real_model_multisource(
+    benchmark, real_sources, real_total_size_mb, variant, cache_state
+):
+    """Multi-source load of a real HF checkpoint, three variants:
+
+    - `unified_prefetch`: single `safe_open(paths)` + single
+      `prefetch()`. One ionic-rs pipeline registers every source file,
+      reads + DMAs across them on one ring. The production target.
+    - `threaded_prefetch`: per-source `safe_open` + `prefetch`, fanned
+      out via a thread pool. N pipelines, each owning its own ring + DMA
+      worker. The intermediate state we measured earlier.
+    - `threaded_get_tensor`: per-source `safe_open` + per-tensor
+      `get_tensor`, threaded. The pre-pipeline baseline (what
+      transformers' TP loader does today).
+
+    Skipped if REAL_MODEL_DIR isn't set.
+    """
+    if real_sources is None:
+        pytest.skip("set REAL_MODEL_DIR to a directory with *.safetensors source files")
+
+    paths = real_sources
+    n_sources = len(paths)
+
+    _setup_cache(paths, cache_state)
+    setup = (lambda: _setup_cache(paths, "cold")) if cache_state == "cold" else None
+
+    if variant == "unified_prefetch":
+        fn = lambda: _load_sources_unified(paths)
+    elif variant == "threaded_prefetch":
+        fn = lambda: _load_sources_threaded(paths, n_sources, use_prefetch=True)
+    else:  # threaded_get_tensor
+        fn = lambda: _load_sources_threaded(paths, n_sources, use_prefetch=False)
+
+    benchmark.pedantic(fn, setup=setup, rounds=3, iterations=1, warmup_rounds=0)
+    _record_throughput(benchmark, real_total_size_mb, cache_state)
+    benchmark.extra_info["n_sources"] = n_sources
+    benchmark.extra_info["variant"] = variant
 
 
 @cuda_required

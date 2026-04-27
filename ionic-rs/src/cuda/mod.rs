@@ -125,6 +125,13 @@ pub struct CuContext {
     ctx: CUcontext,
 }
 
+// SAFETY: a primary context can be made current on multiple threads
+// independently (each thread maintains its own context stack via
+// push/pop). Sharing `&CuContext` across threads so each can call
+// `with_current` is the documented use pattern.
+unsafe impl Send for CuContext {}
+unsafe impl Sync for CuContext {}
+
 impl CuContext {
     pub fn primary_retain(device: CuDevice) -> Result<Self> {
         let cuda = lib()?;
@@ -187,6 +194,13 @@ pub struct CuStream {
     stream: CUstream,
 }
 
+// SAFETY: CUDA driver API documents stream-side ops (`cuMemcpyHtoDAsync`,
+// `cuStreamSynchronize`, `cuEventRecord(_, stream)`) as thread-safe. The
+// `CUstream` handle is just an opaque pointer the driver looks up; nothing
+// in our wrapper holds thread-affine state.
+unsafe impl Send for CuStream {}
+unsafe impl Sync for CuStream {}
+
 impl CuStream {
     /// Create a non-blocking stream. Non-blocking means it does not
     /// implicitly serialize with the legacy default stream — essential for
@@ -229,6 +243,13 @@ pub struct CuEvent {
     event: CUevent,
 }
 
+// SAFETY: same rationale as CuStream — `cuEventRecord`, `cuEventQuery`,
+// `cuEventSynchronize`, `cuEventDestroy` are all documented thread-safe by
+// the CUDA driver. Two-thread pipeline records on the worker thread and
+// the events live for the lifetime of the pipeline.
+unsafe impl Send for CuEvent {}
+unsafe impl Sync for CuEvent {}
+
 impl CuEvent {
     /// Timing-disabled event. We only use these for happens-before fences,
     /// not for profiling — timing-disabled events are cheaper to record.
@@ -256,6 +277,23 @@ impl CuEvent {
             unsafe { (cuda.cuEventSynchronize)(self.event) },
             "cuEventSynchronize",
         )
+    }
+
+    /// Non-blocking status check. Returns `Ok(true)` if all work captured
+    /// by the event has completed, `Ok(false)` if any is still in flight,
+    /// `Err(...)` for any other CUDA error. The async pipeline polls this
+    /// to recycle slots without ever calling `cuStreamSynchronize`.
+    pub fn query(&self) -> Result<bool> {
+        let cuda = lib()?;
+        let rc = unsafe { (cuda.cuEventQuery)(self.event) };
+        match rc {
+            sys::CUDA_SUCCESS => Ok(true),
+            sys::CUDA_ERROR_NOT_READY => Ok(false),
+            _ => Err(Error::Cuda {
+                symbol: "cuEventQuery",
+                code: rc as i32,
+            }),
+        }
     }
 }
 
@@ -353,6 +391,13 @@ impl PinnedBuf {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
     }
 
+    /// Immutable slice view of the pinned region.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: we own the allocation; bytes is the exact size returned
+        // by cuMemHostAlloc.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.bytes) }
+    }
+
     pub fn len(&self) -> usize {
         self.bytes
     }
@@ -386,5 +431,22 @@ pub fn memcpy_h2d_async(
             (cuda.cuMemcpyHtoDAsync)(dst, src as *const std::ffi::c_void, bytes, stream.as_raw())
         },
         "cuMemcpyHtoDAsync_v2",
+    )
+}
+
+/// Synchronous D2H copy. Used by tests to verify GPU contents; the
+/// production prefetch path doesn't read back from the device.
+///
+/// Context must be current on the calling thread (wrap in `with_current`).
+///
+/// # Safety
+///
+/// `dst` must point to writable host memory of at least `bytes` length, and
+/// `src` must be a valid CUdeviceptr with at least `bytes` reachable.
+pub unsafe fn memcpy_d2h(dst: *mut u8, src: CUdeviceptr, bytes: usize) -> Result<()> {
+    let cuda = lib()?;
+    check(
+        unsafe { (cuda.cuMemcpyDtoH)(dst as *mut std::ffi::c_void, src, bytes) },
+        "cuMemcpyDtoH_v2",
     )
 }

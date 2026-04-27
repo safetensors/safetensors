@@ -18,8 +18,10 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 pub mod cuda;
+pub mod dlpack;
 pub mod error;
 pub mod iouring;
 pub mod numa;
+pub mod pipeline;
 
 pub use error::{Error, Result};

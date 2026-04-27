@@ -36,7 +36,8 @@ fn read_via_engine(
     chunk_bytes: usize,
     qd: u32,
 ) -> Vec<u8> {
-    let mut engine = ReadEngine::new(qd, chunk_bytes).expect("ReadEngine::new");
+    let mut engine =
+        ReadEngine::<Box<[u8]>>::new(qd, chunk_bytes).expect("ReadEngine::new");
     let fd_idx = engine.register_file(path).expect("register_file");
 
     let mut total: usize = 0;

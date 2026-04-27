@@ -22,6 +22,16 @@
 mod coalesce;
 pub use coalesce::{coalesce_chunks, ChunkRead, LogicalSegment, ScatterEntry};
 
+/// One io_uring read completion. Returned by `ReadEngine::peek_completions`.
+/// `slot` identifies the staging buffer holding the bytes; `bytes_read` is
+/// the actual count returned by the kernel (may be less than the requested
+/// chunk length when reading past EOF).
+#[derive(Debug, Clone, Copy)]
+pub struct Completion {
+    pub slot: u32,
+    pub bytes_read: usize,
+}
+
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
@@ -32,26 +42,77 @@ use io_uring::{opcode, types, IoUring};
 use crate::error::{Error, Result};
 
 pub const DEFAULT_QUEUE_DEPTH: u32 = 64;
-pub const DEFAULT_CHUNK_BYTES: usize = 128 * 1024;
+/// 512 KiB. Empirically chosen — between 128 KiB and 4 MiB the warm-cache
+/// throughput on a single-tensor read is roughly flat, but the per-chunk
+/// fixed overhead (slot bookkeeping + stream sync) amortizes better at
+/// 512 KiB than at 128 KiB. Cold-cache stays bandwidth-bound on either.
+pub const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
 
-pub struct ReadEngine {
+/// Storage type for io_uring's registered staging buffers.
+///
+/// The engine accepts any backing that exposes raw byte storage. Two
+/// implementations matter:
+///
+/// - [`Box<[u8]>`] — pageable host memory. Used by the standalone tests and
+///   any non-CUDA consumer. Reads land here, but the H2D path that follows
+///   has to bounce through the driver's own pinned buffer, capping
+///   throughput at ~6–7 GB/s effective.
+/// - [`crate::cuda::PinnedBuf`] — page-locked host memory allocated via
+///   `cuMemHostAlloc`. The CUDA pipeline uses this so `cuMemcpyHtoDAsync`
+///   can DMA directly without a bounce, hitting ~25–50 GB/s on PCIe Gen5.
+pub trait StagingBuffer: Send {
+    fn alloc(bytes: usize) -> Result<Self>
+    where
+        Self: Sized;
+    fn as_slice(&self) -> &[u8];
+    fn as_mut_slice(&mut self) -> &mut [u8];
+}
+
+impl StagingBuffer for Box<[u8]> {
+    fn alloc(bytes: usize) -> Result<Self> {
+        Ok(vec![0u8; bytes].into_boxed_slice())
+    }
+    fn as_slice(&self) -> &[u8] {
+        self
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+impl StagingBuffer for crate::cuda::PinnedBuf {
+    fn alloc(bytes: usize) -> Result<Self> {
+        Self::alloc(bytes)
+    }
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+/// io_uring read engine generic over its staging buffer type. Default is
+/// `Box<[u8]>` so existing call sites and tests work unchanged; the CUDA
+/// pipeline parametrizes with `PinnedBuf` for direct-DMA H2D.
+pub struct ReadEngine<B: StagingBuffer = Box<[u8]>> {
     ring: IoUring,
     /// Owned files. Index in this Vec equals the index into the kernel's
     /// registered-files table (`Fixed(idx)` in opcodes).
     files: Vec<File>,
     /// One staging buffer per slot, length == `qd`. Index equals
     /// `buf_index` in the registered-buffers table.
-    bufs: Vec<Box<[u8]>>,
+    bufs: Vec<B>,
     /// Free slot indices. `pop_front()` to claim, `push_back()` to release.
     free: VecDeque<u32>,
     chunk_bytes: usize,
     qd: u32,
 }
 
-impl ReadEngine {
+impl<B: StagingBuffer> ReadEngine<B> {
     /// Open a ring with `qd` SQEs/CQEs and pre-allocate `qd` chunk-sized
-    /// staging buffers, registered with the kernel. Files are added later
-    /// via `register_file`.
+    /// staging buffers via `B::alloc`, then register them with the kernel.
+    /// Files are added later via `register_file`.
     pub fn new(qd: u32, chunk_bytes: usize) -> Result<Self> {
         if qd == 0 || chunk_bytes == 0 {
             return Err(Error::Other(format!(
@@ -60,24 +121,28 @@ impl ReadEngine {
         }
         let ring = IoUring::new(qd).map_err(|e| io_err("IoUring::new", &e))?;
 
-        // Allocate one buffer per slot. Initialized to zero — the kernel
-        // overwrites on read; we never observe the initial bytes.
-        let bufs: Vec<Box<[u8]>> = (0..qd)
-            .map(|_| vec![0u8; chunk_bytes].into_boxed_slice())
-            .collect();
+        // Allocate one buffer per slot. The chosen `B::alloc` controls
+        // whether these are pageable (`Box<[u8]>`) or pinned (`PinnedBuf`).
+        let mut bufs: Vec<B> = Vec::with_capacity(qd as usize);
+        for _ in 0..qd {
+            bufs.push(B::alloc(chunk_bytes)?);
+        }
 
         // Build iovecs pointing at each buffer. The kernel doesn't move the
         // memory; we just hand it the address + length so it can do the read.
         let iovecs: Vec<libc::iovec> = bufs
             .iter()
-            .map(|b| libc::iovec {
-                iov_base: b.as_ptr() as *mut _,
-                iov_len: b.len(),
+            .map(|b| {
+                let s = b.as_slice();
+                libc::iovec {
+                    iov_base: s.as_ptr() as *mut _,
+                    iov_len: s.len(),
+                }
             })
             .collect();
-        // SAFETY: each iovec points into a `Box<[u8]>` we own; the boxes
+        // SAFETY: each iovec points into a buffer we own; the buffers
         // outlive the registration (we explicitly unregister in `Drop` before
-        // the boxes are freed; field drop order ensures `ring` drops first).
+        // the buffers are freed; field drop order ensures `ring` drops first).
         unsafe {
             ring.submitter()
                 .register_buffers(&iovecs)
@@ -125,14 +190,109 @@ impl ReadEngine {
         Ok(idx)
     }
 
+    // ── Lower-level primitives for the async CUDA pipeline ─────────────
+    //
+    // The `fetch` convenience below uses these internally for the
+    // synchronous slot-recycle loop. The CUDA pipeline calls them directly
+    // so it can interleave io_uring polling with `cuEventQuery`-based slot
+    // recycling — slot release waits on the H2D event, not on a stream sync.
+
+    /// Pop a free slot index from the pool, or `None` if all slots are
+    /// currently in flight.
+    pub fn acquire_slot(&mut self) -> Option<u32> {
+        self.free.pop_front()
+    }
+
+    /// Push an `IORING_OP_READ_FIXED` SQE for `chunk` into the slot's
+    /// staging buffer. Doesn't submit to the kernel — caller batches via
+    /// `flush_submissions`.
+    ///
+    /// The SQE's user_data is set to the slot index, so completions
+    /// returned by `peek_completions` carry the slot back.
+    pub fn submit_read(&mut self, slot: u32, chunk: &ChunkRead) -> Result<()> {
+        let buf_ptr = self.bufs[slot as usize].as_mut_slice().as_mut_ptr();
+        let entry = opcode::ReadFixed::new(
+            types::Fixed(chunk.fd_idx),
+            buf_ptr,
+            chunk.len as u32,
+            slot as u16,
+        )
+        .offset(chunk.offset)
+        .build()
+        .user_data(slot as u64);
+        // SAFETY: pointers refer to memory we own (`bufs[slot]`) and a
+        // registered fd (`files`); both outlive the in-flight op (caller
+        // tracks completion before recycling slot or dropping engine).
+        unsafe {
+            self.ring.submission().push(&entry).map_err(|_| {
+                Error::Other("submission queue push failed (queue full?)".into())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Submit any pending SQEs to the kernel. Returns the number submitted.
+    pub fn flush_submissions(&mut self) -> Result<usize> {
+        self.ring
+            .submit()
+            .map_err(|e| io_err("submit", &e))
+    }
+
+    /// Block until at least one CQE is available, submitting any pending
+    /// SQEs in the same syscall. Use when the slot pool is exhausted and
+    /// no more progress is possible without a completion.
+    pub fn submit_and_wait_one(&mut self) -> Result<()> {
+        self.ring
+            .submit_and_wait(1)
+            .map_err(|e| io_err("submit_and_wait", &e))?;
+        Ok(())
+    }
+
+    /// Drain ready CQEs without blocking. Returns one entry per completed
+    /// read carrying the slot index and the byte count actually read
+    /// (which may be less than `chunk.len` near EOF).
+    pub fn peek_completions(&mut self) -> Result<Vec<Completion>> {
+        let cqes: Vec<io_uring::cqueue::Entry> = self.ring.completion().collect();
+        let mut out = Vec::with_capacity(cqes.len());
+        for cqe in cqes {
+            let slot = cqe.user_data() as u32;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(Error::IoUring {
+                    op: "read_fixed",
+                    errno: -result,
+                });
+            }
+            out.push(Completion {
+                slot,
+                bytes_read: result as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Borrow a slot's staging buffer up to `bytes` bytes — caller passes
+    /// the byte count from the matching `Completion`. Use after a CQE is
+    /// returned and before the slot is released.
+    pub fn slot_buffer(&self, slot: u32, bytes: usize) -> &[u8] {
+        &self.bufs[slot as usize].as_slice()[..bytes]
+    }
+
+    /// Return a slot to the free pool. Caller is responsible for ensuring
+    /// no pending consumer is still reading from the slot's buffer (e.g.
+    /// pending H2D copy must be observed complete via `cuEventQuery`).
+    pub fn release_slot(&mut self, slot: u32) {
+        self.free.push_back(slot);
+    }
+
     /// Submit `chunks` to io_uring and synchronously process completions via
     /// `on_chunk`. The callback receives the slot's staging buffer (read
     /// truncated to the actual byte count returned by the kernel) and the
     /// scatter entries the coalescer attached to this chunk. The slot
     /// returns to the free pool immediately after `on_chunk` returns.
     ///
-    /// In P4 this is replaced by a `submit` + `peek_completed` pair, with
-    /// the DMA worker owning slot release.
+    /// Used by the standalone iouring tests; the CUDA pipeline drives the
+    /// lower-level primitives directly to overlap reads with H2D.
     pub fn fetch<F>(&mut self, chunks: &[ChunkRead], mut on_chunk: F) -> Result<()>
     where
         F: FnMut(&[u8], &[ScatterEntry]) -> Result<()>,
@@ -156,7 +316,7 @@ impl ReadEngine {
                     None => break, // QD full; need to drain CQEs first.
                 };
                 let chunk = &chunks[next_chunk];
-                let buf_ptr = self.bufs[slot as usize].as_mut_ptr();
+                let buf_ptr = self.bufs[slot as usize].as_mut_slice().as_mut_ptr();
 
                 let entry = opcode::ReadFixed::new(
                     types::Fixed(chunk.fd_idx),
@@ -215,7 +375,7 @@ impl ReadEngine {
                 }
                 let bytes_read = result as usize;
                 let chunk = &chunks[chunk_idx];
-                let buf = &self.bufs[slot as usize][..bytes_read];
+                let buf = &self.bufs[slot as usize].as_slice()[..bytes_read];
 
                 // Short reads happen at EOF: kernel returns fewer bytes than
                 // we asked for. We promise callers that every scatter entry
@@ -256,7 +416,7 @@ impl ReadEngine {
     }
 }
 
-impl Drop for ReadEngine {
+impl<B: StagingBuffer> Drop for ReadEngine<B> {
     fn drop(&mut self) {
         // Unregister explicitly so the kernel releases its references to our
         // pinned buffers and fds before the backing memory / files are freed

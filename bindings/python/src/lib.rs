@@ -14,16 +14,18 @@ use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
+use std::io::Read;
 use std::ops::Bound;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 mod pipeline;
 
-static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+pub(crate) static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static TENSORFLOW_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -547,13 +549,12 @@ impl Version {
     }
 }
 
-struct Open {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    filename: PathBuf,
-    metadata: Metadata,
-    offset: usize,
-    framework: Framework,
-    device: Device,
+pub(crate) struct Open {
+    pub(crate) filename: PathBuf,
+    pub(crate) metadata: Metadata,
+    pub(crate) offset: usize,
+    pub(crate) framework: Framework,
+    pub(crate) device: Device,
     storage: Arc<Storage>,
 }
 
@@ -1167,14 +1168,311 @@ impl Open {
     }
 }
 
-/// Opens a safetensors lazily and returns tensors as asked
+// ── Multi-source support ────────────────────────────────────────────────
+//
+// `OpenSources` is the multi-file equivalent of `Open` used by
+// `safe_open` when the caller passes more than one source file (or an
+// `.index.json` manifest). It is intentionally lightweight — it does
+// not mmap each source or build per-source torch storages, only reads
+// each header. Per-tensor `get_tensor` lazily constructs a fresh
+// single-file `Open` for the relevant source on demand; bulk loads are
+// expected to go through `prefetch()` which uses io_uring directly.
+
+/// Read just the header of a safetensors file (8-byte size prefix +
+/// JSON metadata). Returns the parsed [`Metadata`] and the byte offset
+/// where the data section starts (`header_size + 8`).
+///
+/// Avoids `mmap` and `SafeTensors::read_metadata`. The latter validates
+/// that the buffer covers the entire file (including the data section),
+/// which would force us to size a buffer to multi-GB just to parse a
+/// few KB of header. We instead deserialize `Metadata` directly via
+/// `serde_json::from_slice` — this still runs the per-tensor offset
+/// validation inside `Metadata::new` (called from `TryFrom<HashMetadata>`).
+/// Skipped check: the file-end coverage one, which we don't need since
+/// downstream reads go through io_uring against the file's actual size.
+pub(crate) fn read_source_metadata(path: &Path) -> PyResult<(Metadata, usize)> {
+    /// Defense-in-depth: cap the header at a generous bound so a corrupt
+    /// 8-byte prefix (claiming a multi-EiB header) can't trigger an OOM.
+    /// 100 MiB is ~3 orders of magnitude above any real safetensors header.
+    const MAX_HEADER_BYTES: usize = 100 * 1024 * 1024;
+
+    let mut file = File::open(path)
+        .map_err(|e| PyFileNotFoundError::new_err(format!("opening {}: {e}", path.display())))?;
+    let mut size_buf = [0u8; 8];
+    file.read_exact(&mut size_buf).map_err(|e| {
+        SafetensorError::new_err(format!("reading header size in {}: {e}", path.display()))
+    })?;
+    let header_size = u64::from_le_bytes(size_buf) as usize;
+    if header_size == 0 || header_size > MAX_HEADER_BYTES {
+        return Err(SafetensorError::new_err(format!(
+            "{} reports header_size={} bytes (cap {})",
+            path.display(),
+            header_size,
+            MAX_HEADER_BYTES
+        )));
+    }
+    let mut header_bytes = vec![0u8; header_size];
+    file.read_exact(&mut header_bytes).map_err(|e| {
+        SafetensorError::new_err(format!("reading header in {}: {e}", path.display()))
+    })?;
+    let metadata: Metadata = serde_json::from_slice(&header_bytes).map_err(|e| {
+        SafetensorError::new_err(format!("parsing header of {}: {e}", path.display()))
+    })?;
+    Ok((metadata, header_size + 8))
+}
+
+/// One source file inside an [`OpenSources`].
+pub(crate) struct SourceEntry {
+    pub(crate) filename: PathBuf,
+    pub(crate) metadata: Metadata,
+    /// Byte offset where this source's tensor data begins (header size +
+    /// the 8-byte length prefix).
+    pub(crate) offset: usize,
+}
+
+/// N-source equivalent of [`Open`]. Carries each source's filename +
+/// parsed metadata, plus a name → source index for O(1) lookup at
+/// prefetch time.
+pub(crate) struct OpenSources {
+    pub(crate) sources: Vec<SourceEntry>,
+    /// `name → source_idx`. Tensor names must be unique across the
+    /// checkpoint per the safetensors index format; `new` errors out if
+    /// two sources both claim the same name.
+    pub(crate) name_index: HashMap<String, usize>,
+    pub(crate) framework: Framework,
+    pub(crate) device: Device,
+}
+
+impl OpenSources {
+    pub fn new(
+        paths: Vec<PathBuf>,
+        framework: Framework,
+        device: Option<Device>,
+    ) -> PyResult<Self> {
+        if paths.is_empty() {
+            return Err(SafetensorError::new_err(
+                "safe_open with multiple sources requires at least one path".to_string(),
+            ));
+        }
+        let device = device.unwrap_or(Device::Cpu);
+        if device != Device::Cpu
+            && framework != Framework::Pytorch
+            && framework != Framework::Paddle
+        {
+            return Err(SafetensorError::new_err(format!(
+                "Device {device} is not supported for framework {framework}",
+            )));
+        }
+
+        // Pre-import torch when relevant so DLPack handoff doesn't pay
+        // import cost on the prefetch hot path.
+        Python::attach(|py| -> PyResult<()> {
+            if matches!(framework, Framework::Pytorch) {
+                let module = PyModule::import(py, intern!(py, "torch"))?;
+                TORCH_MODULE.get_or_init_py_attached(py, || module.into());
+            }
+            Ok(())
+        })?;
+
+        let mut sources = Vec::with_capacity(paths.len());
+        let mut name_index: HashMap<String, usize> = HashMap::new();
+        for (sidx, path) in paths.into_iter().enumerate() {
+            let (metadata, offset) = read_source_metadata(&path)?;
+            for name in metadata.tensors().keys() {
+                if let Some(prev) = name_index.insert(name.clone(), sidx) {
+                    return Err(SafetensorError::new_err(format!(
+                        "tensor '{}' present in both source {} and source {}",
+                        name, prev, sidx
+                    )));
+                }
+            }
+            sources.push(SourceEntry {
+                filename: path,
+                metadata,
+                offset,
+            });
+        }
+
+        Ok(Self {
+            sources,
+            name_index,
+            framework,
+            device,
+        })
+    }
+
+    /// All tensor names, sorted for reproducible iteration.
+    pub fn keys(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.name_index.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Aggregate freeform metadata across sources. Last-write-wins on
+    /// conflicting keys; in practice index'd checkpoints don't carry
+    /// per-source freeform metadata, so this is mostly informational.
+    pub fn metadata_freeform(&self) -> Option<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        for src in &self.sources {
+            if let Some(md) = src.metadata.metadata() {
+                for (k, v) in md {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Resolve a tensor name to `(source_idx, &TensorInfo)`. Returns
+    /// `None` when the tensor isn't present in any source.
+    pub fn info(&self, name: &str) -> Option<(usize, &TensorInfo)> {
+        let sidx = *self.name_index.get(name)?;
+        let info = self.sources[sidx].metadata.info(name)?;
+        Some((sidx, info))
+    }
+
+    /// Lazily build a single-source `Open` for the source containing `name`
+    /// and delegate to its `get_tensor`. Slow if called repeatedly for many
+    /// tensors — bulk loads should go through `prefetch()`.
+    pub fn get_tensor(&self, name: &str) -> PyResult<Py<PyAny>> {
+        let sidx = *self.name_index.get(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("File does not contain tensor {name}"))
+        })?;
+        let entry = &self.sources[sidx];
+        let open = Open::new(
+            entry.filename.clone(),
+            self.framework.clone(),
+            Some(self.device.clone()),
+        )?;
+        open.get_tensor(name)
+    }
+}
+
+/// Polymorphic input accepted by [`safe_open`]. Resolved to a flat
+/// `Vec<PathBuf>` of source files via [`resolve_source_paths`].
+pub(crate) enum SourceInput {
+    /// Single path. May be either a `.safetensors` file (single-source)
+    /// or an `.index.json` manifest (multi-source — sniffed at runtime).
+    Single(PathBuf),
+    /// Explicit list of `.safetensors` source files.
+    Multiple(Vec<PathBuf>),
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for SourceInput {
+    type Error = PyErr;
+    fn extract(ob: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        // Try PathBuf first — a list/tuple won't extract as PathBuf so it
+        // falls through, but a raw str (which Python considers iterable)
+        // matches the single-path case here rather than being misread as
+        // a `Vec<PathBuf>` of one-character strings.
+        if let Ok(p) = ob.extract::<PathBuf>() {
+            return Ok(Self::Single(p));
+        }
+        if let Ok(v) = ob.extract::<Vec<PathBuf>>() {
+            return Ok(Self::Multiple(v));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "expected str/PathLike, list[str/PathLike], or path to a .index.json file",
+        ))
+    }
+}
+
+/// Sniff `.index.json` and resolve to a flat list of source files.
+/// Single non-index path → `[path]`; explicit list → as-is; index path →
+/// parsed manifest.
+pub(crate) fn resolve_source_paths(input: SourceInput) -> PyResult<Vec<PathBuf>> {
+    match input {
+        SourceInput::Single(p) => {
+            // `.index.json` (or `model.safetensors.index.json`) — manifest.
+            // Anything else is treated as a single source file.
+            if is_index_json(&p) {
+                parse_index_json(&p)
+            } else {
+                Ok(vec![p])
+            }
+        }
+        SourceInput::Multiple(paths) => {
+            if paths.is_empty() {
+                Err(SafetensorError::new_err(
+                    "safe_open: empty source list".to_string(),
+                ))
+            } else {
+                Ok(paths)
+            }
+        }
+    }
+}
+
+fn is_index_json(path: &Path) -> bool {
+    // Match either `<anything>.index.json` (HF convention) or a bare
+    // `.index.json`. `extension()` only returns the last component, so
+    // we sniff via the full filename.
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".index.json"))
+        .unwrap_or(false)
+}
+
+/// Parse an HF `*.safetensors.index.json` manifest. The manifest's
+/// `weight_map` is `{tensor_name: source_filename}`; we dedupe values
+/// to recover the source list, resolve each filename relative to the
+/// manifest's parent directory, and sort for reproducible order.
+fn parse_index_json(path: &Path) -> PyResult<Vec<PathBuf>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| PyFileNotFoundError::new_err(format!("opening {}: {e}", path.display())))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| SafetensorError::new_err(format!("parsing {}: {e}", path.display())))?;
+    let weight_map = value
+        .get("weight_map")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            SafetensorError::new_err(format!("{} missing 'weight_map' object", path.display()))
+        })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for (_name, src_value) in weight_map {
+        if let Some(src) = src_value.as_str() {
+            if seen.insert(src.to_string()) {
+                sources.push(parent.join(src));
+            }
+        }
+    }
+    if sources.is_empty() {
+        return Err(SafetensorError::new_err(format!(
+            "{} weight_map is empty or malformed",
+            path.display()
+        )));
+    }
+    sources.sort();
+    Ok(sources)
+}
+
+/// Internal storage for [`safe_open`]. The Python surface is identical
+/// for both kinds; methods dispatch on this enum.
+pub(crate) enum SafeOpenKind {
+    Single(Open),
+    Multi(OpenSources),
+}
+
+/// Opens a safetensors checkpoint lazily and returns tensors as asked.
 ///
 /// Args:
-///     filename (`str`, or `os.PathLike`):
-///         The filename to open
+///     filename (`str`, `os.PathLike`, `list[str | PathLike]`, or path to
+///         a `*.safetensors.index.json`):
+///         - A single safetensors file path (the original single-source
+///           behavior — fully unchanged).
+///         - A list of source file paths.
+///         - A path ending in `.index.json` — the HF manifest format. Its
+///           `weight_map` is parsed and sources are resolved relative to
+///           the manifest's parent directory.
 ///
 ///     framework (`str`):
-///         The framework you want you tensors in. Supported values:
+///         The framework you want your tensors in. Supported values:
 ///         `pt`, `tf`, `flax`, `numpy`.
 ///
 ///     device (`str`, defaults to `"cpu"`):
@@ -1182,16 +1480,26 @@ impl Open {
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
-    inner: Option<Open>,
+    inner: Option<SafeOpenKind>,
 }
 
 impl safe_open {
-    fn inner(&self) -> PyResult<&Open> {
-        let inner = self
-            .inner
+    fn inner_kind(&self) -> PyResult<&SafeOpenKind> {
+        self.inner
             .as_ref()
-            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
-        Ok(inner)
+            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
+    }
+
+    /// Helper for methods only valid in single-source mode (e.g.
+    /// `offset_keys`, `get_slice`, `get_tensors`). Returns an
+    /// "unsupported" error in multi-source mode.
+    fn require_single<'a>(&'a self, op: &str) -> PyResult<&'a Open> {
+        match self.inner_kind()? {
+            SafeOpenKind::Single(o) => Ok(o),
+            SafeOpenKind::Multi(_) => Err(SafetensorError::new_err(format!(
+                "{op} is not yet supported on multi-source safe_open; use prefetch()"
+            ))),
+        }
     }
 }
 
@@ -1199,36 +1507,58 @@ impl safe_open {
 impl safe_open {
     #[new]
     #[pyo3(signature = (filename, framework, device=Some(Device::Cpu)))]
-    fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device)?);
-        Ok(Self { inner })
+    fn new(filename: SourceInput, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+        let paths = resolve_source_paths(filename)?;
+        let inner = if paths.len() == 1 {
+            // Existing single-source code path — fully unchanged for the
+            // common case: caller passed a single `*.safetensors` path.
+            let only = paths.into_iter().next().expect("len == 1");
+            SafeOpenKind::Single(Open::new(only, framework, device)?)
+        } else {
+            SafeOpenKind::Multi(OpenSources::new(paths, framework, device)?)
+        };
+        Ok(Self { inner: Some(inner) })
     }
 
-    /// Return the special non tensor information in the header
+    /// Return the special non tensor information in the header.
+    ///
+    /// In multi-source mode the freeform metadata is aggregated across
+    /// every source (last-write-wins on key conflicts).
     ///
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
     pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
-        Ok(self.inner()?.metadata())
+        match self.inner_kind()? {
+            SafeOpenKind::Single(o) => Ok(o.metadata()),
+            SafeOpenKind::Multi(o) => Ok(o.metadata_freeform()),
+        }
     }
 
-    /// Returns the names of the tensors in the file.
+    /// Returns the names of the tensors in the file (or across the
+    /// union of source files in multi-source mode).
     ///
     /// Returns:
     ///     (`List[str]`):
     ///         The name of the tensors contained in that file
     pub fn keys(&self) -> PyResult<Vec<String>> {
-        self.inner()?.keys()
+        match self.inner_kind()? {
+            SafeOpenKind::Single(o) => o.keys(),
+            SafeOpenKind::Multi(o) => Ok(o.keys()),
+        }
     }
 
     /// Returns the names of the tensors in the file, ordered by offset.
+    ///
+    /// Multi-source: not yet supported. Single-source ordering is by
+    /// data_offset within the file; cross-source ordering is ambiguous
+    /// (no canonical interleaving) so we error rather than fabricate one.
     ///
     /// Returns:
     ///     (`List[str]`):
     ///         The name of the tensors contained in that file
     pub fn offset_keys(&self) -> PyResult<Vec<String>> {
-        self.inner()?.offset_keys()
+        self.require_single("offset_keys")?.offset_keys()
     }
 
     /// Returns a full tensor
@@ -1249,7 +1579,14 @@ impl safe_open {
     ///     tensor = f.get_tensor("embedding")
     /// ```
     pub fn get_tensor(&self, name: &str) -> PyResult<Py<PyAny>> {
-        self.inner()?.get_tensor(name)
+        match self.inner_kind()? {
+            SafeOpenKind::Single(o) => o.get_tensor(name),
+            // Multi-source: lazily build a single-source `Open` for the
+            // matching source. Fine for occasional lookups; bulk loads
+            // should use `prefetch()` to share one io_uring engine across
+            // all sources.
+            SafeOpenKind::Multi(o) => o.get_tensor(name),
+        }
     }
 
     /// Returns every tensor in the file as a dict keyed by name.
@@ -1259,6 +1596,10 @@ impl safe_open {
     /// internal fast path (e.g. MPS with PyTorch ≥ 2.10's
     /// `_host_alias_storage` bulk-allocates and fills tensors with parallel
     /// `pread(2)`).
+    ///
+    /// Multi-source: not yet supported via this entry — use `prefetch()`
+    /// which gives the same dict via `dict(handle)` and uses the io_uring
+    /// engine across all sources.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
@@ -1272,10 +1613,14 @@ impl safe_open {
     ///     state_dict = f.get_tensors()
     /// ```
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        self.inner()?.get_tensors()
+        self.require_single("get_tensors")?.get_tensors()
     }
 
-    /// Returns a full slice view object
+    /// Returns a full slice view object.
+    ///
+    /// Multi-source: not yet supported. Slice views need a stable mmap
+    /// to project into; multi-source uses io_uring for bulk reads and
+    /// doesn't expose per-tensor mmap views.
     ///
     /// Args:
     ///     name (`str`):
@@ -1292,7 +1637,7 @@ impl safe_open {
     ///     tensor_part = f.get_slice("embedding")[:, ::8]
     /// ```
     pub fn get_slice(&self, name: &str) -> PyResult<PySafeSlice> {
-        self.inner()?.get_slice(name)
+        self.require_single("get_slice")?.get_slice(name)
     }
 
     /// Bulk-load a set of tensors through an opt-in fast path.
@@ -1329,7 +1674,10 @@ impl safe_open {
         max_inflight: usize,
     ) -> PyResult<pipeline::PrefetchHandle> {
         let _ = (dtype, max_inflight);
-        pipeline::PrefetchHandle::build_trivial(self.inner()?, names)
+        match self.inner_kind()? {
+            SafeOpenKind::Single(o) => pipeline::PrefetchHandle::build(o, names),
+            SafeOpenKind::Multi(o) => pipeline::PrefetchHandle::build_sources(o, names),
+        }
     }
 
     /// Start the context manager
@@ -1815,7 +2163,7 @@ fn create_tensor<'a>(
     })
 }
 
-fn get_pydtype(
+pub(crate) fn get_pydtype(
     module: &PyBound<'_, PyModule>,
     dtype: Dtype,
     is_numpy: bool,
@@ -1992,7 +2340,7 @@ impl _safe_open_handle {
         max_inflight: usize,
     ) -> PyResult<pipeline::PrefetchHandle> {
         let _ = (dtype, max_inflight);
-        pipeline::PrefetchHandle::build_trivial(self.inner()?, names)
+        pipeline::PrefetchHandle::build(self.inner()?, names)
     }
 
     /// Start the context manager
@@ -2006,6 +2354,14 @@ impl _safe_open_handle {
     }
 }
 
+/// Multi-shard prefetch entry point. Opens every path in `paths`, reads
+/// each header, builds a single ionic-rs CUDA pipeline that registers all
+/// shards' fds, then runs one io_uring + DMA pass across the entire
+/// checkpoint. Returns a [`PrefetchHandle`](pipeline::PrefetchHandle) —
+/// same iterator interface as `safe_open.prefetch`.
+///
+/// Args:
+///     paths: list of safetensors shard paths (typically all `*.safetensors`
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
 fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {

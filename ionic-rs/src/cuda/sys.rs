@@ -33,6 +33,9 @@ pub type CUevent = *mut c_void;
 pub type CUdeviceptr = u64;
 
 pub const CUDA_SUCCESS: CUresult = 0;
+/// Returned by `cuEventQuery` when the event's captured work is still
+/// outstanding. Non-blocking polls treat this as "not done yet," not an error.
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
 
 // Stream creation flags. `NON_BLOCKING` means this stream does not
 // implicitly synchronize with the legacy default stream — critical for
@@ -74,12 +77,19 @@ pub struct CudaLib {
     pub cuEventDestroy: unsafe extern "C" fn(CUevent) -> CUresult,
     pub cuEventRecord: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
     pub cuEventSynchronize: unsafe extern "C" fn(CUevent) -> CUresult,
+    /// Non-blocking event status: returns `CUDA_SUCCESS` if all captured
+    /// work has completed, `CUDA_ERROR_NOT_READY` (=600) if work is still
+    /// outstanding, or another error code on failure.
+    pub cuEventQuery: unsafe extern "C" fn(CUevent) -> CUresult,
     pub cuMemAlloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
     pub cuMemFree: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
     pub cuMemHostAlloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
     pub cuMemFreeHost: unsafe extern "C" fn(*mut c_void) -> CUresult,
     pub cuMemcpyHtoDAsync:
         unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
+    /// Synchronous device-to-host copy. Tests use this to read GPU buffers
+    /// back to host for verification; production paths run async on a stream.
+    pub cuMemcpyDtoH: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
     pub cuGetErrorString: unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult,
 }
 
@@ -133,11 +143,13 @@ impl CudaLib {
             cuEventDestroy: load_fn!(&lib, "cuEventDestroy_v2"),
             cuEventRecord: load_fn!(&lib, "cuEventRecord"),
             cuEventSynchronize: load_fn!(&lib, "cuEventSynchronize"),
+            cuEventQuery: load_fn!(&lib, "cuEventQuery"),
             cuMemAlloc: load_fn!(&lib, "cuMemAlloc_v2"),
             cuMemFree: load_fn!(&lib, "cuMemFree_v2"),
             cuMemHostAlloc: load_fn!(&lib, "cuMemHostAlloc"),
             cuMemFreeHost: load_fn!(&lib, "cuMemFreeHost"),
             cuMemcpyHtoDAsync: load_fn!(&lib, "cuMemcpyHtoDAsync_v2"),
+            cuMemcpyDtoH: load_fn!(&lib, "cuMemcpyDtoH_v2"),
             cuGetErrorString: load_fn!(&lib, "cuGetErrorString"),
             _lib: lib,
         })
