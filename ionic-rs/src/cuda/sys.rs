@@ -11,18 +11,18 @@
 //!
 //! All symbols are resolved at first use by `cuda::lib()` and cached in a
 //! `OnceLock`. Runtime discovery means one wheel ships everywhere; absent
-//! driver → `PipelineError::CudaUnavailable` on first call to a CUDA primitive.
+//! driver → `Error::CudaUnavailable` on first call to a CUDA primitive.
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
 use libloading::Library;
 
-use crate::pipeline::error::{PipelineError, PipelineResult};
+use crate::error::{Error, Result};
 
 // ── C types ─────────────────────────────────────────────────────────────
 
 /// Driver result code. Zero means success; non-zero maps to a `cudaError_enum`
-/// variant. We treat it as opaque and surface via `PipelineError::Cuda`.
+/// variant. We treat it as opaque and surface via `Error::Cuda`.
 pub type CUresult = c_int;
 pub type CUdevice = c_int;
 pub type CUcontext = *mut c_void;
@@ -95,7 +95,7 @@ macro_rules! load_fn {
             $lib.get(concat!($name, "\0").as_bytes())
         }
         .map_err(|e| {
-            PipelineError::CudaUnavailable(format!("resolving {}: {e}", $name))
+            Error::CudaUnavailable(format!("resolving {}: {e}", $name))
         })?;
         *sym
     }};
@@ -107,12 +107,12 @@ impl CudaLib {
     /// CPU-only box) or if any symbol is missing (incompatible driver).
     ///
     /// Does *not* call `cuInit` — callers do that after wrapping.
-    pub fn load() -> PipelineResult<Self> {
+    pub fn load() -> Result<Self> {
         // `libloading::Library::new` is `unsafe` because loading an arbitrary
         // shared library can execute initializer code. We trust the system's
         // `libcuda.so.1`.
         let lib = unsafe { Library::new("libcuda.so.1") }
-            .map_err(|e| PipelineError::CudaUnavailable(format!("dlopen libcuda.so.1: {e}")))?;
+            .map_err(|e| Error::CudaUnavailable(format!("dlopen libcuda.so.1: {e}")))?;
 
         Ok(Self {
             cuInit: load_fn!(&lib, "cuInit"),

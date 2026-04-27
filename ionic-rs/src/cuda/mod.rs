@@ -2,8 +2,8 @@
 //!
 //! Each handle (`CuContext`, `CuStream`, `CuEvent`, `DeviceBuf`, `PinnedBuf`)
 //! owns a driver-side resource and releases it on `Drop`. Fallible methods
-//! return `PipelineResult<_>`; errors carry the CUDA symbol and result code
-//! (see `PipelineError::Cuda`).
+//! return `Result<_>`; errors carry the CUDA symbol and result code
+//! (see `Error::Cuda`).
 //!
 //! **Context discipline.** Memory allocation, stream creation, and H2D copy
 //! require the calling thread to have a current CUDA context. PyTorch
@@ -20,15 +20,15 @@ use std::sync::OnceLock;
 
 use sys::{CudaLib, CUcontext, CUdevice, CUdeviceptr, CUevent, CUresult, CUstream, CUDA_SUCCESS};
 
-use crate::pipeline::error::{PipelineError, PipelineResult};
+use crate::error::{Error, Result};
 
 // ── Library access ──────────────────────────────────────────────────────
 
-fn check(rc: CUresult, symbol: &'static str) -> PipelineResult<()> {
+fn check(rc: CUresult, symbol: &'static str) -> Result<()> {
     if rc == CUDA_SUCCESS {
         Ok(())
     } else {
-        Err(PipelineError::Cuda {
+        Err(Error::Cuda {
             symbol,
             code: rc as i32,
         })
@@ -38,8 +38,12 @@ fn check(rc: CUresult, symbol: &'static str) -> PipelineResult<()> {
 /// Resolve and initialize the CUDA driver once, then hand out shared
 /// references. `cuInit(0)` is called on first access — safe to call multiple
 /// times per the driver's contract, but we only pay for it once.
-pub fn lib() -> PipelineResult<&'static CudaLib> {
-    static CUDA_LIB: OnceLock<Result<CudaLib, String>> = OnceLock::new();
+pub fn lib() -> Result<&'static CudaLib> {
+    // The OnceLock stores std::result::Result, not our crate Result alias —
+    // the cached error is a flat String (cheaply cloneable) rather than the
+    // full Error enum, so we can hand out `&'static CudaLib` references and
+    // re-construct an Error on each failure path.
+    static CUDA_LIB: OnceLock<std::result::Result<CudaLib, String>> = OnceLock::new();
     let res = CUDA_LIB.get_or_init(|| {
         // Two failure modes to collapse into one string: dlopen failure or
         // cuInit failure. The `OnceLock` value stores a flat `String` so the
@@ -52,7 +56,7 @@ pub fn lib() -> PipelineResult<&'static CudaLib> {
             .map_err(|e| e.to_string())
     });
     res.as_ref()
-        .map_err(|s| PipelineError::CudaUnavailable(s.clone()))
+        .map_err(|s| Error::CudaUnavailable(s.clone()))
 }
 
 // ── Device ──────────────────────────────────────────────────────────────
@@ -61,14 +65,14 @@ pub fn lib() -> PipelineResult<&'static CudaLib> {
 pub struct CuDevice(CUdevice);
 
 impl CuDevice {
-    pub fn count() -> PipelineResult<i32> {
+    pub fn count() -> Result<i32> {
         let cuda = lib()?;
         let mut n: i32 = 0;
         check(unsafe { (cuda.cuDeviceGetCount)(&mut n) }, "cuDeviceGetCount")?;
         Ok(n)
     }
 
-    pub fn get(ordinal: i32) -> PipelineResult<Self> {
+    pub fn get(ordinal: i32) -> Result<Self> {
         let cuda = lib()?;
         let mut dev: CUdevice = 0;
         check(
@@ -78,7 +82,7 @@ impl CuDevice {
         Ok(Self(dev))
     }
 
-    pub fn name(self) -> PipelineResult<String> {
+    pub fn name(self) -> Result<String> {
         let cuda = lib()?;
         let mut buf = [0 as c_char; 256];
         check(
@@ -93,7 +97,7 @@ impl CuDevice {
     /// PCI bus ID in sysfs-friendly form (lowercase `DDDD:BB:DD.F`). The
     /// driver returns uppercase hex; we normalize because sysfs paths are
     /// case-sensitive and use lowercase.
-    pub fn pci_bus_id(self) -> PipelineResult<String> {
+    pub fn pci_bus_id(self) -> Result<String> {
         let cuda = lib()?;
         let mut buf = [0 as c_char; 32];
         check(
@@ -122,7 +126,7 @@ pub struct CuContext {
 }
 
 impl CuContext {
-    pub fn primary_retain(device: CuDevice) -> PipelineResult<Self> {
+    pub fn primary_retain(device: CuDevice) -> Result<Self> {
         let cuda = lib()?;
         let mut ctx: CUcontext = std::ptr::null_mut();
         check(
@@ -133,12 +137,12 @@ impl CuContext {
     }
 
     /// Run `f` with this context current on the calling thread. The closure
-    /// returns a `PipelineResult`; the outer method returns the same,
+    /// returns a `Result`; the outer method returns the same,
     /// flattened. The context is popped before this returns, even on panic —
     /// the `PopGuard` Drop pops unconditionally.
-    pub fn with_current<F, R>(&self, f: F) -> PipelineResult<R>
+    pub fn with_current<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce() -> PipelineResult<R>,
+        F: FnOnce() -> Result<R>,
     {
         let cuda = lib()?;
         check(
@@ -188,7 +192,7 @@ impl CuStream {
     /// implicitly serialize with the legacy default stream — essential for
     /// overlap with PyTorch's compute streams and with other pipeline
     /// operations.
-    pub fn new() -> PipelineResult<Self> {
+    pub fn new() -> Result<Self> {
         let cuda = lib()?;
         let mut s: CUstream = std::ptr::null_mut();
         check(
@@ -198,7 +202,7 @@ impl CuStream {
         Ok(Self { stream: s })
     }
 
-    pub fn synchronize(&self) -> PipelineResult<()> {
+    pub fn synchronize(&self) -> Result<()> {
         let cuda = lib()?;
         check(
             unsafe { (cuda.cuStreamSynchronize)(self.stream) },
@@ -228,7 +232,7 @@ pub struct CuEvent {
 impl CuEvent {
     /// Timing-disabled event. We only use these for happens-before fences,
     /// not for profiling — timing-disabled events are cheaper to record.
-    pub fn new() -> PipelineResult<Self> {
+    pub fn new() -> Result<Self> {
         let cuda = lib()?;
         let mut e: CUevent = std::ptr::null_mut();
         check(
@@ -238,7 +242,7 @@ impl CuEvent {
         Ok(Self { event: e })
     }
 
-    pub fn record(&self, stream: &CuStream) -> PipelineResult<()> {
+    pub fn record(&self, stream: &CuStream) -> Result<()> {
         let cuda = lib()?;
         check(
             unsafe { (cuda.cuEventRecord)(self.event, stream.as_raw()) },
@@ -246,7 +250,7 @@ impl CuEvent {
         )
     }
 
-    pub fn synchronize(&self) -> PipelineResult<()> {
+    pub fn synchronize(&self) -> Result<()> {
         let cuda = lib()?;
         check(
             unsafe { (cuda.cuEventSynchronize)(self.event) },
@@ -272,7 +276,7 @@ pub struct DeviceBuf {
 }
 
 impl DeviceBuf {
-    pub fn alloc(bytes: usize) -> PipelineResult<Self> {
+    pub fn alloc(bytes: usize) -> Result<Self> {
         let cuda = lib()?;
         let mut ptr: CUdeviceptr = 0;
         check(
@@ -316,7 +320,7 @@ unsafe impl Send for PinnedBuf {}
 unsafe impl Sync for PinnedBuf {}
 
 impl PinnedBuf {
-    pub fn alloc(bytes: usize) -> PipelineResult<Self> {
+    pub fn alloc(bytes: usize) -> Result<Self> {
         let cuda = lib()?;
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         check(
@@ -375,7 +379,7 @@ pub fn memcpy_h2d_async(
     src: *const u8,
     bytes: usize,
     stream: &CuStream,
-) -> PipelineResult<()> {
+) -> Result<()> {
     let cuda = lib()?;
     check(
         unsafe {

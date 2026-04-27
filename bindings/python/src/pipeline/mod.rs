@@ -1,35 +1,41 @@
-//! Prefetch pipeline — Linux-only fast path for bulk tensor loads.
+//! Python bindings for the prefetch pipeline.
 //!
-//! Port of Morgan's `ionic` C library (`~/ionic`, branch `feat/planner_cuda`).
-//! Architecture, in brief:
-//!
-//!   io_uring engine (registered pinned staging, QD=64, offset-coalesced)
-//!     → DMA worker thread (2 async CUDA streams + events)
-//!       → GPU buffer
-//!         → atomic per-tensor "loaded" counter, signals readiness to main
-//!
-//! The public Python surface is one method on `safe_open`:
-//! `.prefetch(names, max_inflight=8) -> PrefetchHandle`. The handle is a
-//! single-use iterator — that's the whole API.
+//! Thin wrappers over [`ionic_rs`]. The engine code lives in that sibling
+//! crate (cuda FFI, io_uring, NUMA, errors); this module exposes only the
+//! Python-facing surface — currently `PrefetchHandle` plus the
+//! `safe_open.prefetch()` method which constructs it.
 //!
 //! **Phase state:** P1 lands the API shape with a trivial eager-load fallback
-//! (iterates the name list and calls the existing `get_tensor`). Subsequent
-//! phases swap the internals without changing the Python surface:
-//!   - P2: CUDA FFI + NUMA pinning + dedicated stream.
-//!   - P3: io_uring read backend with registered staging.
-//!   - P4: DMA worker thread + atomic load tracking + true as-completed.
-//!   - P5: DLPack output, `dtype=` fusion, error-surface polish.
-
-pub mod cuda;
-pub mod error;
-pub mod iouring;
-pub mod numa;
+//! (iterates the name list and calls the existing `get_tensor`). P2/P3 have
+//! the building blocks (CUDA wrappers, io_uring engine) ready in `ionic-rs`.
+//! P4 will plug them in here without changing the Python surface.
 
 use std::collections::VecDeque;
 
 use pyo3::prelude::*;
 
-use crate::Open;
+use crate::{Open, SafetensorError};
+
+// ── Error bridge ────────────────────────────────────────────────────────
+//
+// `ionic_rs::Error` is pyo3-free by design. The bindings crate provides this
+// adapter so engine errors surface as the project's existing exception type.
+
+pub(crate) struct PyIonicError(pub ionic_rs::Error);
+
+impl From<ionic_rs::Error> for PyIonicError {
+    fn from(e: ionic_rs::Error) -> Self {
+        Self(e)
+    }
+}
+
+impl From<PyIonicError> for PyErr {
+    fn from(e: PyIonicError) -> Self {
+        SafetensorError::new_err(e.0.to_string())
+    }
+}
+
+// ── PrefetchHandle ──────────────────────────────────────────────────────
 
 /// Handle returned by `safe_open.prefetch(...)`. Single-use iterator over
 /// `(name, tensor)` pairs with drain-on-delivery semantics.
@@ -90,93 +96,7 @@ impl PrefetchHandle {
     }
 }
 
-// ── Debug probes ───────────────────────────────────────────────────────
-//
-// Leading-underscore pyfunctions — internal, may change or disappear. These
-// exist so tests under `bindings/python/tests/test_pipeline.py` can exercise
-// the CUDA wrapper stack without depending on the real prefetch integration
-// (which doesn't arrive until P4). A production caller should never import
-// these.
-
-use pyo3::types::{PyDict, PyList};
-
-/// Enumerate visible CUDA devices and their sysfs-derived NUMA mapping.
-///
-/// Returns a list of dicts: `{"ordinal": int, "name": str, "pci_bus_id": str,
-/// "numa_node": int, "numa_cpus": list[int]}`. If the CUDA driver is not
-/// loadable, returns a one-element list with `{"error": "..."}` so tests
-/// can skip cleanly rather than raising.
-#[pyfunction]
-fn _debug_cuda_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
-    let list = PyList::empty(py);
-
-    let count = match cuda::CuDevice::count() {
-        Ok(n) => n,
-        Err(e) => {
-            let d = PyDict::new(py);
-            d.set_item("error", e.to_string())?;
-            list.append(d)?;
-            return Ok(list.into());
-        }
-    };
-
-    for ordinal in 0..count {
-        let d = PyDict::new(py);
-        d.set_item("ordinal", ordinal)?;
-
-        match cuda::CuDevice::get(ordinal) {
-            Ok(dev) => {
-                d.set_item("name", dev.name().unwrap_or_else(|e| format!("<err: {e}>")))?;
-                let bdf = dev.pci_bus_id().unwrap_or_else(|e| format!("<err: {e}>"));
-                d.set_item("pci_bus_id", &bdf)?;
-
-                let node = numa::numa_node_for_pci(&bdf).unwrap_or(-1);
-                d.set_item("numa_node", node)?;
-                let cpus = if node >= 0 {
-                    numa::cpulist_for_node(node).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                d.set_item("numa_cpus", cpus)?;
-            }
-            Err(e) => {
-                d.set_item("error", e.to_string())?;
-            }
-        }
-        list.append(d)?;
-    }
-
-    Ok(list.into())
-}
-
-/// End-to-end smoke of the CUDA wrapper stack: retain primary context,
-/// push/pop, create stream + event, allocate pinned + device, H2D copy,
-/// synchronize, release. Returns bytes copied on success. Raises
-/// `SafetensorError` if any CUDA call fails.
-#[pyfunction]
-fn _debug_cuda_ctx_smoke(ordinal: i32) -> PyResult<usize> {
-    const BYTES: usize = 4096;
-    let dev = cuda::CuDevice::get(ordinal)?;
-    let ctx = cuda::CuContext::primary_retain(dev)?;
-    let bytes = ctx.with_current(|| {
-        let stream = cuda::CuStream::new()?;
-        let event = cuda::CuEvent::new()?;
-        let mut pinned = cuda::PinnedBuf::alloc(BYTES)?;
-        let dev_buf = cuda::DeviceBuf::alloc(BYTES)?;
-        for (i, b) in pinned.as_mut_slice().iter_mut().enumerate() {
-            *b = (i & 0xFF) as u8;
-        }
-        cuda::memcpy_h2d_async(dev_buf.as_device_ptr(), pinned.as_ptr(), BYTES, &stream)?;
-        event.record(&stream)?;
-        event.synchronize()?;
-        Ok(BYTES)
-    })?;
-    Ok(bytes)
-}
-
 pub(crate) fn register(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<PrefetchHandle>()?;
-    m.add_function(wrap_pyfunction!(_debug_cuda_probe, m)?)?;
-    m.add_function(wrap_pyfunction!(_debug_cuda_ctx_smoke, m)?)?;
     Ok(())
 }

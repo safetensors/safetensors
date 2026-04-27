@@ -6,35 +6,33 @@
 //! SQPOLL kernel thread gets pinned separately via
 //! `io_uring::Builder::setup_sqpoll_cpu` in the iouring module.
 
-#![allow(dead_code)] // `pin_current_thread` used by P3 onwards.
-
-use crate::pipeline::error::{PipelineError, PipelineResult};
+use crate::error::{Error, Result};
 
 /// Read `/sys/bus/pci/devices/<bdf>/numa_node` for a PCI BDF. The BDF must be
 /// in lowercase `DDDD:BB:DD.F` form (CUDA returns uppercase hex — callers
 /// lowercase it before calling this).
-pub fn numa_node_for_pci(bdf: &str) -> PipelineResult<i32> {
+pub fn numa_node_for_pci(bdf: &str) -> Result<i32> {
     let path = format!("/sys/bus/pci/devices/{bdf}/numa_node");
     let s = std::fs::read_to_string(&path)
-        .map_err(|e| PipelineError::NumaProbe(format!("read {path}: {e}")))?;
+        .map_err(|e| Error::NumaProbe(format!("read {path}: {e}")))?;
     s.trim()
         .parse::<i32>()
-        .map_err(|e| PipelineError::NumaProbe(format!("parse {path}: {e}")))
+        .map_err(|e| Error::NumaProbe(format!("parse {path}: {e}")))
 }
 
 /// Parse `/sys/devices/system/node/node<N>/cpulist`, which uses the
 /// `"0-23,48-71"` range-list syntax. Returns the expanded CPU id set.
-pub fn cpulist_for_node(node: i32) -> PipelineResult<Vec<usize>> {
+pub fn cpulist_for_node(node: i32) -> Result<Vec<usize>> {
     if node < 0 {
         return Ok(Vec::new());
     }
     let path = format!("/sys/devices/system/node/node{node}/cpulist");
     let s = std::fs::read_to_string(&path)
-        .map_err(|e| PipelineError::NumaProbe(format!("read {path}: {e}")))?;
+        .map_err(|e| Error::NumaProbe(format!("read {path}: {e}")))?;
     parse_cpulist(s.trim())
 }
 
-fn parse_cpulist(s: &str) -> PipelineResult<Vec<usize>> {
+fn parse_cpulist(s: &str) -> Result<Vec<usize>> {
     let mut cpus = Vec::new();
     for tok in s.split(',') {
         let tok = tok.trim();
@@ -44,15 +42,15 @@ fn parse_cpulist(s: &str) -> PipelineResult<Vec<usize>> {
         if let Some((lo, hi)) = tok.split_once('-') {
             let lo: usize = lo
                 .parse()
-                .map_err(|e| PipelineError::NumaProbe(format!("cpulist range lo: {e}")))?;
+                .map_err(|e| Error::NumaProbe(format!("cpulist range lo: {e}")))?;
             let hi: usize = hi
                 .parse()
-                .map_err(|e| PipelineError::NumaProbe(format!("cpulist range hi: {e}")))?;
+                .map_err(|e| Error::NumaProbe(format!("cpulist range hi: {e}")))?;
             cpus.extend(lo..=hi);
         } else {
             let c: usize = tok
                 .parse()
-                .map_err(|e| PipelineError::NumaProbe(format!("cpulist int: {e}")))?;
+                .map_err(|e| Error::NumaProbe(format!("cpulist int: {e}")))?;
             cpus.push(c);
         }
     }
@@ -62,8 +60,8 @@ fn parse_cpulist(s: &str) -> PipelineResult<Vec<usize>> {
 /// Resolve the NUMA node for a CUDA device ordinal. Returns -1 if the node
 /// is unknown (virtualized GPUs, unusual topologies) or if CUDA isn't
 /// available — both are non-fatal; callers degrade to not pinning.
-pub fn numa_node_for_device(device_ordinal: i32) -> PipelineResult<i32> {
-    let dev = crate::pipeline::cuda::CuDevice::get(device_ordinal)?;
+pub fn numa_node_for_device(device_ordinal: i32) -> Result<i32> {
+    let dev = crate::cuda::CuDevice::get(device_ordinal)?;
     let bdf = dev.pci_bus_id()?;
     numa_node_for_pci(&bdf)
 }
@@ -72,7 +70,7 @@ pub fn numa_node_for_device(device_ordinal: i32) -> PipelineResult<i32> {
 /// resolved node id on success, or `Ok(-1)` when the node is unknown (in
 /// which case nothing was pinned — caller sees a best-effort result, not
 /// an error).
-pub fn bind_to_gpu_node(device_ordinal: i32) -> PipelineResult<i32> {
+pub fn bind_to_gpu_node(device_ordinal: i32) -> Result<i32> {
     let node = numa_node_for_device(device_ordinal)?;
     if node < 0 {
         return Ok(-1);
@@ -84,7 +82,7 @@ pub fn bind_to_gpu_node(device_ordinal: i32) -> PipelineResult<i32> {
 
 /// Pin the current thread to the given CPU set via `sched_setaffinity`.
 /// Returns Ok(()) and does nothing if `cpus` is empty.
-pub fn pin_current_thread(cpus: &[usize]) -> PipelineResult<()> {
+pub fn pin_current_thread(cpus: &[usize]) -> Result<()> {
     if cpus.is_empty() {
         return Ok(());
     }
@@ -101,7 +99,7 @@ pub fn pin_current_thread(cpus: &[usize]) -> PipelineResult<()> {
         let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
         if rc != 0 {
             let errno = *libc::__errno_location();
-            return Err(PipelineError::NumaProbe(format!(
+            return Err(Error::NumaProbe(format!(
                 "sched_setaffinity errno={errno}"
             )));
         }
