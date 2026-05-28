@@ -1549,6 +1549,31 @@ mod tests {
     }
 
     #[test]
+    /// Test that a non-empty header tolerates all four JSON whitespace bytes
+    /// (SPACE 0x20, TAB 0x09, LF 0x0A, CR 0x0D) in both leading and trailing
+    /// positions, and that the tensor data still round-trips intact. This
+    /// locks the contract advertised in the README format section so that
+    /// alternative implementations can rely on it.
+    fn test_whitespace_padded_header_with_tensor() {
+        // Header (58 bytes): leading \t\n, body {"t":{"dtype":"I32","shape":[1],"data_offsets":[0,4]}}, trailing \r ' '.
+        // 2 (leading) + 54 (body) + 2 (trailing) = 58 bytes.
+        let header_json: &[u8] =
+            b"\x09\x0A{\"t\":{\"dtype\":\"I32\",\"shape\":[1],\"data_offsets\":[0,4]}}\x0D\x20";
+        assert_eq!(header_json.len(), 58);
+        let mut serialized: Vec<u8> = Vec::new();
+        serialized.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        serialized.extend_from_slice(header_json);
+        serialized.extend_from_slice(&[0x01u8, 0x02, 0x03, 0x04]);
+
+        let loaded = SafeTensors::deserialize(&serialized).unwrap();
+        assert_eq!(loaded.names(), vec!["t"]);
+        let tensor = loaded.tensor("t").unwrap();
+        assert_eq!(tensor.dtype(), Dtype::I32);
+        assert_eq!(tensor.shape(), vec![1]);
+        assert_eq!(tensor.data(), &[0x01u8, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
     fn test_zero_sized_tensor() {
         let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,0],\"data_offsets\":[0, 0]}}";
         let loaded = SafeTensors::deserialize(serialized).unwrap();
