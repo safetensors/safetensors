@@ -41,7 +41,7 @@ static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
 /// The dtype string is validated at construction; an unknown dtype raises
 /// immediately rather than failing further inside the serializer.
 ///
-/// `shape` is the logical (header) shape — the number of elements along each
+/// `shape` is the logical (header) shape: the number of elements along each
 /// axis as recorded in the safetensors header. For packed dtypes like
 /// `float4_e2m1fn_x2` (two F4 values per byte), callers may pass the storage
 /// shape reported by their framework (e.g. `torch.Size`); the constructor
@@ -94,7 +94,7 @@ impl TensorSpec {
         format!("{}", self.dtype)
     }
 
-    /// The tensor's logical shape — the element-count shape recorded in the
+    /// The tensor's logical shape: the element-count shape recorded in the
     /// safetensors header. For packed dtypes like `float4_e2m1fn_x2`, this is
     /// the last-dim-doubled version of whatever was passed to the constructor.
     #[getter]
@@ -1933,7 +1933,7 @@ fn disable_page_cache_macos(file: &File) {
 /// do not consult the file handle's seek cursor. Windows does still update
 /// the synchronous handle's internal cursor as a side-effect (so it ends up
 /// at an unspecified position after concurrent calls), but we never read
-/// from that cursor — every call passes its own `offset`.
+/// from that cursor; every call passes its own `offset`.
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1994,7 +1994,7 @@ fn parallel_pread(
                             return Ok(());
                         }
                         let job = &jobs[i];
-                        // SAFETY: caller contract — distinct, alive, mutable buffers.
+                        // SAFETY: caller contract (distinct, alive, mutable buffers).
                         let buf = unsafe {
                             std::slice::from_raw_parts_mut(job.write_ptr as *mut u8, job.nbytes)
                         };

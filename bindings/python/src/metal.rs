@@ -102,7 +102,7 @@ impl MTLBuffer {
     }
 
     /// The Objective-C buffer pointer (`id<MTLBuffer>`). PyTorch's MPS
-    /// `from_dlpack` expects this - not the `contents` pointer - in
+    /// `from_dlpack` expects this (not the `contents` pointer) in
     /// `DLTensor.data`, since the MPS allocator tracks buffers by ID.
     pub fn as_metal_id_ptr(&self) -> *mut c_void {
         &*self.buf as *const ProtocolObject<dyn RawMTLBuffer> as *mut c_void

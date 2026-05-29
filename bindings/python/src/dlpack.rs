@@ -72,6 +72,12 @@ pub struct DLManagedTensor {
 
 const CAPSULE_NAME: &[u8] = b"dltensor\0";
 
+/// Source of the `data` pointer [`to_capsule`] writes into the `DLTensor`.
+///
+/// Invariant relied on by [`to_capsule`]: the pointer must stay valid as long
+/// as `self` is alive and be unaffected by moving `self`. `to_capsule` reads
+/// it once, then moves the buffer into [`ManagedCtx`], which keeps it alive
+/// until `managed_tensor_deleter` runs.
 pub(crate) trait AsDevicePtr: Send + 'static {
     fn as_device_ptr(&self) -> *mut c_void;
 }
@@ -82,6 +88,11 @@ impl AsDevicePtr for MTLBuffer {
         // looks it up in the MPS allocator's buffer table; passing
         // `contents()` is interpreted as a key into a different region
         // and segfaults.
+        //
+        // This is the address of the Obj-C buffer object, not the
+        // `Retained`/`MTLBuffer` wrapper, so it survives the wrapper moving
+        // into `ManagedCtx` and stays valid until that ctx drops the
+        // `Retained`, satisfying the `AsDevicePtr` invariant.
         self.as_metal_id_ptr()
     }
 }
