@@ -8,7 +8,9 @@
 //! Objective-C protocol from `objc2-metal` is aliased as `RawMTLBuffer`
 //! to keep both names visible and disambiguate raw vs. managed flavor.
 
+use std::error::Error;
 use std::ffi::c_void;
+use std::fmt;
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
@@ -16,6 +18,27 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions,
 };
+
+#[derive(Debug)]
+pub enum MetalError {
+    /// `MTLDevice::newBufferWithLength` returned nil for a request of N bytes.
+    Allocation(usize),
+}
+
+impl fmt::Display for MetalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetalError::Allocation(nbytes) => {
+                write!(
+                    f,
+                    "MTLDevice::newBufferWithLength failed for {nbytes} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl Error for MetalError {}
 
 static DEVICE: OnceLock<DeviceHandle> = OnceLock::new();
 
@@ -25,13 +48,14 @@ struct DeviceHandle(Retained<ProtocolObject<dyn MTLDevice>>);
 unsafe impl Send for DeviceHandle {}
 unsafe impl Sync for DeviceHandle {}
 
-fn device() -> Result<&'static ProtocolObject<dyn MTLDevice>, &'static str> {
-    if let Some(h) = DEVICE.get() {
-        return Ok(&h.0);
-    }
-    let dev = MTLCreateSystemDefaultDevice().ok_or("MTLCreateSystemDefaultDevice returned nil")?;
-    let _ = DEVICE.set(DeviceHandle(dev));
-    Ok(&DEVICE.get().unwrap().0)
+fn device() -> &'static ProtocolObject<dyn MTLDevice> {
+    &DEVICE
+        .get_or_init(|| {
+            let dev =
+                MTLCreateSystemDefaultDevice().expect("MTLCreateSystemDefaultDevice returned nil");
+            DeviceHandle(dev)
+        })
+        .0
 }
 
 pub struct MTLBuffer {
@@ -50,12 +74,12 @@ impl MTLBuffer {
     /// clamped to a 1-byte allocation so it still yields a valid `MTLBuffer`
     /// to hand off; the wrapper keeps the original `nbytes` (0), and the
     /// DLPack shape carries the zero dim, so `numel` stays 0 for the consumer.
-    pub fn alloc_shared(nbytes: usize) -> Result<Self, String> {
-        let dev = device().map_err(str::to_owned)?;
+    pub fn alloc_shared(nbytes: usize) -> Result<Self, MetalError> {
+        let dev = device();
         let len = nbytes.max(1);
         let buf = dev
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| format!("MTLDevice::newBufferWithLength failed for {nbytes} bytes"))?;
+            .ok_or(MetalError::Allocation(nbytes))?;
         let contents = buf.contents().as_ptr();
         Ok(Self {
             buf,
