@@ -32,6 +32,9 @@ static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static MLX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
+
 /// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 ///
 /// Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
@@ -824,6 +827,7 @@ impl Open {
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
             && dlpack::torch_mps_compatible(info.dtype)
+            && torch_supports_mps_dlpack()
         {
             return self.get_tensor_mps(name, info);
         }
@@ -1194,6 +1198,7 @@ impl Open {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
+            && torch_supports_mps_dlpack()
             && self
                 .metadata
                 .tensors()
@@ -1694,6 +1699,7 @@ impl PySafeSlice {
             && self.framework == Framework::Pytorch
             && !matches!(self.storage.as_ref(), Storage::Paddle(_))
             && dlpack::torch_mps_compatible(self.info.dtype)
+            && torch_supports_mps_dlpack()
         {
             return self.slice_mps(slices);
         }
@@ -2074,6 +2080,35 @@ fn mps_tensor_from_buf(
     } else {
         Ok(tensor)
     }
+}
+
+/// Whether torch's `from_dlpack` accepts an MPS-device capsule, added in
+/// torch 2.9. We advertise support back to 2.4, so older torch takes the
+/// generic CPU-tensor + `.to("mps")` path instead: correct on every version,
+/// but it copies host->device rather than aliasing the `MTLBuffer`.
+///
+/// The result is process-cached; first call imports torch under the GIL.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn torch_supports_mps_dlpack() -> bool {
+    if let Some(&supported) = TORCH_MPS_DLPACK.get() {
+        return supported;
+    }
+    *TORCH_MPS_DLPACK.get_or_init(|| {
+        Python::attach(|py| {
+            let Ok(torch) = get_module(py, &TORCH_MODULE) else {
+                return false;
+            };
+            let Ok(version) = torch
+                .getattr(intern!(py, "__version__"))
+                .and_then(|v| v.extract::<String>())
+            else {
+                return false;
+            };
+            Version::from_string(&version)
+                .map(|v| v >= Version::new(2, 9, 0))
+                .unwrap_or(false)
+        })
+    })
 }
 
 /// Framework-specific `from_dlpack` dispatch for a Metal-typed capsule.
