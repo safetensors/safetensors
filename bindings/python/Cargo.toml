@@ -1,6 +1,6 @@
 [package]
 name = "safetensors-python"
-version = "0.8.0-dev.0"
+version = "0.9.0-dev.0"
 edition = "2021"
 rust-version = "1.74"
 
@@ -25,4 +25,8 @@ libc = "0.2"
 # Macs fall back to the existing copy path.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = "0.6"
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLBuffer", "MTLResource"] }
+objc2-metal = { version = "0.3", features = [
+  "MTLDevice",
+  "MTLBuffer",
+  "MTLResource",
+] }
