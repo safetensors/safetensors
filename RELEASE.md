@@ -182,9 +182,8 @@ Sometimes a release or RC has a problem that needs fixing before GA (e.g. a CI m
 
 ## Secrets
 
-The release workflows use two repository secrets:
+The release workflows use one repository secrets:
 
-- `PYPI_TOKEN_DIST` — PyPI API token for the `safetensors` project
 - `CRATES_TOKEN` — crates.io API token
 
 If a workflow fails with an auth error, the token has likely expired. Rotate it in the respective registry and update the repo secret. Worth checking before publishing the release.

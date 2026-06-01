@@ -185,8 +185,6 @@ jobs:
       - name: Publish to PyPI
         if: "startsWith(github.ref, 'refs/tags/')"
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN_DIST}}
         with:
           command: upload
           args: --non-interactive --skip-existing wheels-*/*
