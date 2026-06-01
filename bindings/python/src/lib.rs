@@ -11,7 +11,7 @@ use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
-use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -20,6 +20,7 @@ use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -297,41 +298,100 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     Ok(items)
 }
 
-fn slice_to_indexer(
-    (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
-) -> Result<TensorIndexer, PyErr> {
-    match slice_index {
-        SliceIndex::Slice(slice) => {
-            let py_start = slice.getattr(intern!(slice.py(), "start"))?;
-            let start: Option<usize> = py_start.extract()?;
-            let start = if let Some(start) = start {
-                Bound::Included(start)
-            } else {
-                Bound::Unbounded
-            };
+/// Parses a Python index (`int`, `slice`, `...`, or a tuple of those) into
+/// byte-range [`TensorIndexer`]s. The slice step is carried in
+/// [`TensorIndexer::Narrow`]; step <= 0 is rejected.
+fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<TensorIndexer>> {
+    let py = slices.py();
 
-            let py_stop = slice.getattr(intern!(slice.py(), "stop"))?;
-            let stop: Option<usize> = py_stop.extract()?;
-            let stop = if let Some(stop) = stop {
-                Bound::Excluded(stop)
-            } else {
-                Bound::Unbounded
-            };
-            Ok(TensorIndexer::Narrow(start, stop))
+    let items: Vec<PyBound<'_, PyAny>> = if let Ok(tup) = slices.cast::<PyTuple>() {
+        tup.iter().collect()
+    } else if let Ok(lst) = slices.cast::<PyList>() {
+        if lst.is_empty() {
+            // Empty list = empty selection, matching the prior behavior.
+            return Ok(vec![TensorIndexer::Narrow(
+                Bound::Included(0),
+                Bound::Excluded(0),
+                NonZeroUsize::MIN,
+            )]);
         }
-        SliceIndex::Index(idx) => {
-            if idx < 0 {
-                let idx = dim.checked_add_signed(idx as isize).ok_or_else(|| {
+        return Err(SafetensorError::new_err(
+            "Non empty lists are not implemented",
+        ));
+    } else {
+        vec![slices.clone()]
+    };
+
+    let ellipsis_count = items
+        .iter()
+        .filter(|it| it.is_instance_of::<PyEllipsis>())
+        .count();
+    if ellipsis_count > 1 {
+        return Err(SafetensorError::new_err(
+            "Only one ellipsis (...) is allowed in slice index",
+        ));
+    }
+    let n_explicit = items.len() - ellipsis_count;
+    let n_expansion = shape.len().saturating_sub(n_explicit);
+
+    let mut indexers: Vec<TensorIndexer> = Vec::with_capacity(shape.len());
+    let mut dim_idx = 0usize;
+    for it in items {
+        if it.is_instance_of::<PyEllipsis>() {
+            for _ in 0..n_expansion {
+                indexers.push(TensorIndexer::Narrow(
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    NonZeroUsize::MIN,
+                ));
+                dim_idx += 1;
+            }
+        } else if let Ok(slice) = it.cast::<PySlice>() {
+            let start: Option<usize> = slice.getattr(intern!(py, "start"))?.extract()?;
+            let stop: Option<usize> = slice.getattr(intern!(py, "stop"))?.extract()?;
+            let step_raw: i64 = slice
+                .getattr(intern!(py, "step"))?
+                .extract::<Option<i64>>()?
+                .unwrap_or(1);
+            let step = usize::try_from(step_raw)
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .ok_or_else(|| {
+                    SafetensorError::new_err(format!(
+                        "Slice step must be a positive integer, got {step_raw}"
+                    ))
+                })?;
+            let start_b = match start {
+                Some(s) => Bound::Included(s),
+                None => Bound::Unbounded,
+            };
+            let stop_b = match stop {
+                Some(s) => Bound::Excluded(s),
+                None => Bound::Unbounded,
+            };
+            indexers.push(TensorIndexer::Narrow(start_b, stop_b, step));
+            dim_idx += 1;
+        } else if let Ok(idx) = it.extract::<i32>() {
+            let dim = shape.get(dim_idx).copied().unwrap_or(0);
+            let resolved = if idx < 0 {
+                dim.checked_add_signed(idx as isize).ok_or_else(|| {
                     SafetensorError::new_err(format!(
                         "Invalid index {idx} for dimension {dim_idx} of size {dim}"
                     ))
-                })?;
-                Ok(TensorIndexer::Select(idx))
+                })?
             } else {
-                Ok(TensorIndexer::Select(idx as usize))
-            }
+                idx as usize
+            };
+            indexers.push(TensorIndexer::Select(resolved));
+            dim_idx += 1;
+        } else {
+            return Err(SafetensorError::new_err(format!(
+                "Unsupported slice index at position {dim_idx}: expected slice, int, or ellipsis"
+            )));
         }
     }
+
+    Ok(indexers)
 }
 
 /// Storage backend used to serve tensor bytes.
@@ -1453,18 +1513,6 @@ struct PySafeSlice {
     storage: Arc<Storage>,
 }
 
-#[derive(FromPyObject)]
-enum SliceIndex<'a> {
-    Slice(PyBound<'a, PySlice>),
-    Index(i32),
-}
-
-#[derive(FromPyObject)]
-enum Slice<'a> {
-    Slice(SliceIndex<'a>),
-    Slices(Vec<SliceIndex<'a>>),
-}
-
 use std::fmt;
 struct Disp(Vec<TensorIndexer>);
 
@@ -1486,33 +1534,10 @@ impl PySafeSlice {
         slices: &PyBound<'_, PyAny>,
         data: &[u8],
     ) -> PyResult<Py<PyAny>> {
-        let pyslices = slices;
-        let parsed: Slice = pyslices.extract()?;
-        let is_list = pyslices.is_instance_of::<PyList>();
-        let parsed: Vec<SliceIndex> = match parsed {
-            Slice::Slice(slice) => vec![slice],
-            Slice::Slices(slices) => {
-                if slices.is_empty() && is_list {
-                    vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
-                } else if is_list {
-                    return Err(SafetensorError::new_err(
-                        "Non empty lists are not implemented",
-                    ));
-                } else {
-                    slices
-                }
-            }
-        };
+        let indexers = parse_indexers(slices, &self.info.shape)?;
 
-        let shape = self.info.shape.clone();
         let tensor = TensorView::new(self.info.dtype, self.info.shape.clone(), data)
             .map_err(|e| SafetensorError::new_err(format!("Error preparing tensor view: {e}")))?;
-        let indexers: Vec<TensorIndexer> = parsed
-            .into_iter()
-            .zip(shape)
-            .enumerate()
-            .map(slice_to_indexer)
-            .collect::<Result<_, _>>()?;
 
         let iterator = tensor.sliced_data(&indexers).map_err(|e| {
             SafetensorError::new_err(format!(
@@ -1552,29 +1577,7 @@ impl PySafeSlice {
     /// `.to("mps")` round-trip the general path takes.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn slice_mps(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let parsed: Slice = slices.extract()?;
-        let is_list = slices.is_instance_of::<PyList>();
-        let parsed: Vec<SliceIndex> = match parsed {
-            Slice::Slice(s) => vec![s],
-            Slice::Slices(ss) => {
-                if ss.is_empty() && is_list {
-                    vec![SliceIndex::Slice(PySlice::new(slices.py(), 0, 0, 0))]
-                } else if is_list {
-                    return Err(SafetensorError::new_err(
-                        "Non empty lists are not implemented",
-                    ));
-                } else {
-                    ss
-                }
-            }
-        };
-
-        let indexers: Vec<TensorIndexer> = parsed
-            .into_iter()
-            .zip(self.info.shape.clone())
-            .enumerate()
-            .map(slice_to_indexer)
-            .collect::<Result<_, _>>()?;
+        let indexers = parse_indexers(slices, &self.info.shape)?;
 
         let (ranges, newshape) =
             safetensors::slice::slice_byte_ranges(self.info.dtype, &self.info.shape, &indexers)
