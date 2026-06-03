@@ -49,12 +49,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
+          # just need a host interpreter to run manylinux, 3.14t is already
+          # installed in the manylinux image
           python-version: 3.14
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --manifest-path bindings/python/Cargo.toml  --locked --interpreter '3.13 3.14t'
+          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -80,6 +82,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
+          # just need a host interpreter to run manylinux, 3.14t is already
+          # installed in the manylinux image
           python-version: 3.14
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
@@ -105,19 +109,18 @@ jobs:
             target: x86
           - runner: windows-11-arm
             target: arm64
+        python_interpreter: ['3.14', '3.14t']
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
-          python-version: |
-            3.14
-            3.14t
+          python-version: ${{ matrix.python_interpreter }}
           architecture: ${{ matrix.platform.target }}
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
         with:
           target: ${{ matrix.platform.target == 'arm64' && 'aarch64-pc-windows-msvc' || matrix.platform.target }}
-          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter '3.13 3.14t'
+          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
@@ -138,12 +141,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
-          python-version: 3.14
+          python-version: ${{ matrix.python_interpreter }}
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter '3.13 3.14t'
+          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
