@@ -752,9 +752,15 @@ impl<'data> TensorView<'data> {
         shape: Vec<usize>,
         data: &'data [u8],
     ) -> Result<Self, SafeTensorError> {
-        let n_elements: usize = shape.iter().product();
+        let n_elements: usize = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
 
-        let nbits = n_elements * dtype.bitsize();
+        let nbits = n_elements
+            .checked_mul(dtype.bitsize())
+            .ok_or(SafeTensorError::ValidationOverflow)?;
         if nbits % 8 != 0 {
             return Err(SafeTensorError::MisalignedSlice);
         }
@@ -1127,6 +1133,14 @@ mod tests {
             attn_0,
             Err(SafeTensorError::InvalidTensorView(Dtype::F4, _shape, _size))
         ));
+    }
+
+    #[test]
+    fn test_tensorview_new_rejects_shape_overflow() {
+        let data: Vec<u8> = vec![];
+        let shape = vec![usize::MAX / 2 + 1, 2];
+        let attn_0 = TensorView::new(Dtype::F32, shape, &data);
+        assert!(matches!(attn_0, Err(SafeTensorError::ValidationOverflow)));
     }
 
     #[test]
