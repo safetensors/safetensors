@@ -180,14 +180,6 @@ Sometimes a release or RC has a problem that needs fixing before GA (e.g. a CI m
    ```
    Open a PR from the feature branch so CI runs against `main` before merging. This ensures the fix isn't lost when the next release branches off.
 
-## Secrets
-
-The release workflows use one repository secrets:
-
-- `CRATES_TOKEN` — crates.io API token
-
-If a workflow fails with an auth error, the token has likely expired. Rotate it in the respective registry and update the repo secret. Worth checking before publishing the release.
-
 ## Testing release CI changes
 
 If you're modifying the release workflows:
