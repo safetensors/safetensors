@@ -58,9 +58,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cargo install audit
-        run: cargo install cargo-audit
-
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           workspaces: "bindings/python"
@@ -76,9 +73,6 @@ jobs:
 
       - name: Lint with Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run Audit
-        run: cargo audit -D warnings
 
       - name: Install (torch)
         if: matrix.os != 'windows-11-arm'
@@ -198,3 +192,21 @@ jobs:
           cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
           cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
           push: ${{ steps.canpush.outputs.value == 'true' }}
+
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo install audit
+        run: cargo install cargo-audit
+
+      - name: Run Audit
+        run: cargo audit -D warnings
