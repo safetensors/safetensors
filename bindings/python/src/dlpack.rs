@@ -1,8 +1,10 @@
 //! DLPack v0 producer + Python capsule wrapping.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_void, CStr};
+use std::ptr::NonNull;
 
 use pyo3::prelude::*;
+use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
@@ -70,7 +72,7 @@ pub struct DLManagedTensor {
     pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
 }
 
-const CAPSULE_NAME: &[u8] = b"dltensor\0";
+const CAPSULE_NAME: &CStr = c"dltensor";
 
 /// Source of the `data` pointer [`to_capsule`] writes into the `DLTensor`.
 ///
@@ -221,7 +223,7 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
     shape: Vec<i64>,
     dtype: DLDataType,
     device: DLDevice,
-) -> PyResult<Py<PyAny>> {
+) -> PyResult<Py<PyCapsule>> {
     let ndim = shape.len() as i32;
     let data = device_buf.as_device_ptr();
 
@@ -251,21 +253,28 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
         deleter: Some(managed_tensor_deleter::<B>),
     }));
 
-    let name_ptr = CAPSULE_NAME.as_ptr() as *const c_char;
-    // SAFETY: for all the following unsafe calls, all data was produced by this function and is valid each the call.
-    // In case of failure, we clean up the managed tensor ourselves to avoid leaks, since the capsule destructor won't run.
-    let capsule_ptr = unsafe {
-        pyo3::ffi::PyCapsule_New(managed as *mut c_void, name_ptr, Some(capsule_destructor))
+    // `managed` came from `Box::into_raw`, so it is non-null.
+    let managed_ptr = NonNull::new(managed as *mut c_void).unwrap();
+    // SAFETY: `managed_ptr` points to a live `DLManagedTensor` produced above, and
+    // `capsule_destructor` reclaims it via the registered deleter.
+    let capsule = unsafe {
+        PyCapsule::new_with_pointer_and_destructor(
+            py,
+            managed_ptr,
+            CAPSULE_NAME,
+            Some(capsule_destructor),
+        )
     };
-    if capsule_ptr.is_null() {
+    // On failure the destructor was never registered, so reclaim the tensor ourselves.
+    let capsule = capsule.map_err(|e| {
         unsafe { managed_tensor_deleter::<B>(managed) };
-        return Err(PyErr::fetch(py));
-    }
-    Ok(unsafe { Bound::from_owned_ptr(py, capsule_ptr) }.unbind())
+        e
+    })?;
+    Ok(capsule.unbind())
 }
 
 unsafe extern "C" fn capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
-    let name_ptr = CAPSULE_NAME.as_ptr() as *const c_char;
+    let name_ptr = CAPSULE_NAME.as_ptr();
     if unsafe { pyo3::ffi::PyCapsule_IsValid(capsule, name_ptr) } == 0 {
         return;
     }

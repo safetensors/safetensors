@@ -11,7 +11,9 @@ use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
-use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyCapsule, PyDict, PyEllipsis, PyList, PySlice, PyTuple,
+};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -2132,7 +2134,7 @@ fn torch_supports_mps_dlpack() -> bool {
 fn ingest_dlpack_mps(
     py: Python<'_>,
     framework: &Framework,
-    capsule: Py<PyAny>,
+    capsule: Py<PyCapsule>,
 ) -> PyResult<Py<PyAny>> {
     match framework {
         Framework::Pytorch => {
