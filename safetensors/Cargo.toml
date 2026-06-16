@@ -30,7 +30,7 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16", features = ["serde"] }
 tempfile = { version = "3", optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
