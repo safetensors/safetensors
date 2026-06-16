@@ -394,6 +394,31 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
     Ok(indexers)
 }
 
+fn validate_f4_slice_index(slices: &PyBound<'_, PyAny>, logical_shape: &[usize]) -> PyResult<()> {
+    let indexers = parse_indexers(slices, logical_shape)?;
+    if let Some(indexer) = indexers.get(logical_shape.len().saturating_sub(1)) {
+        match indexer {
+            TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, step)
+                if *step == NonZeroUsize::MIN => {}
+            _ => {
+                return Err(SafetensorError::new_err(
+                    "Slicing the last dimension of F4 tensors is not supported",
+                ));
+            }
+        }
+    }
+
+    safetensors::slice::slice_byte_ranges(Dtype::F4, logical_shape, &indexers).map_err(|e| {
+        SafetensorError::new_err(format!(
+            "Error during slicing {:?} with shape {:?}: {e}",
+            indexers,
+            logical_shape,
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Storage backend used to serve tensor bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -1697,6 +1722,10 @@ impl PySafeSlice {
     }
 
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        if self.info.dtype == Dtype::F4 {
+            validate_f4_slice_index(slices, &self.info.shape)?;
+        }
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
@@ -1732,7 +1761,12 @@ impl PySafeSlice {
                 let torch_uint8: Py<PyAny> = get_pydtype(torch, Dtype::U8, false)?;
                 let kwargs = [(intern!(py, "dtype"), torch_uint8)].into_py_dict(py)?;
                 let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
-                let shape = self.info.shape.to_vec();
+                let logical_shape = self.info.shape.to_vec();
+                let shape = if self.info.dtype == Dtype::F4 {
+                    torch_storage_shape(self.info.dtype, &logical_shape)?
+                } else {
+                    logical_shape.clone()
+                };
                 let shape: Py<PyAny> = shape.into_pyobject(py)?.into();
 
                 let start = (self.info.data_offsets.0 + self.offset) as isize;
@@ -1757,7 +1791,7 @@ impl PySafeSlice {
                     .call((storage_slice,), Some(&kwargs))?
                     .getattr(intern!(py, "view"))?
                     .call((), Some(&view_kwargs))?;
-                if byteorder == "big" {
+                if byteorder == "big" && self.info.dtype != Dtype::F4 {
                     // Important, do NOT use inplace otherwise the slice itself
                     // is byteswapped, meaning multiple calls will fails
                     let inplace_kwargs =
@@ -2229,9 +2263,14 @@ fn create_tensor<'a>(
                 (get_module(py, &NUMPY_MODULE)?, true)
             }
         };
-        let dtype: Py<PyAny> = get_pydtype(module, dtype, is_numpy)?;
+        let dtype_code = dtype;
+        let dtype: Py<PyAny> = get_pydtype(module, dtype_code, is_numpy)?;
         let count: usize = shape.iter().product();
-        let shape = shape.to_vec();
+        let shape = if framework == &Framework::Pytorch {
+            torch_storage_shape(dtype_code, shape)?
+        } else {
+            shape.to_vec()
+        };
         let tensor = if count == 0 {
             // Torch==1.10 does not allow frombuffer on empty buffers so we create
             // the tensor manually.
