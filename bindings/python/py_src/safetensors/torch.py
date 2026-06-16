@@ -198,7 +198,7 @@ def load_model(
     device: Union[str, int] = "cpu",
     *,
     backend: str = "mmap",
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[Set[str], List[str]]:
     """
     Loads a given filename onto a torch model.
     This method exists specifically to avoid tensor sharing issues which are
@@ -220,7 +220,7 @@ def load_model(
             and `"pread"` uses `pread(2)` to read tensor bytes.
 
     Returns:
-        `(missing, unexpected): (List[str], List[str])`
+        `(missing, unexpected): (Set[str], List[str])`
             `missing` are names in the model which were not modified during loading
             `unexpected` are names that are on the file, but weren't used during
             the load.
