@@ -14,6 +14,18 @@ try:
 except Exception:
     npu_present = False
 
+try:
+    import torch_spyre  # noqa — registers Spyre device + safetensors hook
+
+    # Boot the runtime so the RuntimeContext exists before any DMA call.
+    # safe_open() itself does not start the runtime; the first device
+    # allocation does.  Doing it here means the skip-guard below is the
+    # only Spyre-specific logic outside the test body.
+    torch.empty(0, dtype=torch.float16, device="spyre")
+    spyre_present = True
+except Exception:
+    spyre_present = False
+
 
 class TorchTestCase(unittest.TestCase):
     def test_serialization(self):
@@ -360,6 +372,89 @@ class TorchTestCase(unittest.TestCase):
                 whole = f.get_tensor("emb")
                 self.assertEqual(whole.device.type, "mps")
                 self.assertTrue(torch.equal(whole.cpu(), data["emb"]))
+
+    @unittest.skipIf(not spyre_present, "Spyre is not available")
+    def test_spyre_slice(self):
+        # Exercises PySafeSlice::__getitem__ -> slice_custom_device hook dispatch.
+        #
+        # get_slice(key)[...] must:
+        #   1. land on the Spyre device (not silently fall back to CPU), and
+        #   2. produce the same values as the equivalent CPU slice.
+        #
+        # Covers: leading-dim slab, strided column, 1-D slice, full-tensor
+        # equivalence with get_tensor, and a partial-row slice -- on both the
+        # mmap and pread backends.
+        data = {
+            # 2-D weight: exercises leading-dim and column slices
+            "emb": torch.arange(32 * 16, dtype=torch.float16).reshape(32, 16),
+            # 1-D vector: exercises 1-D slice
+            "vec": torch.arange(10, dtype=torch.float16),
+        }
+        local = "./tests/data/out_safe_pt_mmap_small_spyre_slice.safetensors"
+        save_file(data, local)
+
+        for backend in ("mmap", "pread"):
+            with safe_open(local, framework="pt", device="spyre", backend=backend) as f:
+                # contiguous leading-dim slab
+                contiguous = f.get_slice("emb")[8:20, :]
+                self.assertEqual(
+                    contiguous.device.type, "spyre",
+                    f"leading-dim slab ({backend}): expected spyre, got "
+                    f"{contiguous.device.type} -- __getitem__ did not dispatch "
+                    f"to the Spyre hook",
+                )
+                self.assertTrue(
+                    torch.equal(contiguous.cpu(), data["emb"][8:20, :]),
+                    f"leading-dim slab value mismatch ({backend})",
+                )
+
+                # strided column slice (multi-segment gather)
+                strided = f.get_slice("emb")[:, 4:12]
+                self.assertEqual(
+                    strided.device.type, "spyre",
+                    f"column slice ({backend}): expected spyre, got "
+                    f"{strided.device.type}",
+                )
+                self.assertTrue(
+                    torch.equal(strided.cpu(), data["emb"][:, 4:12]),
+                    f"column slice value mismatch ({backend})",
+                )
+
+                # 1-D slice
+                vec = f.get_slice("vec")[2:7]
+                self.assertEqual(
+                    vec.device.type, "spyre",
+                    f"1d slice ({backend}): expected spyre, got {vec.device.type}",
+                )
+                self.assertTrue(
+                    torch.equal(vec.cpu(), data["vec"][2:7]),
+                    f"1d slice value mismatch ({backend})",
+                )
+
+                # full-tensor slice must equal get_tensor, both on Spyre
+                via_slice = f.get_slice("emb")[:]
+                via_tensor = f.get_tensor("emb")
+                self.assertEqual(via_slice.device.type, "spyre",
+                                 f"full slice ({backend}): not on spyre")
+                self.assertEqual(via_tensor.device.type, "spyre",
+                                 f"get_tensor ({backend}): not on spyre")
+                self.assertTrue(
+                    torch.equal(via_slice.cpu(), via_tensor.cpu()),
+                    f"get_slice(emb)[:] != get_tensor(emb) ({backend})",
+                )
+
+                # partial row slice
+                half = data["emb"].shape[0] // 2
+                partial = f.get_slice("emb")[:half, :]
+                self.assertEqual(
+                    partial.device.type, "spyre",
+                    f"partial row slice ({backend}): expected spyre, got "
+                    f"{partial.device.type}",
+                )
+                self.assertTrue(
+                    torch.equal(partial.cpu(), data["emb"][:half, :]),
+                    f"partial row slice value mismatch ({backend})",
+                )
 
     @unittest.skipIf(not npu_present, "Npu is not available")
     def test_npu(self):
