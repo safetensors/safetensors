@@ -18,7 +18,7 @@ pub enum SafeTensorError {
     InvalidHeader(Utf8Error),
     /// The header does contain a valid string, but it is not valid JSON.
     InvalidHeaderDeserialization(serde_json::Error),
-    /// The header is large than 100Mo which is considered too large (Might evolve in the future).
+    /// The header is larger than 100MB which is considered too large (Might evolve in the future).
     HeaderTooLarge,
     /// The header is smaller than 8 bytes
     HeaderTooSmall,
@@ -35,7 +35,7 @@ pub enum SafeTensorError {
     IoError(std::io::Error),
     /// JSON error
     JsonError(serde_json::Error),
-    /// The follow tensor cannot be created because the buffer size doesn't match shape + dtype
+    /// The following tensor cannot be created because the buffer size doesn't match shape + dtype
     InvalidTensorView(Dtype, Vec<usize>, usize),
     /// The metadata is invalid because the data offsets of the tensor does not
     /// fully cover the buffer part of the file. The last offset **must** be
@@ -264,7 +264,7 @@ where
     ))
 }
 
-/// Serialize to an owned byte buffer the dictionnary of tensors.
+/// Serialize to an owned byte buffer the dictionary of tensors.
 pub fn serialize<
     S: AsRef<str> + Ord + core::fmt::Display,
     V: View,
@@ -341,7 +341,7 @@ fn buffered_write_to_file<V: View>(
     Ok(())
 }
 
-/// Serialize to a regular file the dictionnary of tensors.
+/// Serialize to a regular file the dictionary of tensors.
 /// Writing directly to file reduces the need to allocate the whole amount to
 /// memory.
 #[cfg(feature = "std")]
@@ -526,7 +526,7 @@ impl<'data> SafeTensors<'data> {
     }
 }
 
-/// The stuct representing the header of safetensor files which allow
+/// The struct representing the header of safetensor files which allow
 /// indexing into the raw byte-buffer array and how to interpret it.
 #[derive(Debug, Clone)]
 pub struct Metadata {
@@ -809,7 +809,7 @@ pub struct TensorInfo {
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
 #[non_exhaustive]
 pub enum Dtype {
-    /// Boolan type
+    /// Boolean type
     BOOL,
     /// MXF4 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
     F4,
