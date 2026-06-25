@@ -320,6 +320,47 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["packed"].device.type, "mps")
         self.assertEqual(tuple(reloaded["packed"].shape), (2, 4))
 
+    @unittest.skipIf(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        "MPS is not available",
+    )
+    def test_mps_slice(self):
+        # Exercises the slice_mps fast path: contiguous (leading-dim slab) and
+        # strided (column) slices must match the CPU reference, on both the
+        # mmap and pread backends.
+        data = {
+            "emb": torch.arange(32 * 16, dtype=torch.float32).reshape(32, 16),
+            "vec": torch.arange(10, dtype=torch.float32),
+        }
+        local = "./tests/data/out_safe_pt_mmap_small_mps_slice.safetensors"
+        save_file(data, local)
+
+        for backend in ("mmap", "pread"):
+            with safe_open(local, framework="pt", device="mps", backend=backend) as f:
+                # contiguous leading-dim slab
+                contiguous = f.get_slice("emb")[8:20, :]
+                self.assertEqual(contiguous.device.type, "mps")
+                self.assertTrue(
+                    torch.equal(contiguous.cpu(), data["emb"][8:20, :]),
+                    f"contiguous slice mismatch ({backend})",
+                )
+                # strided column slice (multi-segment fill)
+                strided = f.get_slice("emb")[:, 4:12]
+                self.assertTrue(
+                    torch.equal(strided.cpu(), data["emb"][:, 4:12]),
+                    f"strided slice mismatch ({backend})",
+                )
+                # 1-D slice
+                vec = f.get_slice("vec")[2:7]
+                self.assertTrue(
+                    torch.equal(vec.cpu(), data["vec"][2:7]),
+                    f"1d slice mismatch ({backend})",
+                )
+                # single get_tensor on MPS
+                whole = f.get_tensor("emb")
+                self.assertEqual(whole.device.type, "mps")
+                self.assertTrue(torch.equal(whole.cpu(), data["emb"]))
+
     @unittest.skipIf(not npu_present, "Npu is not available")
     def test_npu(self):
         data = {

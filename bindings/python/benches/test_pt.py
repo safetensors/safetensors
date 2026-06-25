@@ -199,11 +199,9 @@ def test_pt_sf_load_mps(benchmark):
     reason="requires mps",
 )
 def test_pt_sf_load_mps_pread(benchmark):
-    # NOTE: on MPS, get_tensors() takes the host-alias bulk fast path
-    # whenever `torch.mps._host_alias_storage` is available — regardless of
-    # the `backend` kwarg. This bench therefore exercises the bulk path on
-    # supported torch builds. To benchmark the per-tensor pread code on MPS
-    # specifically, use `benches/bench_mps_load.py` with `force_slow()`.
+    # On Apple-silicon MPS, get_tensors() allocates Shared MTLBuffers and
+    # parallel-preads into them, then hands off via DLPack. The `backend`
+    # kwarg selects how bytes are sourced (pread here).
     weights = create_gpt2(12)
     with tempfile.NamedTemporaryFile(delete=False) as f:
         save_file(weights, f.name)

@@ -167,8 +167,11 @@ class safe_open:
             The device on which you want the tensors.
 
         backend (`str`, *keyword-only*, defaults to `"mmap"`):
-            Storage backend used to serve tensor bytes. `"mmap"` (default) and
-            `"pread"` uses `pread(2)` to read tensor bytes.
+            Storage backend used to serve tensor bytes. `"mmap"` (the default)
+            memory-maps the file; `"pread"` reads tensor bytes with `pread(2)`.
+            On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
+            shared `MTLBuffer` (1x model memory, no page-cache duplication) and
+            loads a full model several times faster than `"mmap"`.
     """
     def __init__(self, filename, framework, device=..., *, backend: str = "mmap"):
         pass
@@ -235,10 +238,10 @@ class safe_open:
         Returns every tensor in the file as a dict keyed by name.
 
         Equivalent to iterating `offset_keys()` and calling `get_tensor` on
-        each, but specific `framework` + `device` combinations can take an
-        internal fast path (e.g. MPS with PyTorch ≥ 2.10's
-        `_host_alias_storage` bulk-allocates and fills tensors with parallel
-        `pread(2)`).
+        each, but specific `framework` + `device` combinations take an internal
+        fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
+        it bulk-allocates shared `MTLBuffer`s, fills them with parallel
+        `pread(2)`, and hands them to torch via DLPack with no extra copy.
 
         Returns:
             (`Dict[str, Tensor]`):
@@ -248,7 +251,7 @@ class safe_open:
         ```python
         from safetensors import safe_open
 
-        with safe_open("model.safetensors", framework="pt", device="mps") as f:
+        with safe_open("model.safetensors", framework="pt", device="mps", backend="pread") as f:
             state_dict = f.get_tensors()
 
         ```
