@@ -417,7 +417,15 @@ impl<'data> SafeTensors<'data> {
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
         let buffer_end = metadata.validate()?;
-        if buffer_end + N_LEN + n != buffer_len {
+        // `buffer_end` is derived from attacker-controlled offsets, so add with
+        // overflow checks (the header `stop` above is guarded the same way): a
+        // crafted header can otherwise drive this near usize::MAX and panic
+        // (debug) or wrap and bypass the length check (release).
+        let expected_len = buffer_end
+            .checked_add(N_LEN)
+            .and_then(|v| v.checked_add(n))
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        if expected_len != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
 
@@ -752,9 +760,17 @@ impl<'data> TensorView<'data> {
         shape: Vec<usize>,
         data: &'data [u8],
     ) -> Result<Self, SafeTensorError> {
-        let n_elements: usize = shape.iter().product();
+        // Use checked arithmetic so an overflowing shape returns an error instead
+        // of panicking (the deserialize path already guards this the same way).
+        let n_elements: usize = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
 
-        let nbits = n_elements * dtype.bitsize();
+        let nbits = n_elements
+            .checked_mul(dtype.bitsize())
+            .ok_or(SafeTensorError::ValidationOverflow)?;
         if nbits % 8 != 0 {
             return Err(SafeTensorError::MisalignedSlice);
         }
@@ -1591,6 +1607,44 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+    }
+
+    #[test]
+    fn test_tensorview_new_overflow() {
+        // TensorView::new must guard its shape/nbits arithmetic the same way the
+        // deserialize path does: return an error instead of panicking on overflow.
+        // Overflow the shape element-count product.
+        assert!(matches!(
+            TensorView::new(Dtype::I32, vec![usize::MAX, 2], &[]),
+            Err(SafeTensorError::ValidationOverflow)
+        ));
+        // n_elements fits usize but n_elements * bitsize overflows.
+        assert!(matches!(
+            TensorView::new(Dtype::I32, vec![usize::MAX / 4], &[]),
+            Err(SafeTensorError::ValidationOverflow)
+        ));
+    }
+
+    #[test]
+    fn test_read_metadata_offset_sum_overflow() {
+        // A crafted header whose contiguous tensor offsets sum to ~usize::MAX must
+        // not overflow the final `buffer_end + N_LEN + n` length check (which is
+        // derived from attacker-controlled offsets).
+        let m = usize::MAX / 8; // max U8 tensor size before nbits overflows
+        let entries: Vec<String> = (0..8usize)
+            .map(|i| {
+                format!(
+                    "\"t{i}\":{{\"dtype\":\"U8\",\"shape\":[{m}],\"data_offsets\":[{},{}]}}",
+                    i * m,
+                    (i + 1) * m
+                )
+            })
+            .collect();
+        let header = format!("{{{}}}", entries.join(","));
+        let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+        buf.extend_from_slice(header.as_bytes());
+        // Must return an error rather than panicking on the overflowing add.
+        assert!(SafeTensors::deserialize(&buf).is_err());
     }
 
     #[test]
