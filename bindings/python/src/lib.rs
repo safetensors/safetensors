@@ -7,7 +7,7 @@ mod metal;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
-use pyo3::exceptions::{PyException, PyFileNotFoundError};
+use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError, PyPermissionError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
@@ -665,11 +665,15 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
+        let file = File::open(&filename).map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                PyPermissionError::new_err(format!("Permission denied: {}", filename.display()))
+            }
+            std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
                 filename.display()
-            ))
+            )),
+            _ => PyIOError::new_err(format!("Unable to open {}: {e}", filename.display())),
         })?;
         let device = device.unwrap_or(Device::Cpu);
         if device != Device::Cpu
