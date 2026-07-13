@@ -1,3 +1,14 @@
+"""
+PyTorch bindings for safetensors.
+
+This module provides PyTorch-specific functionality for loading and saving
+tensors in the safetensors format. Custom device support is provided through
+the device transfer hook mechanism in the Rust core.
+
+Third-party device packages should call _register_device_transfer_hook() during
+import to enable loading tensors directly to their custom devices.
+"""
+
 import os
 import sys
 from collections import defaultdict
@@ -10,7 +21,120 @@ from safetensors import (
     safe_open,
     serialize,
     serialize_file,
+    _is_custom_device,
 )
+
+def _device_type(device) -> str:
+    """Return the device type string from a str or torch.device."""
+    if isinstance(device, torch.device):
+        return device.type
+    if isinstance(device, int):
+        return "cuda"
+    # Handles "spyre", "spyre:0", "cuda:1", etc.
+    return str(device).split(":")[0]
+
+def _resolve_parent(model, name):
+    """Resolve the parent module and attribute name for a dotted parameter/buffer name.
+
+    Args:
+        model: The root model
+        name: Dotted name like "layer.0.weight"
+
+    Returns:
+        (parent_module, attr_name) tuple
+
+    Raises:
+        AttributeError: If the parent module path doesn't exist
+    """
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2:
+        parent = model.get_submodule(parts[0])
+        attr_name = parts[1]
+    else:
+        parent = model
+        attr_name = parts[0]
+    return parent, attr_name
+
+
+def _assign_tensors_to_model(model, state_dict, strict=True):
+    """Assign tensors from state_dict directly to model parameters/buffers."""
+    missing_keys = []
+    unexpected_keys = list(state_dict.keys())
+
+    # Assign parameters
+    for name, param in model.named_parameters():
+        if name in state_dict:
+            ckpt_tensor = state_dict[name]
+
+            # Validate shape and dtype before assignment to catch mismatches early
+            if ckpt_tensor.shape != param.shape:
+                raise RuntimeError(
+                    f"size mismatch for {name}: "
+                    f"copying a param with shape {ckpt_tensor.shape} from checkpoint, "
+                    f"the shape in current model is {param.shape}."
+                )
+            if ckpt_tensor.dtype != param.dtype:
+                raise RuntimeError(
+                    f"dtype mismatch for {name}: "
+                    f"checkpoint has {ckpt_tensor.dtype}, "
+                    f"model expects {param.dtype}."
+                )
+
+            try:
+                parent, attr_name = _resolve_parent(model, name)
+            except AttributeError:
+                missing_keys.append(name)
+                continue
+
+            # Remove from unexpected only after submodule lookup succeeds 
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+
+            parent._parameters[attr_name] = torch.nn.Parameter(
+                ckpt_tensor, requires_grad=param.requires_grad
+            )
+        else:
+            missing_keys.append(name)
+
+    # Assign buffers
+    for name, buf in model.named_buffers():
+        if name in state_dict:
+            ckpt_tensor = state_dict[name]
+
+            # Validate shape and dtype before assignment to catch mismatches early
+            if ckpt_tensor.shape != buf.shape:
+                raise RuntimeError(
+                    f"size mismatch for {name}: "
+                    f"copying a buffer with shape {ckpt_tensor.shape} from checkpoint, "
+                    f"the shape in current model is {buf.shape}."
+                )
+            if ckpt_tensor.dtype != buf.dtype:
+                raise RuntimeError(
+                    f"dtype mismatch for {name}: "
+                    f"checkpoint has {ckpt_tensor.dtype}, "
+                    f"model expects {buf.dtype}."
+                )
+
+            try:
+                parent, attr_name = _resolve_parent(model, name)
+            except AttributeError:
+                missing_keys.append(name)
+                continue
+
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+
+            parent._buffers[attr_name] = ckpt_tensor
+        else:
+            missing_keys.append(name)
+
+    if strict and (missing_keys or unexpected_keys):
+        raise RuntimeError(
+            f"Error(s) in loading state_dict: missing keys {missing_keys}, "
+            f"unexpected keys {unexpected_keys}"
+        )
+
+    return missing_keys, unexpected_keys
 
 
 def storage_ptr(tensor: torch.Tensor) -> int:
@@ -197,6 +321,7 @@ def load_model(
     strict: bool = True,
     device: Union[str, int] = "cpu",
     *,
+    assign: Optional[bool] = None,
     backend: str = "mmap",
 ) -> Tuple[List[str], List[str]]:
     """
@@ -215,6 +340,13 @@ def load_model(
         device (`Union[str, int]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular torch device locations.
+        assign (`Optional[bool]`, *optional*, defaults to `None`):
+            If True, assign tensors directly to parameters instead of copying
+            via load_state_dict(). This is required when loading to custom
+            devices with models that have meta device parameters, as copying
+            from a non-meta tensor to a meta tensor is a no-op.
+            Defaults to `None`, which auto-selects assign for custom devices.
+            Pass `True`/`False` explicitly to override the auto-detection.
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
             and `"pread"` uses `pread(2)` to read tensor bytes.
@@ -226,11 +358,23 @@ def load_model(
             the load.
     """
     state_dict = load_file(filename, device=device, backend=backend)
+    # For custom devices, load_state_dict's copy_() is a no-op on meta tensors,
+    # so we auto-select the assign path -- but only when the caller hasn't
+    # explicitly told us which path they want via `assign`. An explicit
+    # True/False always wins over the auto-detection.
+    dev_type = _device_type(device) if not isinstance(device, int) else "cuda"
+    if assign is None:
+        _assign = _is_custom_device(dev_type)
+    else:
+        _assign = assign
     model_state_dict = model.state_dict()
     to_removes = _remove_duplicate_names(
         model_state_dict, preferred_names=state_dict.keys()
     )
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if _assign:
+        missing, unexpected = _assign_tensors_to_model(model, state_dict, strict=False)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
     missing = set(missing)
     for to_remove_group in to_removes.values():
         for to_remove in to_remove_group:

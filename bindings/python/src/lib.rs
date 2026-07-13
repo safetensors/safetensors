@@ -7,6 +7,7 @@ mod metal;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
+use once_cell::sync::Lazy;
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
@@ -26,6 +27,7 @@ use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::OnceLock;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -37,6 +39,90 @@ static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Device Transfer Hook Registry
+// ---------------------------------------------------------------------------
+//
+// Global registry for custom device transfer hooks. Third-party device
+// packages (e.g., torch_spyre) register a Python callable that safetensors
+// invokes to transfer tensors from CPU to the custom device.
+//
+// The hook receives:
+//   - cpu_tensor: A framework tensor on CPU (torch.Tensor, jax.Array, etc.)
+//   - name: The tensor's key in the safetensors file
+//   - device: The target device (e.g., "spyre:1")
+//
+// And returns a tensor on the target device.
+
+type DeviceTransferHook = Arc<dyn Fn(Py<PyAny>, &str, Py<PyAny>) -> PyResult<Py<PyAny>> + Send + Sync>;
+
+static DEVICE_HOOKS: Lazy<RwLock<HashMap<String, DeviceTransferHook>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Register a device transfer hook for a custom device type.
+///
+/// Args:
+///     device_type (str): The device type string (e.g., "spyre")
+///     hook (callable): A Python callable with signature
+///         (cpu_tensor, name: str, device) -> tensor
+///    overwrite (bool, optional): If `True`, silently replace an existing
+///         hook for `device_type` instead of raising. Defaults to `False`.
+///         Intended for interactive use (e.g. re-running a notebook cell)
+///         where re-registration is expected; regular imports should not
+///         need it.
+///
+/// This function is called by third-party device packages during import.
+///
+/// Raises:
+///     SafetensorError: if a hook is already registered for `device_type`
+///         and `overwrite` is `False`. Registering a second hook for the
+///         same device type without noticing is a likely source of subtle
+///         bugs (whichever package imports last silently wins), so this is
+///         an error by default rather than a silent overwrite.
+#[pyfunction]
+#[pyo3(signature = (device_type, hook, overwrite=false))]
+fn _register_device_transfer_hook(
+    device_type: String,
+    hook: Py<PyAny>,
+    overwrite: bool,
+) -> PyResult<()> {
+    Python::attach(|py| {
+        // Validate that hook is callable
+        if !hook.bind(py).is_callable() {
+            return Err(SafetensorError::new_err(format!(
+                "Hook for device type '{device_type}' must be callable"
+            )));
+        }
+
+        let hook_fn: DeviceTransferHook = Arc::new(move |tensor: Py<PyAny>, name: &str, device: Py<PyAny>| {
+            Python::attach(|py| {
+                hook.call1(py, (tensor, name, device))
+            })
+        });
+
+        let mut hooks = DEVICE_HOOKS.write().unwrap();
+        if !overwrite && hooks.contains_key(&device_type) {
+            return Err(SafetensorError::new_err(format!(
+                "safetensors: a device transfer hook is already registered for \
+                 device type '{device_type}'. This usually means two packages \
+                 (or two versions of the same package) both tried to register \
+                 a hook for '{device_type}'; whichever registers last would \
+                 otherwise silently win, which can produce a mismatched \
+                 transfer path with no error. Pass overwrite=True to \
+                 _register_device_transfer_hook if replacing the existing \
+                 hook is intentional."
+            )));
+        }
+        hooks.insert(device_type, hook_fn);
+        Ok(())
+    })
+}
+
+#[pyfunction]
+fn _is_custom_device(device_type: &str) -> bool {
+    DEVICE_HOOKS.read().unwrap().contains_key(device_type)
+}
 
 /// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 ///
@@ -493,6 +579,7 @@ enum Device {
     Mlu(usize),
     Musa(usize),
     Hpu(usize),
+    Custom(String, Option<usize>),
     /// User didn't specify accelerator, torch
     /// is responsible for choosing.
     Anonymous(usize),
@@ -500,7 +587,7 @@ enum Device {
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
+        match self {
             Device::Cpu => write!(f, "cpu"),
             Device::Mps => write!(f, "mps"),
             Device::Cuda(index) => write!(f, "cuda:{index}"),
@@ -510,6 +597,8 @@ impl fmt::Display for Device {
             Device::Xla(index) => write!(f, "xla:{index}"),
             Device::Mlu(index) => write!(f, "mlu:{index}"),
             Device::Hpu(index) => write!(f, "hpu:{index}"),
+            Device::Custom(device_type, Some(index)) => write!(f, "{device_type}:{index}"),
+            Device::Custom(device_type, None) => write!(f, "{device_type}"),
             Device::Anonymous(index) => write!(f, "{index}"),
         }
     }
@@ -555,9 +644,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Device {
                 name if name.starts_with("xla:") => parse_device(name).map(Device::Xla),
                 name if name.starts_with("mlu:") => parse_device(name).map(Device::Mlu),
                 name if name.starts_with("hpu:") => parse_device(name).map(Device::Hpu),
-                name => Err(SafetensorError::new_err(format!(
-                    "device {name} is invalid"
-                ))),
+                name => {
+                    // Parse as custom device: "device_type" or "device_type:index"
+                    // Validate device string format: must be alphanumeric + underscore
+                    let parts: Vec<_> = name.split(':').collect();
+                    if parts.is_empty() || parts[0].is_empty() {
+                        return Err(SafetensorError::new_err(format!("device {name} is invalid")));
+                    }
+                    let device_type = parts[0];
+                    if !device_type.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        return Err(SafetensorError::new_err(format!(
+                            "device {name} is invalid: device type must be alphanumeric"
+                        )));
+                    }
+                    let index = if parts.len() == 2 {
+                        Some(parts[1].parse().map_err(|_| {
+                            SafetensorError::new_err(format!("device {name} has invalid index"))
+                        })?)
+                    } else if parts.len() > 2 {
+                        return Err(SafetensorError::new_err(format!("device {name} is invalid")));
+                    } else {
+                        None
+                    };
+                    Ok(Device::Custom(device_type.to_string(), index))
+                }
             }
         } else if let Ok(number) = ob.extract::<usize>() {
             Ok(Device::Anonymous(number))
@@ -585,6 +695,8 @@ impl<'py> IntoPyObject<'py> for Device {
             Device::Xla(n) => format!("xla:{n}").into_pyobject(py).map(|x| x.into_any()),
             Device::Mlu(n) => format!("mlu:{n}").into_pyobject(py).map(|x| x.into_any()),
             Device::Hpu(n) => format!("hpu:{n}").into_pyobject(py).map(|x| x.into_any()),
+            Device::Custom(device_type, Some(n)) => format!("{device_type}:{n}").into_pyobject(py).map(|x| x.into_any()),
+            Device::Custom(device_type, None) => device_type.into_pyobject(py).map(|x| x.into_any()),
             Device::Anonymous(n) => n.into_pyobject(py).map(|x| x.into_any()),
         }
     }
@@ -676,9 +788,24 @@ impl Open {
             && framework != Framework::Pytorch
             && framework != Framework::Paddle
         {
-            return Err(SafetensorError::new_err(format!(
-                "Device {device} is not supported for framework {framework}",
-            )));
+            // Allow custom devices for all frameworks
+            if !matches!(device, Device::Custom(_, _)) {
+                return Err(SafetensorError::new_err(format!(
+                    "Device {device} is not supported for framework {framework}",
+                )));
+            }
+        }
+        // Custom device — validate hook is registered at open time, not lazily at get_tensor
+        if let Device::Custom(device_type, _) = &device {
+            let hooks = DEVICE_HOOKS.read().unwrap();
+            if !hooks.contains_key(device_type) {
+                return Err(SafetensorError::new_err(format!(
+                    "safetensors: device type '{device_type}' is not natively supported \
+                     and no transfer hook has been registered for it. \
+                     If you are using a third-party device package, make sure it is \
+                     imported before calling safe_open (e.g., 'import torch_{device_type}')."
+                )));
+            }
         }
 
         // SAFETY: Mmap is used to prevent allocating in Rust
@@ -766,7 +893,7 @@ impl Open {
 
                 // Untyped storage only exists for versions over 1.11.0
                 // Same for torch.asarray which is necessary for zero-copy tensor
-                if version >= Version::new(1, 11, 0) {
+                if version >= Version::new(1, 11, 0) && !matches!(device, Device::Custom(_, _)) {
                     // storage = torch.ByteStorage.from_file(filename, shared=False,
                     // size=size).untyped()
                     let py_filename: Py<PyAny> = filename
@@ -872,6 +999,22 @@ impl Open {
         let info = self.metadata.info(name).ok_or_else(|| {
             SafetensorError::new_err(format!("File does not contain tensor {name}",))
         })?;
+        // Check if device needs a custom hook
+        if let Device::Custom(device_type, _) = &self.device {
+            let hooks = DEVICE_HOOKS.read().unwrap();
+            if let Some(hook) = hooks.get(device_type) {
+                // Load tensor bytes for the hook
+                let cpu_tensor = self.get_tensor_bytes_for_hook(name, info)?;
+                // Invoke hook to transfer to custom device
+                return Python::attach(|py| {
+                    let device_obj = self.device.clone().into_pyobject(py)?.into();
+                    hook(cpu_tensor, name, device_obj)
+                });
+            } else {
+                // Unreachable: Open::new rejects custom devices with no registered hook.
+                unreachable!("custom device '{device_type}' has no hook but passed Open::new")
+            }
+        }
 
         // Pytorch + CUDA: write into a pinned CPU tensor and `.to(cuda)` for
         // async DMA, regardless of backend. The byte source differs per
@@ -1083,6 +1226,96 @@ impl Open {
                 })
             }
             Storage::Pread(file) => self.get_tensor_pread(name, info, file),
+        }
+    }
+    /// Prepare a tensor for transfer via a custom device hook.
+    ///
+    /// Returns a CPU tensor ready to be passed to the registered hook:
+    /// - **mmap**: zero-copy `PyMemoryView` into the OS page-cache (no heap alloc)
+    /// - **pread**: single copy from disk into a pre-allocated buffer
+    fn get_tensor_bytes_for_hook(&self, name: &str, info: &TensorInfo) -> PyResult<Py<PyAny>> {
+        match &self.storage.as_ref() {
+            Storage::Mmap(mmap) => {
+                let data =
+                    &mmap[info.data_offsets.0 + self.offset..info.data_offsets.1 + self.offset];
+
+                let array: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
+                    // Zero-copy: expose the mmap slice as a read-only Python
+                    // memoryview via the CPython C API.  torch.frombuffer
+                    // (called inside create_tensor) accepts any
+                    // buffer-protocol object and reads from the mmap address
+                    // directly, with no heap allocation.
+                    //
+                    // PyMemoryView_FromMemory(ptr, len, PyBUF_READ) creates a
+                    // memoryview that borrows the pointer without copying.
+                    //
+                    // SAFETY:
+                    //  - data is a sub-slice of self.storage (the Mmap), kept
+                    //    alive by Arc<Storage> for the full duration of this
+                    //    call and until the synchronous hook returns.
+                    //  - PyBUF_READ marks the view read-only; mutation raises
+                    //    TypeError on the Python side.
+                    //  - The raw pointer is checked for null before use.
+                    use pyo3::ffi;
+                    // PyBUF_READ = 0x100 marks the view read-only.
+                    // Defined inline since pyo3::ffi does not re-export it
+                    // in all versions.
+                    const PY_BUF_READ: std::os::raw::c_int = 0x100;
+                    let ptr = unsafe {
+                        ffi::PyMemoryView_FromMemory(
+                            data.as_ptr() as *mut i8,
+                            data.len() as isize,
+                            PY_BUF_READ,
+                        )
+                    };
+                    if ptr.is_null() {
+                        return Err(pyo3::PyErr::fetch(py));
+                    }
+                    // SAFETY: ptr is a valid non-null PyObject* from CPython.
+                    Ok(unsafe { PyBound::from_owned_ptr(py, ptr).unbind() })
+                })?;
+
+                create_tensor(
+                    &self.framework,
+                    info.dtype,
+                    &info.shape,
+                    array,
+                    &Device::Cpu,
+                )
+            }
+            Storage::Torch(_) | Storage::Paddle(_) => {
+                // Torch/Paddle storage backs its bytes in a Python-managed
+                // UntypedStorage / MmapStorage.  Extracting raw bytes from
+                // those without framework-specific Python calls is non-trivial;
+                // a follow-up can add those paths if needed.
+                Err(SafetensorError::new_err(
+                    "Custom device hooks with Torch/Paddle storage are not yet supported. \
+                     Use backend='pread' or open the file without a custom device.",
+                ))
+            }
+            Storage::Pread(file) => {
+                // Pread has no mmap to point into.  `PyByteArray::new_with`
+                // writes the pread bytes directly into a pre-allocated Python
+                // buffer — one copy from disk, no second copy.
+                let (begin, end) = info.data_offsets;
+                let nbytes = end - begin;
+                let file_offset = (self.offset + begin) as u64;
+
+                let array: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
+                    let pyarray = PyByteArray::new_with(py, nbytes, |dst| {
+                        if !dst.is_empty() {
+                            read_exact_at(file, dst, file_offset).map_err(|e| {
+                                SafetensorError::new_err(format!(
+                                    "Could not read tensor {name} from file: {e}"
+                                ))
+                            })?;
+                        }
+                        Ok(())
+                    })?;
+                    Ok(pyarray.into_any().into())
+                })?;
+                create_tensor(&self.framework, info.dtype, &info.shape, array, &Device::Cpu)
+            }
         }
     }
 
@@ -1355,6 +1588,7 @@ impl Open {
                 offset: self.offset,
                 device: self.device.clone(),
                 storage: self.storage.clone(),
+                name: name.to_string(),
             })
         } else {
             Err(SafetensorError::new_err(format!(
@@ -1513,6 +1747,9 @@ struct PySafeSlice {
     offset: usize,
     device: Device,
     storage: Arc<Storage>,
+    /// Tensor key in the safetensors file.  Forwarded to the custom-device
+    /// hook so it receives the same name as Open::get_tensor() would pass.
+    name: String,
 }
 
 use std::fmt;
@@ -1654,6 +1891,139 @@ impl PySafeSlice {
             mps_tensor_from_buf(py, &self.framework, self.info.dtype, &newshape, buf)
         })
     }
+
+    /// Slice the tensor and transfer the result to a custom device via the
+    /// registered hook.
+    ///
+    /// Called by `__getitem__` whenever `self.device` is `Device::Custom`.
+    ///
+    /// # Strategy
+    ///
+    /// 1. Gather the post-slice bytes into a contiguous CPU buffer using
+    ///    `slice_bytes_to_tensor` -- the same helper used by the mmap/pread
+    ///    branches of `__getitem__`.  For mmap storage only the slice ranges
+    ///    are copied, not the whole tensor.
+    ///
+    /// 2. Call `hook(cpu_tensor, name, device)` to move the CPU tensor to
+    ///    the custom device -- exactly as `Open::get_tensor` does.
+    ///
+    /// Torch / Paddle storage is never created for custom devices because
+    /// `Open::new` skips the `UntypedStorage` construction path for
+    /// `Device::Custom`, so those arms are unreachable in practice.
+    fn slice_custom_device(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Step 1 -- produce a contiguous CPU tensor for the requested slice.
+        // Step 1 -- produce a CPU tensor for the requested slice.
+        //
+        // We cannot use slice_bytes_to_tensor() here: it calls
+        // create_tensor(..., &self.device), which for a custom device would
+        // invoke the hook a second time (inside create_tensor) before we even
+        // reach Step 2.  That means the hook receives a Spyre tensor and tries
+        // to DMA it onto Spyre again, causing "Unsupported copy types: src on
+        // spyre dst on spyre".
+        //
+        // Instead, re-do the byte→tensor step explicitly with Device::Cpu so
+        // the hook in Step 2 always receives a plain CPU tensor.
+        let cpu_tensor: Py<PyAny> = match self.storage.as_ref() {
+            Storage::Mmap(mmap) => {
+                let data = &mmap[self.info.data_offsets.0 + self.offset
+                    ..self.info.data_offsets.1 + self.offset];
+                self.slice_bytes_to_cpu_tensor(slices, data)?
+            }
+            Storage::Pread(file) => {
+                let (begin, end) = self.info.data_offsets;
+                let nbytes = end - begin;
+                let mut data = vec![0u8; nbytes];
+                if nbytes > 0 {
+                    read_exact_at(file, &mut data, (self.offset + begin) as u64).map_err(
+                        |e| {
+                            SafetensorError::new_err(format!(
+                                "Could not read tensor bytes for slicing: {e}"
+                            ))
+                        },
+                    )?;
+                }
+                self.slice_bytes_to_cpu_tensor(slices, &data)?
+            }
+            // Unreachable: Open::new skips UntypedStorage construction for
+            // Device::Custom so Storage::Torch / Storage::Paddle are never
+            // created for custom devices.  Emit a clear error anyway.
+            Storage::Torch(_) | Storage::Paddle(_) => {
+                return Err(SafetensorError::new_err(
+                    "Custom device slicing with Torch/Paddle storage is not supported. \
+                     Use backend='pread' or open the file without a custom device.",
+                ));
+            }
+        };
+
+        // Step 2 -- invoke the registered hook to move the CPU tensor to the
+        // custom device.  The hook signature is (cpu_tensor, name, device).
+        let Device::Custom(device_type, _) = &self.device else {
+            unreachable!("slice_custom_device called for non-Custom device")
+        };
+        let hooks = DEVICE_HOOKS.read().unwrap();
+        let hook = hooks.get(device_type).ok_or_else(|| {
+           SafetensorError::new_err(format!(
+               "safetensors: device type '{device_type}' is not natively supported \
+                and no transfer hook has been registered for it. \
+                If you are using a third-party device package, make sure it is \
+                imported before calling safe_open (e.g., 'import torch_{device_type}')."
+           ))
+        })?;
+        Python::attach(|py| {
+            let device_obj: Py<PyAny> = self.device.clone().into_pyobject(py)?.into();
+            hook(cpu_tensor, &self.name, device_obj)
+        })
+    }
+
+    /// Like `slice_bytes_to_tensor` but always targets CPU.
+    ///
+    /// Used by `slice_custom_device` so the hook receives a plain CPU tensor
+    /// rather than one that has already been moved to the custom device by
+    /// `create_tensor` (which would cause a double-dispatch / copy error).
+fn slice_bytes_to_cpu_tensor(
+        &self,
+        slices: &PyBound<'_, PyAny>,
+        data: &[u8],
+    ) -> PyResult<Py<PyAny>> {
+        let indexers = parse_indexers(slices, &self.info.shape)?;
+
+        let tensor = TensorView::new(self.info.dtype, self.info.shape.clone(), data)
+            .map_err(|e| SafetensorError::new_err(format!("Error preparing tensor view: {e}")))?;
+
+        let iterator = tensor.sliced_data(&indexers).map_err(|e| {
+            SafetensorError::new_err(format!(
+                "Error during slicing {} with shape {:?}: {e}",
+                Disp(indexers),
+                self.info.shape,
+            ))
+        })?;
+        let newshape = iterator.newshape();
+        let length = iterator.remaining_byte_len();
+
+        let mut offset = 0;
+        Python::attach(|py| {
+            let array: Py<PyAny> = PyByteArray::new_with(py, length, |bytes: &mut [u8]| {
+                for slice in iterator {
+                    let len = slice.len();
+                    bytes[offset..offset + len].copy_from_slice(slice);
+                    offset += len;
+                }
+                Ok(())
+            })?
+            .into_any()
+            .into();
+            // Force CPU regardless of self.device so the caller (slice_custom_device)
+            // always gets a CPU tensor to hand to the registered hook.
+            create_tensor(
+                &self.framework,
+                self.info.dtype,
+                &newshape,
+                array,
+                &Device::Cpu,
+            )
+        })
+    }
+
 }
 
 #[pymethods]
@@ -1699,6 +2069,14 @@ impl PySafeSlice {
     }
 
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Custom device: gather the sliced bytes on CPU then dispatch to the
+        // registered hook.  Must come before the MPS guard because a custom
+        // device could in principle run on macOS/aarch64 and the MPS path
+        // would otherwise shadow it.
+        if matches!(self.device, Device::Custom(_, _)) {
+            return self.slice_custom_device(slices);
+        }
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
@@ -2514,6 +2892,8 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_device_transfer_hook, m)?)?;
+    m.add_function(wrap_pyfunction!(_is_custom_device, m)?)?;
     m.add_class::<TensorSpec>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
