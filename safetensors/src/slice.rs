@@ -347,6 +347,9 @@ pub fn slice_byte_ranges(
     // Minimum span is the span of 1 item;
     let mut span = dtype.bitsize();
     let mut indices: Vec<(usize, usize)> = vec![];
+    // Whether some dimension selected zero elements, making the whole
+    // slice empty.
+    let mut is_empty = false;
     // Everything is row major.
     for (i, &dim) in shape.iter().enumerate().rev() {
         if i >= slices.len() {
@@ -372,6 +375,13 @@ pub fn slice_byte_ranges(
                     asked,
                     dim_size: dim,
                 });
+            }
+            // A backwards range (`start > stop`, e.g. `2:1`) selects
+            // nothing; clamp it to an empty range as numpy does instead
+            // of letting `stop - start` underflow below.
+            let stop = stop.max(start);
+            if start == stop {
+                is_empty = true;
             }
             if !matches!(slice, TensorIndexer::Select(_)) {
                 newshape.push((stop - start).div_ceil(step));
@@ -415,7 +425,13 @@ pub fn slice_byte_ranges(
         }
         span *= dim;
     }
-    if indices.is_empty() {
+    if is_empty {
+        // Some dimension selected zero elements, so the slice holds no
+        // bytes at all; drop any ranges accumulated before that
+        // dimension was reached so the fallback below cannot resurrect
+        // the full tensor.
+        indices = vec![];
+    } else if indices.is_empty() {
         // Empty `slices` (or all unbounded full-range slices): no slicing
         // happened, the whole tensor is the result. `span` ended as
         // bitsize * product(shape).
@@ -760,5 +776,58 @@ mod tests {
             ),
             Err(InvalidSlice::TooManySlices)
         );
+    }
+
+    #[test]
+    fn test_empty_and_backwards_range() {
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let attn_0 = TensorView::new(Dtype::F32, vec![2, 3], &data).unwrap();
+
+        // Backwards range on the innermost dim (`arr[:, 2:1]` in numpy):
+        // used to underflow `stop - start` and panic; must be empty.
+        let mut iterator = SliceIterator::new(
+            &attn_0,
+            &[
+                TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN),
+                TensorIndexer::Narrow(Bound::Included(2), Bound::Excluded(1), NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![2, 0]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.by_ref().map(<[u8]>::len).sum::<usize>(), 0);
+
+        // Backwards range on the outer dim combined with a real slice on
+        // the inner dim (`arr[1:0, 1:3]`): the accumulated inner ranges
+        // must be discarded, not replaced by the full tensor.
+        let mut iterator = SliceIterator::new(
+            &attn_0,
+            &[
+                TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(0), NonZeroUsize::MIN),
+                TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(3), NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0, 2]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.by_ref().map(<[u8]>::len).sum::<usize>(), 0);
+
+        // In-order empty range on the outer dim (`arr[1:1, 1:3]`): same
+        // invariant without any backwards bound.
+        let mut iterator = SliceIterator::new(
+            &attn_0,
+            &[
+                TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(1), NonZeroUsize::MIN),
+                TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(3), NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0, 2]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.by_ref().map(<[u8]>::len).sum::<usize>(), 0);
     }
 }
