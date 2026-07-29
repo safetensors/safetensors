@@ -650,6 +650,10 @@ impl Version {
     }
 }
 
+/// Default per-buffer size of the pinned staging ring used by the bulk CUDA
+/// load path (`get_tensors_cuda`); two buffers of this size are live at once.
+const DEFAULT_STAGING_BYTES: usize = 256 << 20;
+
 struct Open {
     metadata: Metadata,
     offset: usize,
@@ -1253,7 +1257,20 @@ impl Open {
     /// Shared `MTLBuffer`s, parallel-`pread`s into them, and hands them to
     /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
     /// The `mmap` backend uses the sequential loop, reading through the mmap.
-    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+    /// Pytorch on CUDA uses a bulk pipelined path (`get_tensors_cuda`) whose
+    /// pinned staging ring is sized by `staging_bytes` (`None` = 256 MiB per
+    /// buffer, two buffers live).
+    pub fn get_tensors(&self, staging_bytes: Option<usize>) -> PyResult<Py<PyDict>> {
+        let staging_bytes = match staging_bytes {
+            Some(0) => {
+                return Err(SafetensorError::new_err(
+                    "staging_bytes must be a positive number of bytes",
+                ))
+            }
+            Some(n) => n,
+            None => DEFAULT_STAGING_BYTES,
+        };
+
         // The bulk parallel-pread path is gated on the `pread` backend so the
         // `backend` choice is honored: `mmap` falls through to the per-tensor
         // loop below, which reads through the mmap via `get_tensor_mps`.
@@ -1270,6 +1287,10 @@ impl Open {
             if let Storage::Pread(file) = self.storage.as_ref() {
                 return self.get_tensors_mps(file);
             }
+        }
+
+        if self.framework == Framework::Pytorch && matches!(self.device, Device::Cuda(_)) {
+            return self.get_tensors_cuda(staging_bytes);
         }
 
         Python::attach(|py| -> PyResult<Py<PyDict>> {
@@ -1329,6 +1350,241 @@ impl Open {
             }
             Ok(dict.into())
         })
+    }
+
+    /// Bulk CUDA load for whole-file reads (`load_file(device="cuda")`).
+    ///
+    /// The per-tensor path (`get_tensor_pinned_cuda`) allocates a fresh
+    /// pinned buffer and issues a blocking `.to(cuda)` per tensor, so file
+    /// reads, host copies, and DMA never overlap. Here every destination is
+    /// allocated up front, file bytes are staged through a small ring of
+    /// pinned buffers, and one `copy_(non_blocking=True)` per tensor/chunk
+    /// overlap is enqueued on the target device's current stream: while the
+    /// copy engine drains chunk `k`, worker threads fill chunk `k+1`. Peak
+    /// extra host memory is the pinned ring (`CUDA_STAGE_*`), and one final
+    /// event sync materializes everything before returning.
+    fn get_tensors_cuda(&self, staging_bytes: usize) -> PyResult<Py<PyDict>> {
+        // Two pinned ring buffers of `staging_bytes` each (default 256 MiB:
+        // large enough that per-chunk costs — stripe thread spawns, event
+        // syncs — amortize, small enough that the transient host allocation
+        // stays negligible next to the model).
+        const CUDA_STAGE_BUFFERS: usize = 2;
+
+        struct Dest<'py> {
+            name: String,
+            data_offsets: (usize, usize),
+            dtype: Dtype,
+            shape: Vec<usize>,
+            tensor: PyBound<'py, PyAny>,
+        }
+
+        Python::attach(|py| -> PyResult<Py<PyDict>> {
+            let torch = get_module(py, &TORCH_MODULE)?;
+            let device_str: Py<PyAny> = self.device.clone().into_pyobject(py)?.into();
+            let device_obj = torch.call_method1(intern!(py, "device"), (device_str,))?;
+            let u8_dtype = get_pydtype(torch, Dtype::U8, false)?;
+
+            // Every destination is a flat uint8 device tensor, viewed to its
+            // real dtype/shape at the end: fresh allocations are always
+            // dtype-aligned, so the views are zero-copy even for tensors
+            // whose file offsets are not.
+            let names = self.metadata.offset_keys();
+            let mut dests: Vec<Dest> = Vec::with_capacity(names.len());
+            let mut data_end = 0usize;
+            for name in names {
+                let info = self.metadata.info(&name).ok_or_else(|| {
+                    SafetensorError::new_err(format!("Missing tensor info for {name}"))
+                })?;
+                let (begin, end) = info.data_offsets;
+                let kwargs = [
+                    (intern!(py, "dtype"), u8_dtype.clone_ref(py)),
+                    (intern!(py, "device"), device_obj.clone().unbind()),
+                ]
+                .into_py_dict(py)?;
+                let tensor =
+                    torch.call_method(intern!(py, "empty"), (end - begin,), Some(&kwargs))?;
+                data_end = data_end.max(end);
+                dests.push(Dest {
+                    name,
+                    data_offsets: (begin, end),
+                    dtype: info.dtype,
+                    shape: info.shape.clone(),
+                    tensor,
+                });
+            }
+
+            // `Storage::Torch` serves bytes from a torch storage's data_ptr;
+            // fetch the base pointer once instead of per chunk.
+            let torch_base_ptr = match self.storage.as_ref() {
+                Storage::Torch(storage) => {
+                    let storage_obj = storage
+                        .get()
+                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
+                    let ptr: usize = storage_obj
+                        .bind(py)
+                        .call_method0(intern!(py, "data_ptr"))?
+                        .extract()?;
+                    Some(ptr)
+                }
+                _ => None,
+            };
+
+            if data_end > 0 {
+                let cuda = torch.getattr(intern!(py, "cuda"))?;
+                let stream =
+                    cuda.call_method1(intern!(py, "current_stream"), (device_obj.clone(),))?;
+                let event_cls = cuda.getattr(intern!(py, "Event"))?;
+
+                let chunk_len = staging_bytes.min(data_end);
+                let n_buffers = CUDA_STAGE_BUFFERS.min(data_end.div_ceil(chunk_len));
+                let mut buffers = Vec::with_capacity(n_buffers);
+                for _ in 0..n_buffers {
+                    let pin: Py<PyAny> = PyBool::new(py, true).to_owned().into_any().into();
+                    // device="cpu" must be explicit: a `with torch.device(..)`
+                    // default-device context would otherwise move the
+                    // allocation to CUDA, where pin_memory is invalid.
+                    let cpu_device: Py<PyAny> = "cpu".into_pyobject(py)?.into();
+                    let kwargs = [
+                        (intern!(py, "dtype"), u8_dtype.clone_ref(py)),
+                        (intern!(py, "device"), cpu_device),
+                        (intern!(py, "pin_memory"), pin),
+                    ]
+                    .into_py_dict(py)?;
+                    let buf =
+                        torch.call_method(intern!(py, "empty"), (chunk_len,), Some(&kwargs))?;
+                    let ptr: usize = buf.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                    let event = event_cls.call0()?;
+                    buffers.push((buf, ptr, event));
+                }
+
+                let nb: Py<PyAny> = PyBool::new(py, true).to_owned().into_any().into();
+                let nb_kwargs = [(intern!(py, "non_blocking"), nb)].into_py_dict(py)?;
+                let mut ti = 0usize;
+                let mut lo = 0usize;
+                let mut chunk_idx = 0usize;
+                while lo < data_end {
+                    let hi = (lo + chunk_len).min(data_end);
+                    let (buf, buf_ptr, event) = &buffers[chunk_idx % n_buffers];
+                    if chunk_idx >= n_buffers {
+                        // H2D copies still reading this buffer must drain
+                        // before we overwrite it.
+                        event.call_method0(intern!(py, "synchronize"))?;
+                    }
+                    self.fill_stage_buffer(
+                        py,
+                        torch_base_ptr,
+                        *buf_ptr,
+                        self.offset + lo,
+                        hi - lo,
+                    )?;
+                    while ti < dests.len() && dests[ti].data_offsets.1 <= lo {
+                        ti += 1;
+                    }
+                    let mut j = ti;
+                    while j < dests.len() && dests[j].data_offsets.0 < hi {
+                        let (begin, end) = dests[j].data_offsets;
+                        if end > begin {
+                            let a = begin.max(lo);
+                            let e = end.min(hi);
+                            let src =
+                                buf.call_method1(intern!(py, "narrow"), (0, a - lo, e - a))?;
+                            let dst = dests[j]
+                                .tensor
+                                .call_method1(intern!(py, "narrow"), (0, a - begin, e - a))?;
+                            dst.call_method(intern!(py, "copy_"), (src,), Some(&nb_kwargs))?;
+                        }
+                        j += 1;
+                    }
+                    event.call_method1(intern!(py, "record"), (stream.clone(),))?;
+                    lo = hi;
+                    chunk_idx += 1;
+                }
+                // The pinned ring must outlive every in-flight copy, and the
+                // returned tensors must be materialized for the caller.
+                for (_, _, event) in &buffers {
+                    event.call_method0(intern!(py, "synchronize"))?;
+                }
+            }
+
+            let dict = PyDict::new(py);
+            for d in dests {
+                let dtype_obj = get_pydtype(torch, d.dtype, false)?;
+                let viewed = d.tensor.call_method1(intern!(py, "view"), (dtype_obj,))?;
+                let storage_shape = torch_storage_shape(d.dtype, &d.shape)?;
+                let shape_obj: Py<PyAny> = storage_shape.into_pyobject(py)?.into();
+                let tensor = viewed.call_method1(intern!(py, "reshape"), (shape_obj,))?;
+                dict.set_item(d.name, tensor)?;
+            }
+            Ok(dict.into())
+        })
+    }
+
+    /// Fill `len` bytes at pinned `dst_ptr` from absolute file byte
+    /// `src_off` (header offset already applied), striping the work across
+    /// threads with the GIL released. `torch_base_ptr` is the pre-fetched
+    /// `data_ptr()` for `Storage::Torch`.
+    fn fill_stage_buffer(
+        &self,
+        py: Python<'_>,
+        torch_base_ptr: Option<usize>,
+        dst_ptr: usize,
+        src_off: usize,
+        len: usize,
+    ) -> PyResult<()> {
+        match self.storage.as_ref() {
+            Storage::Mmap(mmap) => {
+                let src_ptr = mmap[src_off..src_off + len].as_ptr() as usize;
+                // SAFETY (inside stripe_copy): src names the live mmap
+                // region, dst the pinned buffer; both outlive the call.
+                py.detach(|| stripe_copy(src_ptr, dst_ptr, len));
+                Ok(())
+            }
+            Storage::Torch(_) => {
+                let base = torch_base_ptr
+                    .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
+                // SAFETY (inside stripe_copy): base is the data_ptr of the
+                // torch UntypedStorage held alive by `self.storage`, valid
+                // for `src_off..src_off + len`; dst is the pinned buffer.
+                py.detach(|| stripe_copy(base + src_off, dst_ptr, len));
+                Ok(())
+            }
+            Storage::Pread(file) => {
+                let res: std::io::Result<()> = py.detach(|| {
+                    let n_stripes = stage_stripe_count(len);
+                    let stripe = len.div_ceil(n_stripes);
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(n_stripes);
+                        for w in 0..n_stripes {
+                            let begin = w * stripe;
+                            if begin >= len {
+                                break;
+                            }
+                            let end = (begin + stripe).min(len);
+                            handles.push(s.spawn(move || {
+                                // SAFETY: stripes are disjoint slices of the
+                                // pinned buffer, which outlives this scope.
+                                let buf = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        (dst_ptr + begin) as *mut u8,
+                                        end - begin,
+                                    )
+                                };
+                                read_exact_at(file, buf, (src_off + begin) as u64)
+                            }));
+                        }
+                        for h in handles {
+                            h.join()
+                                .map_err(|_| std::io::Error::other("worker panicked"))??;
+                        }
+                        Ok(())
+                    })
+                });
+                res.map_err(|e| SafetensorError::new_err(format!("pread failed: {e}")))
+            }
+            Storage::Paddle(_) => {
+                unreachable!("Storage::Paddle does not route through the bulk CUDA path")
+            }
+        }
     }
 
     /// Returns a full slice view object
@@ -1458,7 +1714,15 @@ impl safe_open {
     ///
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
     /// each; for `device="mps"` it instead bulk-allocates Shared MTLBuffers,
-    /// parallel-`pread(2)`s into them, and hands them off via DLPack.
+    /// parallel-`pread(2)`s into them, and hands them off via DLPack, and for
+    /// CUDA (or ROCm) devices it streams the file through a pinned staging
+    /// ring with async copies.
+    ///
+    /// Args:
+    ///     staging_bytes (`int`, *keyword-only*, *optional*, defaults to 256MiB):
+    ///         Per-buffer size of the CUDA path's pinned staging ring; two
+    ///         buffers of this size are live during the load. Other devices
+    ///         ignore it.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
@@ -1471,8 +1735,9 @@ impl safe_open {
     /// with safe_open("model.safetensors", framework="pt", device="mps") as f:
     ///     state_dict = f.get_tensors()
     /// ```
-    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        self.inner()?.get_tensors()
+    #[pyo3(signature = (*, staging_bytes=None))]
+    pub fn get_tensors(&self, staging_bytes: Option<usize>) -> PyResult<Py<PyDict>> {
+        self.inner()?.get_tensors(staging_bytes)
     }
 
     /// Returns a full slice view object
@@ -2021,6 +2286,55 @@ fn parallel_pread(
     })
 }
 
+/// Number of worker threads for one stage-buffer fill: at most 16 (page-
+/// cache memcpy keeps scaling past 8 on wide server parts; NVMe reads
+/// saturate earlier), at least 4 MiB per stripe so small chunks stay
+/// single-threaded.
+fn stage_stripe_count(len: usize) -> usize {
+    const MIN_STRIPE: usize = 4 << 20;
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16)
+        .min(len.div_ceil(MIN_STRIPE))
+        .max(1)
+}
+
+/// memcpy `len` bytes from `src_ptr` to `dst_ptr`, striped across threads.
+///
+/// SAFETY: caller guarantees both ranges are valid for `len` bytes, disjoint,
+/// and outlive the call.
+fn stripe_copy(src_ptr: usize, dst_ptr: usize, len: usize) {
+    let n_stripes = stage_stripe_count(len);
+    if n_stripes <= 1 {
+        // SAFETY: caller contract.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr as *const u8, dst_ptr as *mut u8, len);
+        }
+        return;
+    }
+    let stripe = len.div_ceil(n_stripes);
+    std::thread::scope(|s| {
+        for w in 0..n_stripes {
+            let begin = w * stripe;
+            if begin >= len {
+                break;
+            }
+            let end = (begin + stripe).min(len);
+            s.spawn(move || {
+                // SAFETY: stripes are disjoint sub-ranges of the caller's
+                // ranges; the scope keeps them alive.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (src_ptr + begin) as *const u8,
+                        (dst_ptr + begin) as *mut u8,
+                        end - begin,
+                    );
+                }
+            });
+        }
+    });
+}
+
 /// Storage shape for torch tensors. F4 packs two elements per byte, so the
 /// `torch.empty` shape halves the last dim relative to the logical shape
 /// recorded in the safetensors header.
@@ -2473,8 +2787,9 @@ impl _safe_open_handle {
     /// Returns every tensor in the file as a dict keyed by name.
     ///
     /// See `safe_open.get_tensors` for the device-specific dispatch.
-    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        self.inner()?.get_tensors()
+    #[pyo3(signature = (*, staging_bytes=None))]
+    pub fn get_tensors(&self, staging_bytes: Option<usize>) -> PyResult<Py<PyDict>> {
+        self.inner()?.get_tensors(staging_bytes)
     }
 
     /// Returns a full slice view object

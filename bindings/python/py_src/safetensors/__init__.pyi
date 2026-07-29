@@ -233,9 +233,13 @@ class safe_open:
         """
         pass
 
-    def get_tensors(self):
+    def get_tensors(self, *, staging_bytes: Optional[int] = None):
         """
         Returns every tensor in the file as a dict keyed by name.
+
+        `staging_bytes` sizes each buffer of the pinned staging ring used
+        when loading to a CUDA (or ROCm) device (default 256MiB per buffer,
+        two buffers live); other devices ignore it.
 
         Equivalent to iterating `offset_keys()` and calling `get_tensor` on
         each, but specific `framework` + `device` combinations take an internal
