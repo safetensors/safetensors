@@ -330,6 +330,7 @@ def load_file(
     device: Union[str, int] = "cpu",
     *,
     backend: str = "mmap",
+    staging_bytes: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Loads a safetensors file into torch format.
@@ -343,6 +344,11 @@ def load_file(
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
             and `"pread"` uses `pread(2)` to read tensor bytes.
+        staging_bytes (`int`, *optional*, defaults to 256MiB):
+            Per-buffer size of the pinned-memory staging ring used when
+            loading to a CUDA (or ROCm) device; two buffers of this size are
+            live during the load. Lower it on memory-constrained hosts, raise
+            it to squeeze out more bandwidth on fast links.
 
     Returns:
         `Dict[str, torch.Tensor]`: dictionary that contains name as key, value as `torch.Tensor`
@@ -357,7 +363,7 @@ def load_file(
     ```
     """
     with safe_open(filename, framework="pt", device=device, backend=backend) as f:
-        return f.get_tensors()
+        return f.get_tensors(staging_bytes=staging_bytes)
 
 
 def load(data: bytes) -> Dict[str, torch.Tensor]:

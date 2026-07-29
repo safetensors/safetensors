@@ -575,3 +575,88 @@ class SliceTestCase(unittest.TestCase):
         with safe_open(local, framework="pt") as f:
             metadata = f.metadata()
         self.assertEqual(metadata, {"Something": "more"})
+
+
+class BulkCudaTestCase(unittest.TestCase):
+    """The bulk CUDA `get_tensors` path must match the per-tensor path bitwise."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        # Mixed dtypes with odd sizes so later tensors land on offsets that
+        # are not aligned to their dtype, plus scalar and empty tensors.
+        self.tensors = {
+            "a_bf16": torch.randn(127, 33, dtype=torch.bfloat16),
+            "b_u8": torch.randint(0, 255, (13,), dtype=torch.uint8),
+            "c_f32": torch.randn(65, 7),
+            "d_bool": torch.randn(100) > 0,
+            "e_scalar": torch.tensor(3.5, dtype=torch.float16),
+            "f_empty": torch.empty(0, 4, dtype=torch.bfloat16),
+            "g_i64": torch.randint(-(2**40), 2**40, (11, 3)),
+            "h_f8": torch.randn(33).to(torch.float8_e4m3fn),
+            "j_big": torch.randn(300, 1111, dtype=torch.bfloat16),
+        }
+        self.local = "./tests/data/bulk_cuda.safetensors"
+        save_file(self.tensors, self.local)
+
+    def _load_per_tensor(self, backend):
+        # get_tensor still uses the per-tensor pinned path; only whole-file
+        # get_tensors goes bulk.
+        with safe_open(self.local, framework="pt", device="cuda:0", backend=backend) as f:
+            return {name: f.get_tensor(name) for name in f.keys()}
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+    def test_bulk_matches_per_tensor(self):
+        for backend in ("mmap", "pread"):
+            stock = self._load_per_tensor(backend)
+            bulk = load_file(self.local, device="cuda:0", backend=backend)
+            self.assertEqual(stock.keys(), bulk.keys())
+            for name, expected in stock.items():
+                got = bulk[name]
+                self.assertEqual(expected.dtype, got.dtype, name)
+                self.assertEqual(expected.shape, got.shape, name)
+                self.assertEqual(got.device, torch.device("cuda:0"), name)
+                if expected.dtype is torch.bool:
+                    expected = expected.view(torch.uint8)
+                    got = got.view(torch.uint8)
+                self.assertTrue(torch.equal(expected, got), name)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+    def test_bulk_under_default_device_context(self):
+        with torch.device("cuda:0"):
+            bulk = load_file(self.local, device="cuda:0")
+        self.assertEqual(len(bulk), len(self.tensors))
+        for tensor in bulk.values():
+            self.assertEqual(tensor.device, torch.device("cuda:0"))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+    def test_custom_staging_bytes(self):
+        # A staging buffer far smaller than the file forces every tensor to
+        # span chunks; the result must not change.
+        stock = self._load_per_tensor("mmap")
+        bulk = load_file(self.local, device="cuda:0", staging_bytes=64 << 10)
+        for name, expected in stock.items():
+            got = bulk[name]
+            if expected.dtype is torch.bool:
+                expected, got = expected.view(torch.uint8), got.view(torch.uint8)
+            self.assertTrue(torch.equal(expected, got), name)
+
+    def test_zero_staging_bytes_rejected(self):
+        with self.assertRaises(Exception):
+            load_file(self.local, device="cpu", staging_bytes=0)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+    def test_tensor_larger_than_stage_chunk(self):
+        # A single tensor bigger than the 256MiB stage chunk is streamed
+        # through the pinned ring in pieces; the partial copies must
+        # reassemble it exactly.
+        local = "./tests/data/bulk_cuda_huge.safetensors"
+        torch.manual_seed(0)
+        tensors = {
+            "huge": torch.randn(90_000_000),  # 360MB f32, spans >1 chunk
+            "tail": torch.randn(31, dtype=torch.bfloat16),
+        }
+        save_file(tensors, local)
+        bulk = load_file(local, device="cuda:0")
+        with safe_open(local, framework="pt", device="cuda:0") as f:
+            for name in f.keys():
+                self.assertTrue(torch.equal(f.get_tensor(name), bulk[name]), name)
