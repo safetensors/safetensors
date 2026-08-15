@@ -1,5 +1,7 @@
 # Re-export this
 from ._safetensors_rust import (  # noqa: F401
+    configure_cuda_loading,
+    _engine_inflight_mb,
     SafetensorError,
     TensorSpec,
     __version__,

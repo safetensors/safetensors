@@ -8,6 +8,7 @@ use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
 
 // The structs and enums below are the ABI consumers read across the FFI
@@ -18,6 +19,7 @@ use crate::metal::MTLBuffer;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DLDeviceType {
     Cpu = 1,
     Cuda = 2,
@@ -84,6 +86,7 @@ pub(crate) trait AsDevicePtr: Send + 'static {
     fn as_device_ptr(&self) -> *mut c_void;
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl AsDevicePtr for MTLBuffer {
     fn as_device_ptr(&self) -> *mut c_void {
         // PyTorch's MPS from_dlpack reads `data` as `id<MTLBuffer>` and
@@ -171,7 +174,9 @@ pub(crate) fn torch_view_target(dtype: Dtype) -> Option<&'static str> {
     Some(match dtype {
         Dtype::F4 => "float4_e2m1fn_x2",
         Dtype::F8_E5M2 => "float8_e5m2",
+        Dtype::F8_E5M2FNUZ => "float8_e5m2fnuz",
         Dtype::F8_E4M3 => "float8_e4m3fn",
+        Dtype::F8_E4M3FNUZ => "float8_e4m3fnuz",
         Dtype::F8_E8M0 => "float8_e8m0fnu",
         _ => return None,
     })
@@ -186,9 +191,9 @@ pub(crate) fn uint8_dlpack() -> DLDataType {
     }
 }
 
-/// Whether torch's MPS fast path can ingest this dtype, either via native
-/// DLPack support or via the `uint8 + view`-cast workaround.
-pub(crate) fn torch_mps_compatible(dtype: Dtype) -> bool {
+/// Whether torch's DLPack fast paths can ingest this dtype,
+/// either via native DLPack support or via the `uint8 + view`-cast workaround
+pub(crate) fn torch_dlpack_compatible(dtype: Dtype) -> bool {
     dlpack_supported_native(dtype) || torch_view_target(dtype).is_some()
 }
 
@@ -200,7 +205,7 @@ pub(crate) fn cpu_device() -> DLDevice {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(unix)]
 pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Cuda,
@@ -208,6 +213,7 @@ pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn metal_device() -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Metal,

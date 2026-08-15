@@ -151,6 +151,42 @@ class TensorSpec:
         """
         pass
 
+def configure_cuda_loading(
+    *,
+    chunk_mb: Optional[int] = None,
+    workers: Optional[int] = None,
+    slabs: Optional[int] = None,
+    inflight_mb: Optional[int] = None,
+):
+    """
+    Configure the CUDA loading engine (chunk/pinned-slab size in MiB, shared
+    engine worker-thread count, pinned slab ring depth, opportunistic
+    read-ahead budget in MiB).
+
+    One-shot: call it before the first CUDA `safe_open(..., backend="pread")`
+    load in the process; the engine otherwise initializes lazily with the
+    defaults below. Calling it after the engine initialized (or twice)
+    raises `SafetensorError`. Omitted arguments keep their default, so
+    setting one knob does not pin the others.
+
+    Defaults: `chunk_mb=16`, `workers=24`, `slabs=24`. `inflight_mb` bounds
+    the tensor bytes allocated ahead of consumption across every file being
+    loaded at once; left unset it is derived at engine init as one
+    sixteenth of the loading device's free memory, clamped to
+    `[512, 8192]` MiB.
+    """
+    pass
+
+def _engine_inflight_mb() -> int:
+    """
+    The read-ahead budget the CUDA loading engine is running with, in MiB:
+    the configured `inflight_mb`, or the free-memory-derived default.
+
+    Internal instrumentation. Reading it initializes the budget, freezing
+    the derived value, so call it only after (or instead of) a load.
+    """
+    pass
+
 class safe_open:
     """
     Opens a safetensors lazily and returns tensors as asked
@@ -172,8 +208,32 @@ class safe_open:
             On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
             shared `MTLBuffer` (1x model memory, no page-cache duplication) and
             loads a full model several times faster than `"mmap"`.
+            On CUDA devices with PyTorch, `"pread"` makes `get_tensors()`
+            bulk-load the whole file: chunked parallel `pread(2)` through a
+            process-global ring of reusable pinned slabs and
+            `cudaMemcpyAsync` to the device, served by a shared engine
+            worker pool (see `configure_cuda_loading` for the tunables).
+
+        prefetch (`bool`, *keyword-only*, defaults to `False`):
+            CUDA + PyTorch + `backend="pread"` only. Starts loading the whole
+            tensor-data section at open: reads and H2D copies proceed fully
+            in the background (no GIL involvement) into per-tensor
+            stream-ordered CUDA allocations (`cudaMallocAsync`), handed to
+            torch via DLPack at delivery. `get_tensor` then blocks only
+            until that tensor's bytes are resident, `tensor_stream()` yields
+            pairs in completion order as they become ready, and
+            `get_tensors()` drains the same machinery. Read-ahead across any
+            number of prefetching files is bounded by the in-flight budget
+            (`configure_cuda_loading(inflight_mb=...)`, otherwise free
+            device memory / 16 clamped to `[512, 8192]`MiB):
+            allocated-but-unconsumed tensor bytes; at the cap, prefetching
+            idles until tensors are consumed. Tensor memory lives outside torch's caching
+            allocator (visible in `torch.cuda.mem_get_info`, not in
+            `torch.cuda.memory_allocated`) and is freed when the tensor
+            drops. Each tensor is delivered once; asking again re-reads it
+            from disk.
     """
-    def __init__(self, filename, framework, device=..., *, backend: str = "mmap"):
+    def __init__(self, filename, framework, device=..., *, backend: str = "mmap", prefetch: bool = False):
         pass
 
     def __enter__(self):
@@ -210,6 +270,18 @@ class safe_open:
         """
         pass
 
+    def _forced_pushes(self) -> int:
+        """
+        Work items this handle has pushed onto the loading engine's forced
+        (consumer-demanded) lane; `0` without `prefetch=True`.
+
+        Internal instrumentation: consuming through `tensor_stream` takes
+        tensors in the order the engine finishes them, so a plain drain
+        never demands work and this stays `0`. Random-access `get_tensor`,
+        and a stream starved of budget by other open files, move it.
+        """
+        pass
+
     def get_tensor(self, name):
         """
         Returns a full tensor
@@ -242,6 +314,10 @@ class safe_open:
         fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
         it bulk-allocates shared `MTLBuffer`s, fills them with parallel
         `pread(2)`, and hands them to torch via DLPack with no extra copy.
+        On CUDA with PyTorch and the `"pread"` backend, the file is loaded
+        through a ring of reusable pinned slabs straight into owned
+        per-tensor allocations, in completion order (which is also the dict
+        insertion order); `prefetch=True` merely starts that work at open.
 
         Returns:
             (`Dict[str, Tensor]`):
@@ -253,6 +329,40 @@ class safe_open:
 
         with safe_open("model.safetensors", framework="pt", device="mps", backend="pread") as f:
             state_dict = f.get_tensors()
+
+        ```
+        """
+        pass
+
+    def tensor_stream(self):
+        """
+        Returns an iterator of `(name, tensor)` pairs.
+
+        With `prefetch=True`, each pair is yielded as soon as its bytes are
+        resident on the device, so per-tensor consumer work overlaps the
+        remaining I/O. The yield order is therefore **completion order, not
+        offset order**, and varies from run to run: waiting for a particular
+        tensor while later ones are already resident is exactly the
+        head-of-line stall this iterator exists to avoid. Every tensor is
+        yielded exactly once, so `dict(f.tensor_stream())` is unaffected;
+        use `get_tensor` when a specific tensor is needed next.
+
+        Without prefetch it is equivalent to `get_tensor` over
+        `offset_keys()`, in offset order.
+
+        Returns:
+            (`Iterator[Tuple[str, Tensor]]`):
+                Every tensor exactly once, in completion order under
+                `prefetch=True` and offset order otherwise.
+
+        Example:
+        ```python
+        from safetensors import safe_open
+
+        with safe_open("model.safetensors", framework="pt", device="cuda:0",
+                       backend="pread", prefetch=True) as f:
+            for name, tensor in f.tensor_stream():
+                ...
 
         ```
         """
