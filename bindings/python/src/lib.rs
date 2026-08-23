@@ -51,9 +51,12 @@ static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
 /// transparently doubles the last dimension so `spec.shape` always reflects
 /// the logical element count.
 ///
-/// SAFETY: `data_ptr` is a raw memory address. The caller must ensure the
-/// underlying buffer stays alive for the duration of every `serialize` /
-/// `serialize_file` call that consumes this spec.
+/// SAFETY: `data_ptr` is a raw memory address. It must reference a contiguous
+/// buffer encoded in the safetensors format's little-endian byte order. This
+/// type borrows the raw bytes and does not own, copy, byteswap, or otherwise
+/// transform them. The caller must ensure the underlying buffer stays alive
+/// for the duration of every `serialize` / `serialize_file` call that consumes
+/// this spec.
 #[pyclass(frozen, from_py_object)]
 #[derive(Clone, Debug)]
 struct TensorSpec {
