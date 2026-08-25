@@ -1376,6 +1376,13 @@ impl Open {
 ///
 ///     device (`str`, defaults to `"cpu"`):
 ///         The device on which you want the tensors.
+///
+///     backend (`str`, *keyword-only*, defaults to `"mmap"`):
+///         Storage backend used to serve tensor bytes. `"mmap"` (the default)
+///         memory-maps the file; `"pread"` reads tensor bytes with `pread(2)`.
+///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
+///         shared `MTLBuffer` (1x model memory, no page-cache duplication) and
+///         loads a full model several times faster than `"mmap"`.
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
