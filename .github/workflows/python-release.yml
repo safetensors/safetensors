@@ -161,7 +161,7 @@ jobs:
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1
         with:
           command: sdist
-          args: --out dist --manifest-path bindings/python/Cargo.toml
+          args: --out dist --manifest-path bindings/python/Cargo.toml --locked
       - name: Upload sdist
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:

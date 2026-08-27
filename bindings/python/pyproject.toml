@@ -92,6 +92,7 @@ conflicts = [
 ]
 
 [tool.maturin]
+locked = true
 python-source = "py_src"
 module-name = "safetensors._safetensors_rust"
 bindings = 'pyo3'

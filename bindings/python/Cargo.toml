@@ -2,7 +2,7 @@
 name = "safetensors-python"
 version = "0.9.0-dev.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.83"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
@@ -17,7 +17,7 @@ serde_json = "1.0"
 [dependencies.safetensors]
 path = "../../safetensors"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Metal-direct MTLBuffer path is Apple-silicon-only: Shared-mode buffers rely

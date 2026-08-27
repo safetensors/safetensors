@@ -32,16 +32,16 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Build
-        run: cargo build --all-targets --verbose
+        run: cargo build --locked --all-targets --verbose
 
       - name: Lint with Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Run No-STD Tests
-        run: cargo test --no-default-features --verbose
+        run: cargo test --locked --no-default-features --verbose
 
       - name: Run Audit
         # RUSTSEC-2021-0145 is criterion so only within benchmarks

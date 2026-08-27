@@ -72,7 +72,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Lint with Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Install (torch)
         if: matrix.os != 'windows-11-arm'
@@ -123,21 +123,21 @@ jobs:
       - name: Run tests
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
-          cargo test
+          cargo test --locked
           pip install ".[testing]"
           pytest -sv tests/
 
       - name: Run tests (Windows arm64)
         if: matrix.os == 'windows-11-arm'
         run: |
-          cargo test
+          cargo test --locked
           pip install ".[testing]"
           pytest -sv tests/ --ignore=tests/test_tf_comparison.py
 
       - name: Run tests (freethreaded)
         if: matrix.version.arch == 'x64-freethreaded'
         run: |
-          cargo test
+          cargo test --locked
           pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
           # importing msgpack._cmsgpack re-enables the GIL, so force-disable
           # until msgpack declares support

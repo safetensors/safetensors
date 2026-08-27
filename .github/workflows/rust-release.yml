@@ -28,7 +28,7 @@ jobs:
       - name: Publish package rust
         if: ${{ !contains(github.ref, 'rc') }}
         working-directory: ./safetensors
-        run: cargo publish
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 

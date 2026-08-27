@@ -663,6 +663,16 @@ impl Metadata {
         Ok(start)
     }
 
+    /// [`TensorInfo`] list is guaranteed to be ordered by in buffer offset thanks to `TryFrom` sorting tensors by offset and [`Self::new`] calling [`Self::validate`]
+    pub fn tensor_infos(&self) -> &[TensorInfo] {
+        &self.tensors
+    }
+
+    /// get the index of a given tensor in the [`Self::tensors`] array
+    pub fn tensor_idx(&self, name: &str) -> Option<usize> {
+        self.index_map.get(name).copied()
+    }
+
     /// Gives back the tensor metadata
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         let &index = self.index_map.get(name)?;
