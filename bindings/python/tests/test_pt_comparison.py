@@ -101,6 +101,15 @@ class TorchTestCase(unittest.TestCase):
             b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\xbf\x00\x00\x80?",
         )
 
+    def test_lazy_views(self):
+        tensors = {
+            "conj": torch.tensor([1 + 2j, 3 + 4j], dtype=torch.complex64).conj(),
+            "neg": torch._neg_view(torch.tensor([1.0, 3.0])),
+        }
+        loaded = load(save(tensors))
+        for name, tensor in tensors.items():
+            self.assertTrue(torch.equal(tensor, loaded[name]))
+
     def test_odd_dtype_fp8_e4m3fn(self):
         if not hasattr(torch, "float8_e4m3fn"):
             return  # torch.float8_e4m3fn requires 2.1
