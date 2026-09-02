@@ -16,6 +16,7 @@ const CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD: c_int = 4;
 macro_rules! cuda_fns {
     ($( $name:ident : fn( $($arg:ty),*) -> Err),+ $(,)?) => {
         #[allow(non_snake_case)]
+        #[allow(dead_code)]
         struct Fns { $( $name: unsafe extern "C" fn($($arg),*) -> Err, )+ }
         impl Fns {
             unsafe fn load(h: *mut c_void) -> Option<Self> {
@@ -33,8 +34,8 @@ macro_rules! cuda_fns {
 }
 
 cuda_fns! {
-    cudaHostAlloc:               fn(*mut *mut c_void, usize, c_uint) -> Err,
     cudaFreeHost:                fn(*mut c_void) -> Err,
+    cudaHostAlloc:               fn(*mut *mut c_void, usize, c_uint) -> Err,
     cudaMallocAsync:             fn(*mut *mut c_void, usize, Stream) -> Err,
     cudaFreeAsync:               fn(*mut c_void, Stream) -> Err,
     cudaMemcpyAsync:             fn(*mut c_void, *const c_void, usize, c_int, Stream) -> Err,
@@ -48,9 +49,9 @@ cuda_fns! {
     cudaEventDestroy:            fn(Event) -> Err,
     cudaSetDevice:               fn(c_int) -> Err,
     cudaGetDevice:               fn(*mut c_int) -> Err,
-    cudaMemGetInfo:              fn(*mut usize, *mut usize) -> Err,
     cudaDeviceGetDefaultMemPool: fn(*mut MemPool, c_int) -> Err,
     cudaMemPoolSetAttribute:     fn(MemPool, c_int, *mut c_void) -> Err,
+    cudaMemGetInfo:              fn(*mut usize, *mut usize) -> Err,
     cudaMemPoolTrimTo:           fn(MemPool, usize) -> Err,
 }
 
@@ -99,6 +100,7 @@ impl CudaApi {
         Ok(ptr as *mut u8)
     }
 
+    #[cfg(test)]
     pub fn free_host(&self, ptr: *mut u8) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaFreeHost)(ptr as *mut c_void) })
     }
@@ -155,6 +157,7 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaEventRecord)(e, s) })
     }
 
+    #[cfg(test)]
     pub fn event_query(&self, e: Event) -> Result<bool, CudaError> {
         match unsafe { (self.f.cudaEventQuery)(e) } {
             0 => Ok(true),
@@ -189,6 +192,7 @@ impl CudaApi {
         Ok(DeviceGuard { api: self, prev })
     }
 
+    #[cfg(test)]
     pub fn mem_get_info(&self) -> Result<(usize, usize), CudaError> {
         let mut free = 0;
         let mut total = 0;

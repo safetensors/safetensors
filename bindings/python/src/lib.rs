@@ -1616,6 +1616,8 @@ impl safe_open {
         self.inner()?.get_slice(name)
     }
 
+    /// Returned tensors are safe to use immediately on any stream; if you consume them on a non-default CUDA stream,
+    /// synchronize that stream before releasing your last reference.
     pub fn tensor_stream(slf: PyRef<'_, Self>) -> PyResult<TensorStream> {
         let mut stream = slf.inner()?.tensor_stream()?;
         stream._keepalive = Some(Py::from(slf).into_any());

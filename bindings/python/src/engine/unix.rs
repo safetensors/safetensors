@@ -52,30 +52,76 @@ impl From<std::io::Error> for LoaderError {
     }
 }
 
+const MIN_ALLOCATION_SIZE: NonZeroUsize = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
 const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+const DEFAULT_STREAM: Stream = std::ptr::null_mut();
 
-#[derive(Debug, PartialEq)]
-pub struct ChunkTensorSlice {
-    tensor: usize,
-    src: Range<usize>,
-    dst_offset: usize,
+struct DeviceAllocator {
+    api: &'static CudaApi,
+    device: i32,
+    stream: Stream,
+}
+
+unsafe impl Send for DeviceAllocator {}
+unsafe impl Sync for DeviceAllocator {}
+
+impl DeviceAllocator {
+    fn request(self: &Arc<Self>, bytes: usize) -> Result<Arc<Allocation>, LoaderError> {
+        let _g = self.api.device_guard(self.device)?;
+        let ptr = self.api.malloc_async(bytes, self.stream)?;
+        Ok(Arc::new(Allocation {
+            allocator: self.clone(),
+            ptr,
+        }))
+    }
+
+    fn release(&self, base: u64) {
+        let Ok(_g) = self.api.device_guard(self.device) else {
+            return;
+        };
+        let Ok(free) = free_stream(self.api, self.device) else {
+            return;
+        };
+        for stream in [self.stream, DEFAULT_STREAM] {
+            if let Ok(e) = self.api.event_create() {
+                let _ = self.api.event_record(e, stream);
+                let _ = self.api.stream_wait_event(free, e);
+                let _ = self.api.event_destroy(e);
+            }
+        }
+        let _ = self.api.free_async(base, free);
+    }
+}
+
+struct Allocation {
+    allocator: Arc<DeviceAllocator>,
+    ptr: u64,
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        self.allocator.release(self.ptr);
+    }
 }
 
 pub struct LoadPlan {
     tensor_offsets: Box<[(usize, usize)]>,
     data_len: usize,
-    /// Flat list of tensor-slice-within-a-chunk ([`ChunkTensorSlice`])
-    intersections: Box<[ChunkTensorSlice]>,
-    /// index into [`Self::intersections`] such that `intersections[chunk_intersections[chunk_idx]..chunk_intersections[chunk_idx + 1]]` -> gives all the intersections that are contained in `chunk_idx`
-    chunk_intersections: Box<[usize]>,
+    allocation_ranges: Box<[Range<usize>]>,
     in_file_offset: usize,
     n_chunks: usize,
     chunk_size: usize,
 }
 
 impl LoadPlan {
-    pub fn new(metadata: &Metadata, in_file_offset: usize, chunk_size: NonZeroUsize) -> Self {
+    pub fn new(
+        metadata: &Metadata,
+        in_file_offset: usize,
+        chunk_size: NonZeroUsize,
+        min_allocation_size: NonZeroUsize,
+    ) -> Self {
         let chunk_size = chunk_size.get();
+        let min_allocation_size = min_allocation_size.get();
         let tensor_offsets: Box<[(usize, usize)]> = metadata
             .tensor_infos()
             .iter()
@@ -83,44 +129,24 @@ impl LoadPlan {
             .collect();
         let data_len = metadata.data_len();
 
+        let mut allocation_ranges = Vec::new();
+        let mut alloc_start = 0;
+        for &(_, end) in tensor_offsets.iter() {
+            if end - alloc_start >= min_allocation_size {
+                allocation_ranges.push(alloc_start..end);
+                alloc_start = end;
+            }
+        }
+        if alloc_start < data_len {
+            allocation_ranges.push(alloc_start..data_len);
+        }
+
         let n_chunks = data_len.div_ceil(chunk_size);
-
-        let mut intersections = Vec::with_capacity(tensor_offsets.len() + n_chunks);
-        let mut offsets = vec![0usize; n_chunks + 1];
-        let mut cursor = 0;
-
-        for (i, &(start, end)) in tensor_offsets.iter().enumerate() {
-            if start == end {
-                continue;
-            }
-            for c in (start / chunk_size)..=((end - 1) / chunk_size) {
-                if cursor < c {
-                    offsets[cursor + 1] = intersections.len();
-                    cursor += 1;
-                }
-                debug_assert_eq!(c, cursor);
-                let chunk_start = c * chunk_size;
-                let overlap =
-                    start.max(chunk_start)..end.min((chunk_start + chunk_size).min(data_len));
-                intersections.push(ChunkTensorSlice {
-                    tensor: i,
-                    // convert to offsets within the chunk
-                    src: (overlap.start - chunk_start)..(overlap.end - chunk_start),
-                    // convert to offset within the destination tensor
-                    dst_offset: overlap.start - start,
-                });
-            }
-        }
-
-        if cursor < n_chunks {
-            offsets[cursor + 1] = intersections.len();
-        }
 
         Self {
             tensor_offsets,
             data_len,
-            intersections: intersections.into_boxed_slice(),
-            chunk_intersections: offsets.into_boxed_slice(),
+            allocation_ranges: allocation_ranges.into_boxed_slice(),
             in_file_offset,
             n_chunks,
             chunk_size,
@@ -138,10 +164,14 @@ impl LoadPlan {
 }
 
 impl LoadPlan {
-    /// Tensor slices contained in a chunk
-    fn chunk_tensor_slices(&self, chunk_idx: usize) -> &[ChunkTensorSlice] {
-        &self.intersections
-            [self.chunk_intersections[chunk_idx]..self.chunk_intersections[chunk_idx + 1]]
+    fn allocation_at(&self, offset: usize) -> usize {
+        self.allocation_ranges.partition_point(|r| r.end <= offset)
+    }
+
+    fn chunk_allocations(&self, chunk_idx: usize) -> Range<usize> {
+        let start = chunk_idx * self.chunk_size;
+        let end = start + self.chunk_len(chunk_idx);
+        self.allocation_at(start)..self.allocation_at(end - 1) + 1
     }
 
     /// Chunk idx list that contain slices of a given tensor
@@ -152,17 +182,11 @@ impl LoadPlan {
         }
         (s / self.chunk_size)..((e - 1) / self.chunk_size + 1)
     }
-
-    fn tensor_size(&self, tensor: usize) -> usize {
-        let (s, e) = self.tensor_offsets[tensor];
-        e - s
-    }
 }
 
 pub struct CudaBuffer {
-    api: &'static CudaApi,
+    _alloc: Option<Arc<Allocation>>,
     device: i32,
-    stream: Stream,
     ptr: u64,
     len: usize,
 }
@@ -180,16 +204,6 @@ impl CudaBuffer {
 
     pub(crate) fn device(&self) -> i32 {
         self.device
-    }
-}
-
-impl Drop for CudaBuffer {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            if let Ok(_g) = self.api.device_guard(self.device) {
-                let _ = self.api.free_async(self.ptr, self.stream);
-            }
-        }
     }
 }
 
@@ -258,8 +272,12 @@ struct SlabLease {
 }
 
 impl SlabLease {
-    fn buffer(&mut self, len: usize) -> &mut [u8] {
-        assert!(len <= self.pool.slab_size, "chunk larger than slab size");
+    fn ptr(&self) -> *mut u8 {
+        unsafe { self.pool.buffer_ptr.add(self.offset) }
+    }
+
+    fn mut_slice(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.pool.slab_size, "chunk does not fit in slab");
         unsafe { std::slice::from_raw_parts_mut(self.pool.buffer_ptr.add(self.offset), len) }
     }
 
@@ -299,7 +317,7 @@ unsafe impl Sync for SlabPool {}
 
 impl SlabPool {
     fn new(cuda: &CudaApi, n_slabs: usize, slab_size: usize) -> Result<Self, CudaError> {
-        let buffer = cuda.host_alloc(n_slabs * slab_size)?;
+        let buffer_ptr = cuda.host_alloc(n_slabs * slab_size)?;
         let free = (0..n_slabs)
             .map(|i| {
                 Ok(Slab {
@@ -310,7 +328,7 @@ impl SlabPool {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            buffer_ptr: buffer,
+            buffer_ptr,
             slab_size,
             free: Mutex::new(free),
             available: Condvar::new(),
@@ -344,51 +362,14 @@ impl SlabPool {
     }
 }
 
-struct DestinationPtr(AtomicU64);
-const DELIVERED: u64 = u64::MAX;
-
-enum Take {
-    Ptr(u64),
-    Unallocated,
-    AlreadyDelivered,
-}
-
-impl DestinationPtr {
-    fn get_or_alloc(&self, len: usize, api: &CudaApi, stream: Stream) -> Result<u64, CudaError> {
-        let ptr = self.0.load(Ordering::Acquire);
-        if ptr != 0 {
-            return Ok(ptr);
-        }
-        let new = api.malloc_async(len, stream)?;
-        let ptr = match self
-            .0
-            .compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => new,
-            Err(existing) => {
-                api.free_async(new, stream)?;
-                existing
-            }
-        };
-        Ok(ptr)
-    }
-
-    fn take(&self) -> Take {
-        match self.0.swap(DELIVERED, Ordering::AcqRel) {
-            0 => Take::Unallocated,
-            DELIVERED => Take::AlreadyDelivered,
-            p => Take::Ptr(p),
-        }
-    }
-
-    /// reset the pointer to `0` and return the previous ptr if any
-    fn reset(&self) -> Option<u64> {
-        match self.0.swap(0, Ordering::AcqRel) {
-            0 | DELIVERED => None,
-            p => Some(p),
-        }
-    }
-}
+/// Used to track live [`CudaSink`]s
+/// We configure cuda's memory pool to retain allocated memory, meaning:
+/// - across `safe_open` calls, allocated memory blocks can be reused
+/// - we need to track when all active sinks are done to be able to release that retained memory
+///
+/// Once the active counter for a given device reaches 0, we call `cudaMemPoolTrimTo` releasing the
+/// unused additional retained memory
+static CUDA_ACTIVE_SINKS: [AtomicUsize; MAX_DEVICES] = [const { AtomicUsize::new(0) }; MAX_DEVICES];
 
 pub struct CudaSink {
     api: &'static CudaApi,
@@ -396,9 +377,12 @@ pub struct CudaSink {
     stream: Stream,
     pool: &'static SlabPool,
     plan: Arc<LoadPlan>,
+    allocator: Arc<DeviceAllocator>,
+    allocations: Box<[Mutex<Option<Arc<Allocation>>>]>,
+    delivered: Box<[AtomicBool]>,
     chunk_completion_events: Box<[AtomicU64]>,
-    dests: Box<[DestinationPtr]>,
     closed: AtomicBool,
+    released: AtomicBool,
 }
 
 unsafe impl Send for CudaSink {}
@@ -413,19 +397,44 @@ impl CudaSink {
     ) -> Result<Self, LoaderError> {
         let _g = api.device_guard(device)?;
         let stream = device_stream(api, device)?;
-        let n_tensors = plan.tensor_offsets.len();
+        let _ = api.pool_set_release_threshold(device, u64::MAX);
+        CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             api,
             device,
             stream,
             pool,
-            chunk_completion_events: (0..plan.n_chunks).map(|_| AtomicU64::new(0)).collect(),
-            dests: (0..n_tensors)
-                .map(|_| DestinationPtr(AtomicU64::new(0)))
+            allocator: Arc::new(DeviceAllocator {
+                api,
+                device,
+                stream,
+            }),
+            allocations: (0..plan.allocation_ranges.len())
+                .map(|_| Mutex::new(None))
                 .collect(),
+            delivered: (0..plan.tensor_offsets.len())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            chunk_completion_events: (0..plan.n_chunks).map(|_| AtomicU64::new(0)).collect(),
             closed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             plan,
         })
+    }
+
+    fn allocation_ptr(&self, alloc_idx: usize) -> Result<u64, LoaderError> {
+        let mut slot = self.allocations[alloc_idx].lock().unwrap();
+        if let Some(a) = &*slot {
+            return Ok(a.ptr);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LoaderError::Closed);
+        }
+        let range = &self.plan.allocation_ranges[alloc_idx];
+        let alloc = self.allocator.request(range.end - range.start)?;
+        let ptr = alloc.ptr;
+        *slot = Some(alloc);
+        Ok(ptr)
     }
 
     fn load_chunk(
@@ -435,19 +444,18 @@ impl CudaSink {
         read: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         let mut lease = self.pool.acquire(self.api)?;
-        read(lease.buffer(len))?;
+        read(lease.mut_slice(len))?;
         let _g = self.api.device_guard(self.device)?;
-        let slab = unsafe { self.pool.buffer_ptr.add(lease.offset) };
-        for slice in self.plan.chunk_tensor_slices(chunk_idx) {
-            let dst = self.dests[slice.tensor].get_or_alloc(
-                self.plan.tensor_size(slice.tensor),
-                self.api,
-                self.stream,
-            )?;
+        let chunk_start = chunk_idx * self.plan.chunk_size;
+        for alloc in self.plan.chunk_allocations(chunk_idx) {
+            let range = &self.plan.allocation_ranges[alloc];
+            let dst = self.allocation_ptr(alloc)?;
+            let start = chunk_start.max(range.start);
+            let end = (chunk_start + len).min(range.end);
             self.api.memcpy_h2d_async(
-                dst + slice.dst_offset as u64,
-                unsafe { slab.add(slice.src.start) },
-                slice.src.end - slice.src.start,
+                dst + (start - range.start) as u64,
+                unsafe { lease.ptr().add(start - chunk_start) },
+                end - start,
                 self.stream,
             )?;
         }
@@ -483,39 +491,52 @@ impl CudaSink {
     }
 
     fn take(&self, tensor: usize) -> Result<CudaBuffer, LoaderError> {
-        assert!(tensor < self.dests.len());
-        match self.dests[tensor].take() {
-            Take::Ptr(ptr) => Ok(CudaBuffer {
-                api: self.api,
+        if self.delivered[tensor].swap(true, Ordering::AcqRel) {
+            return Err(LoaderError::AlreadyDelivered);
+        }
+        let (start, end) = self.plan.tensor_offsets[tensor];
+        if start == end {
+            return Ok(CudaBuffer {
+                _alloc: None,
                 device: self.device,
-                stream: self.stream,
-                ptr,
-                len: self.plan.tensor_size(tensor),
-            }),
-            Take::Unallocated => Ok(CudaBuffer {
-                api: self.api,
-                device: self.device,
-                stream: self.stream,
                 ptr: 0,
                 len: 0,
-            }),
-            Take::AlreadyDelivered => Err(LoaderError::AlreadyDelivered),
+            });
         }
+        let alloc_idx = self.plan.allocation_at(start);
+        let Some(alloc) = self.allocations[alloc_idx].lock().unwrap().clone() else {
+            return Err(LoaderError::Closed);
+        };
+        Ok(CudaBuffer {
+            ptr: alloc.ptr + (start - self.plan.allocation_ranges[alloc_idx].start) as u64,
+            len: end - start,
+            device: self.device,
+            _alloc: Some(alloc),
+        })
     }
 
     fn release(&self) -> Result<(), LoaderError> {
         self.closed.store(true, Ordering::Release);
-        let _g = self.api.device_guard(self.device)?;
-        for dst in self.dests.iter() {
-            if let Some(p) = dst.reset() {
-                self.api.free_async(p, self.stream)?;
-            }
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
-        for e in self.chunk_completion_events.iter() {
-            let e = e.load(Ordering::Acquire);
-            if e != 0 {
-                self.api.event_sync(e as Event)?;
+        for slot in self.allocations.iter() {
+            *slot.lock().unwrap() = None;
+        }
+        if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
+            let Ok(_g) = self.api.device_guard(self.device) else {
+                return Ok(());
+            };
+            // NOTE: `let _ =` is intentional, releasing retained memory is best effort
+            if let Ok(free) = free_stream(self.api, self.device) {
+                if let Ok(e) = self.api.event_create() {
+                    let _ = self.api.event_record(e, free);
+                    let _ = self.api.event_sync(e);
+                    let _ = self.api.event_destroy(e);
+                }
             }
+            let _ = self.api.pool_set_release_threshold(self.device, 0);
+            let _ = self.api.pool_trim(self.device);
         }
         Ok(())
     }
@@ -545,9 +566,10 @@ impl Drop for CudaSink {
 /// This is a generous limit on the maximum number of devices that could be connected to a single host
 const MAX_DEVICES: usize = 64;
 static STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
+static FREE_STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
 
-fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
-    let slot = STREAMS
+fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
+    let slot = stream_slots
         .get(device as usize)
         .unwrap_or_else(|| panic!("device index {device} exceeds MAX_DEVICES ({MAX_DEVICES})"));
     let stream = slot.load(Ordering::Acquire);
@@ -563,6 +585,14 @@ fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
             Ok(existing as Stream)
         }
     }
+}
+
+fn free_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
+    get_stream(&FREE_STREAMS, api, device)
+}
+
+fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
+    get_stream(&STREAMS, api, device)
 }
 
 pub struct LoaderInner {
@@ -601,7 +631,12 @@ impl Loader {
         threads: usize,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
-        let plan = Arc::new(LoadPlan::new(metadata, buffer_start_pos, CHUNK_SIZE));
+        let plan = Arc::new(LoadPlan::new(
+            metadata,
+            buffer_start_pos,
+            CHUNK_SIZE,
+            MIN_ALLOCATION_SIZE,
+        ));
         let pool = pool(cuda_api)?;
         let inner = Arc::new(LoaderInner {
             file,
@@ -723,14 +758,14 @@ fn worker(loader: Arc<LoaderInner>) {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{collections::HashSet, num::NonZeroUsize};
 
     use safetensors::{
         tensor::{Metadata, TensorInfo},
         Dtype,
     };
 
-    use crate::engine::{ChunkTensorSlice, LoadPlan};
+    use crate::engine::LoadPlan;
 
     fn t(name: &str, start: usize, len: usize) -> (String, TensorInfo) {
         (
@@ -743,120 +778,124 @@ mod tests {
         )
     }
 
-    fn check_plan(plan: &LoadPlan) {
-        assert_eq!(plan.chunk_intersections[0], 0);
-        assert_eq!(
-            *plan.chunk_intersections.last().unwrap(),
-            plan.intersections.len()
-        );
-        assert!(plan.chunk_intersections.windows(2).all(|w| w[0] <= w[1]));
+    fn check_plan(plan: &LoadPlan, min_allocation_size: usize) {
+        let mut cursor = 0;
+        for r in plan.allocation_ranges.iter() {
+            assert_eq!(r.start, cursor, "gap/overlap between allocation ranges");
+            assert!(r.end > r.start);
+            cursor = r.end;
+        }
+        assert_eq!(cursor, plan.data_len);
+        let ends: HashSet<usize> = plan.tensor_offsets.iter().map(|&(_, e)| e).collect();
+        for r in plan.allocation_ranges.iter().rev().skip(1) {
+            assert!(
+                ends.contains(&r.end),
+                "cut at {} is not a tensor end",
+                r.end
+            );
+            assert!(
+                r.end - r.start >= min_allocation_size,
+                "undersized non-tail range {r:?}"
+            );
+            for &(_, t) in plan.tensor_offsets.iter() {
+                assert!(
+                    !(t > r.start && t < r.end && t - r.start >= min_allocation_size),
+                    "range {r:?} should have been cut earlier, at tensor end {t}"
+                );
+            }
+        }
+        for &(s, e) in plan.tensor_offsets.iter() {
+            if s == e {
+                continue;
+            }
+            let r = &plan.allocation_ranges[plan.allocation_at(s)];
+            assert!(r.start <= s && e <= r.end, "tensor {s}..{e} crosses {r:?}");
+        }
 
         for c in 0..plan.n_chunks {
-            let chunk_len = plan.chunk_len(c);
-            let mut cursor = 0;
-            for slice in plan.chunk_tensor_slices(c) {
-                assert_eq!(slice.src.start, cursor, "gap/overlap inside chunk {c}");
-                assert!(slice.src.end > slice.src.start);
-                cursor = slice.src.end;
-            }
-            assert_eq!(
-                cursor, chunk_len,
-                "tensor chunk slices don't cover the full chunk"
-            );
-        }
-        let mut tensor_slices = vec![vec![]; plan.tensor_offsets.len()];
-        for slice in plan.intersections.iter() {
-            tensor_slices[slice.tensor].push((slice.dst_offset, slice.src.end - slice.src.start))
-        }
-        for (i, (start, end)) in plan.tensor_offsets.iter().enumerate() {
-            let size = end - start;
-            let mut cursor = 0;
-            for (dst, len) in &tensor_slices[i] {
+            let (chunk_start, chunk_end) =
+                (c * plan.chunk_size, c * plan.chunk_size + plan.chunk_len(c));
+            let got = plan.chunk_allocations(c);
+            for (i, r) in plan.allocation_ranges.iter().enumerate() {
                 assert_eq!(
-                    *dst, cursor,
-                    "tensor {i}: gap/overlap at in destination buffer offset: {dst}"
+                    got.contains(&i),
+                    r.start < chunk_end && chunk_start < r.end,
+                    "chunk {c} vs range {i}"
                 );
-                cursor += len;
             }
-            assert_eq!(
-                cursor, size,
-                "tensor {i}: missing last slice ({cursor} / {size})"
-            );
+            if min_allocation_size >= plan.chunk_size {
+                assert!(got.len() <= 2, "chunk {c} spans {} allocations", got.len());
+            }
+            for (t, &(s, e)) in plan.tensor_offsets.iter().enumerate() {
+                assert_eq!(
+                    plan.tensor_chunks(t).contains(&c),
+                    s != e && s < chunk_end && chunk_start < e,
+                    "tensor {t} vs chunk {c}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_plan_valid_intersect() {
+    fn test_plan_allocation_ranges() {
         let chunk_size = NonZeroUsize::new(5).unwrap();
+        let min_allocation_size = NonZeroUsize::new(12).unwrap();
         let metadata = Metadata::new(
             None,
             vec![t("first", 0, 5), t("second", 5, 7), t("third", 12, 6)],
         )
         .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+
         assert_eq!(
-            load_plan.intersections,
-            vec![
-                ChunkTensorSlice {
-                    tensor: 0,
-                    src: 0..5,
-                    dst_offset: 0,
-                },
-                ChunkTensorSlice {
-                    tensor: 1,
-                    src: 0..5,
-                    dst_offset: 0,
-                },
-                ChunkTensorSlice {
-                    tensor: 1,
-                    src: 0..2,
-                    dst_offset: 5,
-                },
-                ChunkTensorSlice {
-                    tensor: 2,
-                    src: 2..5,
-                    dst_offset: 0,
-                },
-                ChunkTensorSlice {
-                    tensor: 2,
-                    src: 0..3,
-                    dst_offset: 3,
-                }
-            ]
-            .into_boxed_slice(),
+            load_plan.allocation_ranges,
+            vec![0..12, 12..18].into_boxed_slice(),
         );
+        check_plan(&load_plan, 12);
+    }
+
+    #[test]
+    fn test_allocation_ranges_oversized_tensor() {
+        // floor 8: cut at the first tensor end >= 8 bytes in; the 30-byte
+        // tensor forces a large range; the 3-byte tail stays undersized
+        let chunk_size = NonZeroUsize::new(5).unwrap();
+        let min_allocation_size = NonZeroUsize::new(8).unwrap();
+        let metadata = Metadata::new(
+            None,
+            vec![t("a", 0, 5), t("b", 5, 7), t("big", 12, 30), t("c", 42, 3)],
+        )
+        .unwrap();
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
         assert_eq!(
-            load_plan.chunk_intersections,
-            vec![0, 1, 2, 4, 5].into_boxed_slice()
+            load_plan.allocation_ranges,
+            vec![0..12, 12..42, 42..45].into_boxed_slice(),
         );
-        check_plan(&load_plan);
+        check_plan(&load_plan, 8);
     }
 
     #[test]
     fn test_chunk_len_exact_multiple_of_chunk_size() {
         let chunk_size = NonZeroUsize::new(5).unwrap();
+        let min_allocation_size = NonZeroUsize::new(12).unwrap();
         let metadata = Metadata::new(None, vec![t("first", 0, 10)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
-        check_plan(&load_plan);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+        check_plan(&load_plan, 12);
     }
 
     #[test]
     fn test_multi_chunk_span() {
         let chunk_size = NonZeroUsize::new(5).unwrap();
+        let min_allocation_size = NonZeroUsize::new(12).unwrap();
         let metadata = Metadata::new(None, vec![t("first", 0, 42)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
-        let offsets: Vec<_> = load_plan
-            .intersections
-            .iter()
-            .map(|s| s.dst_offset)
-            .collect();
-        assert_eq!(offsets, vec![0, 5, 10, 15, 20, 25, 30, 35, 40]);
-        check_plan(&load_plan);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+        assert_eq!(load_plan.tensor_chunks(0), 0..9);
+        check_plan(&load_plan, 12);
     }
 
     #[test]
     fn test_many_tensors_in_single_chunk() {
         let chunk_size = NonZeroUsize::new(20).unwrap();
+        let min_allocation_size = NonZeroUsize::new(20).unwrap();
         let metadata = Metadata::new(
             None,
             vec![
@@ -874,21 +913,23 @@ mod tests {
             ],
         )
         .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
-        check_plan(&load_plan);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+        check_plan(&load_plan, 20);
     }
 
     #[test]
     fn test_chunk_size_larger_than_data() {
         let chunk_size = NonZeroUsize::new(4242).unwrap();
+        let min_allocation_size = NonZeroUsize::new(4242).unwrap();
         let metadata = Metadata::new(None, vec![t("a", 0, 5), t("b", 5, 3)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
-        check_plan(&load_plan);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+        check_plan(&load_plan, 4242);
     }
 
     #[test]
     fn test_empty_slices() {
         let chunk_size = NonZeroUsize::new(5).unwrap();
+        let min_allocation_size = NonZeroUsize::new(5).unwrap();
         let metadata = Metadata::new(
             None,
             vec![
@@ -900,7 +941,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size);
-        check_plan(&load_plan);
+        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
+        check_plan(&load_plan, 5);
     }
 }
