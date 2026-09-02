@@ -645,16 +645,15 @@ impl Metadata {
                 .copied()
                 .try_fold(1usize, usize::checked_mul)
                 .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbits = nelements
-                .checked_mul(info.dtype.bitsize())
+            let nbits = (nelements as u128)
+                .checked_mul(info.dtype.bitsize() as u128)
                 .ok_or(SafeTensorError::ValidationOverflow)?;
 
             if nbits % 8 != 0 {
                 return Err(SafeTensorError::MisalignedSlice);
             }
-            let size = nbits
-                .checked_div(8)
-                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let size =
+                usize::try_from(nbits / 8).map_err(|_| SafeTensorError::ValidationOverflow)?;
 
             if e - s != size {
                 return Err(SafeTensorError::TensorInvalidInfo);
@@ -1591,6 +1590,31 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_large_tensor_with_addressable_byte_size() {
+        const ELEMENTS: usize = 196_761_600;
+        const BYTES: usize = 787_046_400;
+
+        assert!(ELEMENTS.checked_mul(Dtype::F32.bitsize()).is_none());
+        assert_eq!(ELEMENTS * 4, BYTES);
+
+        let metadata = Metadata::new(
+            None,
+            vec![(
+                "test".to_string(),
+                TensorInfo {
+                    dtype: Dtype::F32,
+                    shape: vec![ELEMENTS],
+                    data_offsets: (0, BYTES),
+                },
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(metadata.data_len(), BYTES);
     }
 
     #[test]
