@@ -22,6 +22,7 @@ use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::path::PathBuf;
@@ -665,11 +666,15 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
-                "No such file or directory: {}",
-                filename.display()
-            ))
+        let file = File::open(&filename).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                PyFileNotFoundError::new_err(format!(
+                    "No such file or directory: {}",
+                    filename.display()
+                ))
+            } else {
+                PyErr::from(error)
+            }
         })?;
         let device = device.unwrap_or(Device::Cpu);
         if device != Device::Cpu
