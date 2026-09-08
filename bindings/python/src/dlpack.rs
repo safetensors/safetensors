@@ -182,6 +182,8 @@ pub(crate) fn torch_view_target(dtype: Dtype) -> Option<&'static str> {
         Dtype::F4 => "float4_e2m1fn_x2",
         Dtype::F8_E5M2 => "float8_e5m2",
         Dtype::F8_E4M3 => "float8_e4m3fn",
+        Dtype::F8_E4M3FNUZ => "float8_e4m3fnuz",
+        Dtype::F8_E5M2FNUZ => "float8_e5m2fnuz",
         Dtype::F8_E8M0 => "float8_e8m0fnu",
         _ => return None,
     })

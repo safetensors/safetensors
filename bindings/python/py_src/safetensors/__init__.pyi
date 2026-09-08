@@ -181,6 +181,10 @@ class safe_open:
             open, and hands each tensor out exactly once as a zero-copy view:
             via `get_tensor` or `tensor_stream()`, whichever asks first.
             Consume inside the `with` block — closing the file stops the load.
+            Each open file runs 8 reader threads and holds its full data size
+            in device memory until its tensors are consumed; all files share
+            one process-wide 512 MiB pinned staging pool. Raises at open if the
+            file holds a dtype torch cannot represent (F6).
     """
     def __init__(
         self,

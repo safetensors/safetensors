@@ -85,7 +85,11 @@ impl Display for LoaderError {
             ),
             Self::Closed => write!(f, "prefetch loader closed"),
             Self::Cuda(e) => write!(f, "{e}"),
-            Self::CudaRuntimeLoad => write!(f, "could not load libcudart"),
+            Self::CudaRuntimeLoad => write!(
+                f,
+                "no CUDA runtime is loaded in this process; import a CUDA-enabled \
+                 framework (torch) before opening with prefetch=True"
+            ),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::WorkerFailed(msg) => f.write_str(msg),
         }

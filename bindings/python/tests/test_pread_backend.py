@@ -7,6 +7,7 @@ cumulative host residency stays bounded at one tensor.
 
 import os
 import struct
+import sys
 import tempfile
 import unittest
 
@@ -164,6 +165,19 @@ class PreadBackendTests(unittest.TestCase):
                 self.path, framework="pt", device="cpu", backend="pread", prefetch=True
             )
 
+    def test_prefetch_rejects_unsupported_dtype(self):
+        # F6 has no torch dtype: refuse at open, before any device memory moves.
+        path = os.path.join(self.tempdir.name, "f6.safetensors")
+        header = b'{"x":{"dtype":"F6_E2M3","shape":[4],"data_offsets":[0,3]}}'
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(bytes([0, 0, 0]))
+        with self.assertRaisesRegex(Exception, "F6_E2M3"):
+            safe_open(
+                path, framework="pt", device="cuda:0", backend="pread", prefetch=True
+            )
+
     def test_tensor_stream_requires_prefetch(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
             with self.assertRaisesRegex(Exception, "prefetch=True"):
@@ -267,6 +281,37 @@ class PrefetchCudaTests(unittest.TestCase):
         with self.assertRaises(Exception):
             with self._open(bad_path) as f:
                 f.get_tensor("t")
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc/self/maps")
+    def test_reuses_framework_cuda_runtime(self):
+        # The engine must attach to the libcudart torch already loaded, never
+        # bring up a second runtime next to it.
+        def mapped_cudarts():
+            with open("/proc/self/maps") as maps:
+                return {line.split()[-1] for line in maps if "libcudart.so" in line}
+
+        torch.zeros(1, device="cuda:0")
+        before = mapped_cudarts()
+        self.assertTrue(before)
+        with self._open() as f:
+            f.get_tensor(next(iter(f.keys())))
+        self.assertEqual(mapped_cudarts(), before)
+
+    @unittest.skipUnless(
+        hasattr(torch, "float8_e5m2fnuz"), "torch lacks float8_e5m2fnuz"
+    )
+    def test_fnuz_dtype_view(self):
+        path = os.path.join(self.tempdir.name, "fnuz.safetensors")
+        header = b'{"x":{"dtype":"F8_E5M2FNUZ","shape":[4],"data_offsets":[0,4]}}'
+        raw = bytes([1, 2, 3, 4])
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(raw)
+        with self._open(path) as f:
+            x = f.get_tensor("x")
+        self.assertEqual(x.dtype, torch.float8_e5m2fnuz)
+        self.assertEqual(x.view(torch.uint8).cpu().tolist(), list(raw))
 
     def test_misaligned_offsets(self):
         # save_file keeps tensors aligned; hand-build a file where an F32 tensor

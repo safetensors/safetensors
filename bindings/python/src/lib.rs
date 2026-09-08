@@ -735,6 +735,18 @@ impl Open {
                         "prefetch is only compatible with cuda devices",
                     ));
                 };
+                // Every tensor is handed out through DLPack (natively or as a
+                // uint8 view); refuse dtypes torch cannot represent before any
+                // device memory is committed.
+                if let Some(info) = metadata.tensor_infos().iter().find(|info| {
+                    !dlpack::dlpack_supported_native(info.dtype)
+                        && dlpack::torch_view_target(info.dtype).is_none()
+                }) {
+                    return Err(SafetensorError::new_err(format!(
+                        "prefetch cannot hand out dtype {:?}: torch has no matching dtype",
+                        info.dtype
+                    )));
+                }
                 Some(Loader::load(
                     file.clone(),
                     &metadata,
@@ -1508,6 +1520,10 @@ impl TensorStream {
 ///         open, and hands each tensor out exactly once as a zero-copy view:
 ///         via `get_tensor` or `tensor_stream()`, whichever asks first.
 ///         Consume inside the `with` block — closing the file stops the load.
+///         Each open file runs 8 reader threads and holds its full data size
+///         in device memory until its tensors are consumed; all files share
+///         one process-wide 512 MiB pinned staging pool. Raises at open if the
+///         file holds a dtype torch cannot represent (F6).
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {

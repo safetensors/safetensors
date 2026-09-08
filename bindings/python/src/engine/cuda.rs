@@ -236,7 +236,10 @@ fn find_loaded_cudart() -> Option<CString> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     maps.lines()
         .filter_map(|l| l.split_whitespace().last())
-        .find(|p| p.contains("libcudart.so"))
+        .find(|p| {
+            let file = p.rsplit('/').next().unwrap_or(p);
+            file.starts_with("libcudart") && file.contains(".so")
+        })
         .and_then(|p| CString::new(p).ok())
 }
 
@@ -245,22 +248,11 @@ fn find_loaded_cudart() -> Option<CString> {
     None
 }
 
+/// Attach to the CUDA runtime the framework already loaded
 fn open_cudart() -> *mut c_void {
-    unsafe {
-        if let Some(path) = find_loaded_cudart() {
-            let h = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
-            if !h.is_null() {
-                return h;
-            }
-        }
-        for name in ["libcudart.so.13", "libcudart.so.12", "libcudart.so"] {
-            let c = CString::new(name).unwrap();
-            let h = libc::dlopen(c.as_ptr(), libc::RTLD_NOW);
-            if !h.is_null() {
-                return h;
-            }
-        }
-        std::ptr::null_mut()
+    match find_loaded_cudart() {
+        Some(path) => unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) },
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -290,13 +282,22 @@ mod test {
     use super::{api, CudaApi};
 
     fn cuda_or_skip() -> Option<&'static CudaApi> {
+        // No framework in this process: map a runtime the way `import torch`
+        // would (handle intentionally kept), then let `api()` attach to it.
+        if let Some(path) = std::env::var_os("SAFETENSORS_TEST_CUDART") {
+            let c = std::ffi::CString::new(path.into_encoded_bytes()).unwrap();
+            unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW) };
+        }
         match api() {
             Some(api) => Some(api),
             None => {
                 if std::env::var_os("ENFORCE_CUDA_TEST").is_some() {
-                    panic!("ENFORCE_CUDA_TEST is set but could not load CUDA runtime");
+                    panic!(
+                        "ENFORCE_CUDA_TEST is set but no CUDA runtime is mapped; \
+                         set SAFETENSORS_TEST_CUDART=/path/to/libcudart.so"
+                    );
                 }
-                eprintln!("skipped: could not load CUDA runtime");
+                eprintln!("skipped: no CUDA runtime mapped in this process");
                 None
             }
         }
