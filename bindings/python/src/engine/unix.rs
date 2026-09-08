@@ -1,3 +1,52 @@
+//! CUDA prefetch engine: load a whole safetensors data section into device
+//! memory in the background and hand tensors out, once each, as they land.
+//!
+//! Two partitions of the data section that do not nest:
+//!
+//! ```text
+//! tensors  |t0 |  t1  |     t2     |  t3  |        t4       | t5 | t6  |
+//! chunks   |   c0   |   c1   |   c2   |   c3   |   c4   |   c5   | c6  |
+//! ranges   |        range 0        |         range 1        |  range 2 |
+//! ```
+//!
+//! - chunks: fixed `CHUNK_SIZE` grid, the unit of movement (one `pread`, one
+//!   slab, one set of copies). `LoadPlan::tensor_chunks` maps a tensor to the
+//!   chunks it needs.
+//! - ranges: `LoadPlan::allocation_ranges`, the unit of residence (one
+//!   `cudaMallocAsync` each). Cut at tensor ends so a tensor never crosses a
+//!   range; every range but the last is >= `MIN_ALLOCATION_SIZE`. A chunk may
+//!   overlap two ranges (c2 and c5 above), hence <= 2 copies per chunk. The
+//!   layout is identity: a tensor's device address is its range base plus
+//!   (file offset - range start), so tensors are views and are never copied
+//!   again.
+//!
+//! Data flow, per file:
+//!
+//! ```text
+//! worker threads
+//!   c = next_chunk.fetch_add(1)
+//!   lease = SlabPool::acquire()          pinned host slab (process-global
+//!   pread(chunk c) -> lease              pool), reused once the copy that
+//!   memcpyAsync(lease -> device)         last used it completes; <= 2 copies
+//!                                        per chunk on STREAMS[device]
+//!   chunk_completion_events[c] = event   recorded after the copies; 0 while
+//!                                        the chunk is still pending
+//! consumer
+//!   take_tensor(t) / TensorIter::next    wait the events of t's chunks, then
+//!     -> CudaBuffer                      a view into Arc<Allocation>, handed
+//!                                        out once (AlreadyDelivered after)
+//!   drop(last view of a range)           free_async on FREE_STREAMS[device],
+//!                                        fenced on the load stream and the
+//!                                        legacy default stream
+//! ```
+//!
+//! `Loader` owns the worker threads; `LoaderInner` (file, plan, sink, chunk
+//! counter, first error) is shared with them and with `TensorIter`. Closing
+//! signals the workers, joins them, then releases the sink: an outstanding
+//! iterator yields `Err(Closed)` once and is exhausted. `CUDA_ACTIVE_SINKS`
+//! counts live sinks per device so the mempool keeps its memory while any
+//! file is loading and is trimmed when the last one releases.
+
 use std::{
     collections::VecDeque,
     fmt::Display,
@@ -24,16 +73,21 @@ pub enum LoaderError {
     Cuda(CudaError),
     CudaRuntimeLoad,
     Io(std::io::Error),
+    WorkerFailed(String),
 }
 
 impl Display for LoaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyDelivered => write!(f, "attempt to take already delivered tensor"),
-            Self::Closed => write!(f, "load engine already shutdown"),
-            Self::Cuda(e) => write!(f, "cuda error: {e}"),
-            Self::CudaRuntimeLoad => write!(f, "could not load cuda runtime"),
+            Self::AlreadyDelivered => write!(
+                f,
+                "tensor already delivered (prefetch hands each tensor out once, via get_tensor or tensor_stream)"
+            ),
+            Self::Closed => write!(f, "prefetch loader closed"),
+            Self::Cuda(e) => write!(f, "{e}"),
+            Self::CudaRuntimeLoad => write!(f, "could not load libcudart"),
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::WorkerFailed(msg) => f.write_str(msg),
         }
     }
 }
@@ -54,34 +108,51 @@ impl From<std::io::Error> for LoaderError {
 
 const MIN_ALLOCATION_SIZE: NonZeroUsize = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
 const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+/// CUDA's default stream (null handle): where torch/CuPy enqueue work
+/// unless the caller uses an explicit stream context.
 const DEFAULT_STREAM: Stream = std::ptr::null_mut();
 
-struct DeviceAllocator {
+/// One `allocation_range` of device memory — the only malloc/free site for
+/// tensor memory. Freed when the sink clears its slot and the last
+/// `CudaBuffer` view is dropped.
+struct Allocation {
     api: &'static CudaApi,
     device: i32,
     stream: Stream,
+    ptr: u64,
 }
 
-unsafe impl Send for DeviceAllocator {}
-unsafe impl Sync for DeviceAllocator {}
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
 
-impl DeviceAllocator {
-    fn request(self: &Arc<Self>, bytes: usize) -> Result<Arc<Allocation>, LoaderError> {
-        let _g = self.api.device_guard(self.device)?;
-        let ptr = self.api.malloc_async(bytes, self.stream)?;
-        Ok(Arc::new(Allocation {
-            allocator: self.clone(),
+impl Allocation {
+    fn new(
+        api: &'static CudaApi,
+        device: i32,
+        stream: Stream,
+        bytes: usize,
+    ) -> Result<Arc<Self>, LoaderError> {
+        let _g = api.device_guard(device)?;
+        let ptr = api.malloc_async(bytes, stream)?;
+        Ok(Arc::new(Self {
+            api,
+            device,
+            stream,
             ptr,
         }))
     }
+}
 
-    fn release(&self, base: u64) {
+/// Frees on the per-device free stream once it has waited on the load stream
+/// (our pending copies) and the legacy default stream (consumer reads).
+/// Consumers on other streams must sync before dropping their last view;
+/// `__dlpack__(stream=)` negotiation is the planned replacement.
+impl Drop for Allocation {
+    fn drop(&mut self) {
         let Ok(_g) = self.api.device_guard(self.device) else {
             return;
         };
-        let Ok(free) = free_stream(self.api, self.device) else {
-            return;
-        };
+        let free = free_stream(self.api, self.device).unwrap_or(self.stream);
         for stream in [self.stream, DEFAULT_STREAM] {
             if let Ok(e) = self.api.event_create() {
                 let _ = self.api.event_record(e, stream);
@@ -89,22 +160,11 @@ impl DeviceAllocator {
                 let _ = self.api.event_destroy(e);
             }
         }
-        let _ = self.api.free_async(base, free);
+        let _ = self.api.free_async(self.ptr, free);
     }
 }
 
-struct Allocation {
-    allocator: Arc<DeviceAllocator>,
-    ptr: u64,
-}
-
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        self.allocator.release(self.ptr);
-    }
-}
-
-pub struct LoadPlan {
+struct LoadPlan {
     tensor_offsets: Box<[(usize, usize)]>,
     data_len: usize,
     allocation_ranges: Box<[Range<usize>]>,
@@ -114,7 +174,7 @@ pub struct LoadPlan {
 }
 
 impl LoadPlan {
-    pub fn new(
+    fn new(
         metadata: &Metadata,
         in_file_offset: usize,
         chunk_size: NonZeroUsize,
@@ -191,8 +251,6 @@ pub struct CudaBuffer {
     len: usize,
 }
 
-unsafe impl Send for CudaBuffer {}
-
 impl CudaBuffer {
     pub(crate) fn ptr(&self) -> u64 {
         self.ptr
@@ -245,9 +303,15 @@ impl Sink {
         }
     }
 
-    fn release(&self) -> Result<(), LoaderError> {
+    fn stopped(&self) -> bool {
         match self {
-            Self::Cuda(sink) => sink.release(),
+            Self::Cuda(sink) => sink.closed.load(Ordering::Acquire),
+        }
+    }
+
+    fn release(&self) {
+        match self {
+            Self::Cuda(sink) => sink.close(),
         }
     }
 
@@ -258,57 +322,52 @@ impl Sink {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Slab {
     offset: usize,
     event: Event,
-    sync_needed: bool,
+    device: i32,
 }
 
 struct SlabLease {
     pool: &'static SlabPool,
-    offset: usize,
-    event: Event,
-    finished: bool,
+    slab: Slab,
 }
 
 impl SlabLease {
     fn ptr(&self) -> *mut u8 {
-        unsafe { self.pool.buffer_ptr.add(self.offset) }
+        unsafe { self.pool.buffer_ptr.add(self.slab.offset) }
     }
 
     fn mut_slice(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.pool.slab_size, "chunk does not fit in slab");
-        unsafe { std::slice::from_raw_parts_mut(self.pool.buffer_ptr.add(self.offset), len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), len) }
     }
 
-    fn finish(mut self, cuda: &CudaApi, stream: Stream) -> Result<(), CudaError> {
-        cuda.event_record(self.event, stream)?;
-        self.finished = true;
-        self.pool.put_back(Slab {
-            offset: self.offset,
-            event: self.event,
-            sync_needed: true,
-        });
-        Ok(())
+    fn release(mut self, cuda: &CudaApi, stream: Stream, device: i32) -> Result<(), CudaError> {
+        if self.slab.device != device {
+            let event = cuda.event_create()?;
+            let _ = cuda.event_destroy(self.slab.event);
+            self.slab = Slab {
+                event,
+                device,
+                ..self.slab
+            };
+        }
+        cuda.event_record(self.slab.event, stream)
     }
 }
 
 impl Drop for SlabLease {
     fn drop(&mut self) {
-        if !self.finished {
-            self.pool.put_back(Slab {
-                offset: self.offset,
-                event: self.event,
-                sync_needed: false,
-            });
-        }
+        self.pool.put_back(self.slab);
     }
 }
 
 struct SlabPool {
     buffer_ptr: *mut u8,
     slab_size: usize,
-    free: Mutex<Vec<Slab>>,
+    free: Mutex<VecDeque<Slab>>,
     available: Condvar,
 }
 
@@ -323,10 +382,10 @@ impl SlabPool {
                 Ok(Slab {
                     offset: i * slab_size,
                     event: cuda.event_create()?,
-                    sync_needed: false,
+                    device: -1,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<VecDeque<_>, _>>()?;
         Ok(Self {
             buffer_ptr,
             slab_size,
@@ -339,25 +398,19 @@ impl SlabPool {
         // TODO: handle poisoning
         let mut free = self.free.lock().unwrap();
         let slab = loop {
-            if let Some(s) = free.pop() {
+            if let Some(s) = free.pop_front() {
                 break s;
             }
             free = self.available.wait(free).unwrap();
         };
         drop(free);
-        if slab.sync_needed {
-            cuda.event_sync(slab.event)?;
-        }
-        Ok(SlabLease {
-            pool: self,
-            offset: slab.offset,
-            event: slab.event,
-            finished: false,
-        })
+        let lease = SlabLease { pool: self, slab };
+        cuda.event_sync(lease.slab.event)?;
+        Ok(lease)
     }
 
     fn put_back(&self, slab: Slab) {
-        self.free.lock().unwrap().push(slab);
+        self.free.lock().unwrap().push_back(slab);
         self.available.notify_one();
     }
 }
@@ -371,13 +424,12 @@ impl SlabPool {
 /// unused additional retained memory
 static CUDA_ACTIVE_SINKS: [AtomicUsize; MAX_DEVICES] = [const { AtomicUsize::new(0) }; MAX_DEVICES];
 
-pub struct CudaSink {
+struct CudaSink {
     api: &'static CudaApi,
     device: i32,
     stream: Stream,
     pool: &'static SlabPool,
     plan: Arc<LoadPlan>,
-    allocator: Arc<DeviceAllocator>,
     allocations: Box<[Mutex<Option<Arc<Allocation>>>]>,
     delivered: Box<[AtomicBool]>,
     chunk_completion_events: Box<[AtomicU64]>,
@@ -397,18 +449,13 @@ impl CudaSink {
     ) -> Result<Self, LoaderError> {
         let _g = api.device_guard(device)?;
         let stream = device_stream(api, device)?;
-        let _ = api.pool_set_release_threshold(device, u64::MAX);
         CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
+        let _ = api.pool_set_release_threshold(device, u64::MAX);
         Ok(Self {
             api,
             device,
             stream,
             pool,
-            allocator: Arc::new(DeviceAllocator {
-                api,
-                device,
-                stream,
-            }),
             allocations: (0..plan.allocation_ranges.len())
                 .map(|_| Mutex::new(None))
                 .collect(),
@@ -431,7 +478,7 @@ impl CudaSink {
             return Err(LoaderError::Closed);
         }
         let range = &self.plan.allocation_ranges[alloc_idx];
-        let alloc = self.allocator.request(range.end - range.start)?;
+        let alloc = Allocation::new(self.api, self.device, self.stream, range.end - range.start)?;
         let ptr = alloc.ptr;
         *slot = Some(alloc);
         Ok(ptr)
@@ -459,10 +506,13 @@ impl CudaSink {
                 self.stream,
             )?;
         }
+        lease.release(self.api, self.stream, self.device)?;
         let e = self.api.event_create()?;
-        self.api.event_record(e, self.stream)?;
+        if let Err(err) = self.api.event_record(e, self.stream) {
+            let _ = self.api.event_destroy(e);
+            return Err(err.into());
+        }
         self.chunk_completion_events[chunk_idx].store(e as u64, Ordering::Release);
-        lease.finish(self.api, self.stream)?;
         Ok(())
     }
 
@@ -491,41 +541,41 @@ impl CudaSink {
     }
 
     fn take(&self, tensor: usize) -> Result<CudaBuffer, LoaderError> {
-        if self.delivered[tensor].swap(true, Ordering::AcqRel) {
+        if self.delivered[tensor].load(Ordering::Acquire) {
             return Err(LoaderError::AlreadyDelivered);
         }
         let (start, end) = self.plan.tensor_offsets[tensor];
-        if start == end {
-            return Ok(CudaBuffer {
-                _alloc: None,
-                device: self.device,
-                ptr: 0,
-                len: 0,
-            });
-        }
-        let alloc_idx = self.plan.allocation_at(start);
-        let Some(alloc) = self.allocations[alloc_idx].lock().unwrap().clone() else {
-            return Err(LoaderError::Closed);
-        };
-        Ok(CudaBuffer {
-            ptr: alloc.ptr + (start - self.plan.allocation_ranges[alloc_idx].start) as u64,
-            len: end - start,
+        let mut buffer = CudaBuffer {
+            _alloc: None,
             device: self.device,
-            _alloc: Some(alloc),
-        })
+            ptr: 0,
+            len: end - start,
+        };
+        if start != end {
+            let alloc_idx = self.plan.allocation_at(start);
+            let Some(alloc) = self.allocations[alloc_idx].lock().unwrap().clone() else {
+                return Err(LoaderError::Closed);
+            };
+            buffer.ptr = alloc.ptr + (start - self.plan.allocation_ranges[alloc_idx].start) as u64;
+            buffer._alloc = Some(alloc);
+        }
+        if self.delivered[tensor].swap(true, Ordering::AcqRel) {
+            return Err(LoaderError::AlreadyDelivered);
+        }
+        Ok(buffer)
     }
 
-    fn release(&self) -> Result<(), LoaderError> {
+    fn close(&self) {
         self.closed.store(true, Ordering::Release);
         if self.released.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            return;
         }
         for slot in self.allocations.iter() {
             *slot.lock().unwrap() = None;
         }
         if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
             let Ok(_g) = self.api.device_guard(self.device) else {
-                return Ok(());
+                return;
             };
             // NOTE: `let _ =` is intentional, releasing retained memory is best effort
             if let Ok(free) = free_stream(self.api, self.device) {
@@ -537,8 +587,11 @@ impl CudaSink {
             }
             let _ = self.api.pool_set_release_threshold(self.device, 0);
             let _ = self.api.pool_trim(self.device);
+            // a sink opened concurrently may have lost its retention to the reset above
+            if CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) > 0 {
+                let _ = self.api.pool_set_release_threshold(self.device, u64::MAX);
+            }
         }
-        Ok(())
     }
 
     fn signal_stop(&self) {
@@ -554,6 +607,7 @@ impl CudaSink {
 
 impl Drop for CudaSink {
     fn drop(&mut self) {
+        self.close();
         for e in self.chunk_completion_events.iter() {
             let e = e.swap(0, Ordering::AcqRel);
             if e != 0 {
@@ -595,25 +649,23 @@ fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
     get_stream(&STREAMS, api, device)
 }
 
-pub struct LoaderInner {
+struct LoaderInner {
     file: Arc<File>,
     plan: Arc<LoadPlan>,
     sink: Sink,
     next_chunk: AtomicUsize,
-    cancelled: AtomicBool,
     error: OnceLock<LoaderError>,
 }
 
 impl LoaderInner {
     fn take_tensor(&self, tensor: usize) -> Result<DeviceBuffer, LoaderError> {
-        self.sink.wait_ready(tensor).map_err(|e| match e {
-            LoaderError::Closed => match self.error.get() {
-                Some(err) => LoaderError::Io(std::io::Error::other(err.to_string())),
-                None => LoaderError::Closed,
-            },
-            e => e,
-        })?;
-        self.sink.take(tensor)
+        self.sink
+            .wait_ready(tensor)
+            .and_then(|()| self.sink.take(tensor))
+            .map_err(|e| match (e, self.error.get()) {
+                (LoaderError::Closed, Some(err)) => LoaderError::WorkerFailed(err.to_string()),
+                (e, _) => e,
+            })
     }
 }
 
@@ -626,21 +678,20 @@ impl Loader {
     pub fn load(
         file: Arc<File>,
         metadata: &Metadata,
-        buffer_start_pos: usize,
+        in_file_offset: usize,
         device: i32,
         threads: usize,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
         let plan = Arc::new(LoadPlan::new(
             metadata,
-            buffer_start_pos,
+            in_file_offset,
             CHUNK_SIZE,
             MIN_ALLOCATION_SIZE,
         ));
         let pool = pool(cuda_api)?;
         let inner = Arc::new(LoaderInner {
             file,
-            cancelled: AtomicBool::new(false),
             error: OnceLock::new(),
             plan: plan.clone(),
             sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
@@ -662,12 +713,11 @@ impl Loader {
     }
 
     pub fn close(&mut self) {
-        self.inner.cancelled.store(true, Ordering::Release);
         self.inner.sink.signal_stop();
         for h in std::mem::take(&mut self.workers) {
             let _ = h.join();
         }
-        let _ = self.inner.sink.release();
+        self.inner.sink.release();
     }
 
     pub fn iter(&self) -> TensorIter {
@@ -733,7 +783,7 @@ fn pool(cuda_api: &'static CudaApi) -> Result<&'static SlabPool, CudaError> {
 
 fn worker(loader: Arc<LoaderInner>) {
     loop {
-        if loader.cancelled.load(Ordering::Acquire) {
+        if loader.sink.stopped() {
             return;
         }
         let chunk_idx = loader.next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -748,8 +798,9 @@ fn worker(loader: Arc<LoaderInner>) {
                     .read_exact_at(buffer, loader.plan.chunk_file_offset(chunk_idx) as u64)
             });
         if let Err(err) = res {
-            let _ = loader.error.set(err);
-            loader.cancelled.store(true, Ordering::Release);
+            if !matches!(err, LoaderError::Closed) {
+                let _ = loader.error.set(err);
+            }
             loader.sink.signal_stop();
             return;
         }
@@ -765,7 +816,7 @@ mod tests {
         Dtype,
     };
 
-    use crate::engine::LoadPlan;
+    use super::LoadPlan;
 
     fn t(name: &str, start: usize, len: usize) -> (String, TensorInfo) {
         (

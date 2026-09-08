@@ -12,7 +12,7 @@ jobs:
         toolchain: [stable]
         include:
           - os: ubuntu-latest
-            toolchain: "1.74"
+            toolchain: "1.86"
     defaults:
       run:
         working-directory: ./safetensors

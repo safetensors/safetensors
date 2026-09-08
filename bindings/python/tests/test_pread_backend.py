@@ -148,6 +148,27 @@ class PreadBackendTests(unittest.TestCase):
             ) as f:
                 _ = f.get_tensors()
 
+    def test_prefetch_requires_pread(self):
+        with self.assertRaisesRegex(Exception, 'backend="pread"'):
+            safe_open(
+                self.path, framework="pt", device="cpu", backend="mmap", prefetch=True
+            )
+
+    def test_prefetch_requires_pt(self):
+        with self.assertRaisesRegex(Exception, 'framework="pt"'):
+            safe_open(self.path, framework="numpy", backend="pread", prefetch=True)
+
+    def test_prefetch_requires_cuda(self):
+        with self.assertRaisesRegex(Exception, "cuda"):
+            safe_open(
+                self.path, framework="pt", device="cpu", backend="pread", prefetch=True
+            )
+
+    def test_tensor_stream_requires_prefetch(self):
+        with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, "prefetch=True"):
+                f.tensor_stream()
+
     def test_numpy_framework(self):
         np_path = os.path.join(self.tempdir.name, "np.safetensors")
         from safetensors.numpy import save_file as save_np
@@ -164,6 +185,109 @@ class PreadBackendTests(unittest.TestCase):
                 self.assertEqual(got.dtype, expected.dtype, k)
                 self.assertEqual(got.shape, expected.shape, k)
                 np.testing.assert_array_equal(got, expected)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+class PrefetchCudaTests(unittest.TestCase):
+    """`safe_open(..., backend="pread", prefetch=True)`: background load into
+    device memory, tensors handed out once as zero-copy views."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tempdir.name, "tiny.safetensors")
+        save_file(SOURCE_TENSORS, self.path, metadata={"foo": "bar"})
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def _open(self, path=None):
+        return safe_open(
+            path or self.path,
+            framework="pt",
+            device="cuda:0",
+            backend="pread",
+            prefetch=True,
+        )
+
+    def _assert_matches_source(self, sd):
+        self.assertEqual(set(sd.keys()), set(SOURCE_TENSORS.keys()))
+        for k, expected in SOURCE_TENSORS.items():
+            got = sd[k]
+            self.assertEqual(got.device.type, "cuda", k)
+            self.assertEqual(got.dtype, expected.dtype, k)
+            self.assertEqual(tuple(got.shape), tuple(expected.shape), k)
+            if expected.numel() > 0:
+                self.assertTrue(_tensors_equal(got.cpu(), expected), k)
+
+    def test_tensor_stream_matches_source(self):
+        with self._open() as f:
+            sd = dict(f.tensor_stream())
+        self._assert_matches_source(sd)
+
+    def test_get_tensor_matches_source(self):
+        with self._open() as f:
+            sd = {k: f.get_tensor(k) for k in f.keys()}
+        self._assert_matches_source(sd)
+
+    def test_take_once(self):
+        with self._open() as f:
+            f.get_tensor("fp32_2d")
+            with self.assertRaisesRegex(Exception, "already delivered"):
+                f.get_tensor("fp32_2d")
+
+    def test_tensor_stream_skips_taken(self):
+        with self._open() as f:
+            f.get_tensor("fp32_2d")
+            names = {name for name, _ in f.tensor_stream()}
+        self.assertEqual(names, set(SOURCE_TENSORS.keys()) - {"fp32_2d"})
+
+    def test_views_outlive_handle(self):
+        # Delivered tensors own their memory: reading after close is valid.
+        with self._open() as f:
+            sd = dict(f.tensor_stream())
+        torch.cuda.synchronize()
+        self._assert_matches_source(sd)
+
+    def test_close_mid_stream(self):
+        f = self._open()
+        stream = f.tensor_stream()
+        next(stream)
+        f.__exit__(None, None, None)
+        with self.assertRaisesRegex(Exception, "closed"):
+            for _ in stream:
+                pass
+
+    def test_truncated_data_raises(self):
+        bad_path = os.path.join(self.tempdir.name, "short.safetensors")
+        header = b'{"t":{"dtype":"F32","shape":[1024],"data_offsets":[0,4096]}}'
+        with open(bad_path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(b"\x00" * 100)
+        with self.assertRaises(Exception):
+            with self._open(bad_path) as f:
+                f.get_tensor("t")
+
+    def test_misaligned_offsets(self):
+        # save_file keeps tensors aligned; hand-build a file where an F32 tensor
+        # sits at byte offset 3 to exercise the realignment path.
+        bad_path = os.path.join(self.tempdir.name, "misaligned.safetensors")
+        header = (
+            b'{"u8":{"dtype":"U8","shape":[3],"data_offsets":[0,3]},'
+            b'"f32":{"dtype":"F32","shape":[4],"data_offsets":[3,19]}}'
+        )
+        with open(bad_path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(bytes([1, 2, 3]))
+            fh.write(struct.pack("<4f", 0.0, 1.0, 2.0, 3.0))
+        with self._open(bad_path) as f:
+            f32 = f.get_tensor("f32")
+            u8 = f.get_tensor("u8")
+        self.assertTrue(torch.equal(f32.cpu(), torch.arange(4, dtype=torch.float32)))
+        self.assertTrue(
+            torch.equal(u8.cpu(), torch.tensor([1, 2, 3], dtype=torch.uint8))
+        )
 
 
 if __name__ == "__main__":

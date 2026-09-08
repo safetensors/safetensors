@@ -7,15 +7,15 @@ use safetensors::tensor::Metadata;
 pub enum CudaBuffer {}
 
 impl CudaBuffer {
-    pub fn ptr(&self) -> u64 {
+    pub(crate) fn ptr(&self) -> u64 {
         match *self {}
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match *self {}
     }
 
-    pub fn device(&self) -> i32 {
+    pub(crate) fn device(&self) -> i32 {
         match *self {}
     }
 }
@@ -49,7 +49,7 @@ impl Loader {
     pub fn load(
         _file: Arc<File>,
         _metadata: &Metadata,
-        _buffer_start_pos: usize,
+        _in_file_offset: usize,
         _device: i32,
         _threads: usize,
     ) -> Result<Self, LoaderError> {
