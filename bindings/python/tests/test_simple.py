@@ -11,7 +11,9 @@ import torch
 from safetensors import SafetensorError, TensorSpec, safe_open, serialize
 from safetensors.numpy import load, load_file, save, save_file
 from safetensors.torch import _find_shared_tensors
+from safetensors.torch import load as load_pt
 from safetensors.torch import load_file as load_file_pt
+from safetensors.torch import save as save_pt
 from safetensors.torch import save_file as save_file_pt
 from safetensors.torch import storage_ptr, storage_size
 
@@ -127,6 +129,25 @@ class TestCase(unittest.TestCase):
         save_file_pt(tensors, Path(filename))
         load_file_pt(Path(filename))
         os.remove(Path(filename))
+
+    def test_pytorch_lazy_view_bits_roundtrip(self):
+        tensors = {
+            "conjugate": torch.tensor([1 + 2j, 3 + 4j], dtype=torch.complex64).conj(),
+            "negative": torch._neg_view(torch.tensor([1.0, 3.0])),
+        }
+
+        for name, tensor in tensors.items():
+            with self.subTest(name=name, destination="bytes"):
+                loaded = load_pt(save_pt({name: tensor}))[name]
+                torch.testing.assert_close(loaded, tensor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "lazy-view-bits.safetensors")
+            save_file_pt(tensors, filename)
+            loaded = load_file_pt(filename)
+            for name, tensor in tensors.items():
+                with self.subTest(name=name, destination="file"):
+                    torch.testing.assert_close(loaded[name], tensor)
 
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
