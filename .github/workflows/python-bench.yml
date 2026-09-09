@@ -21,6 +21,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Install Python

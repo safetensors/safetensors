@@ -9,10 +9,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        toolchain: [stable]
-        include:
-          - os: ubuntu-latest
-            toolchain: "1.86"
     defaults:
       run:
         working-directory: ./safetensors
@@ -23,8 +19,8 @@ jobs:
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy, llvm-tools-preview
-          override: true
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
