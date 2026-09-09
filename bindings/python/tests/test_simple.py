@@ -182,6 +182,22 @@ class ErrorsTestCase(unittest.TestCase):
                 pass
         self.assertEqual(str(ctx.exception), "No such file or directory: notafile")
 
+    @unittest.skipIf(
+        os.name == "nt" or not hasattr(os, "getuid") or os.getuid() == 0,
+        "requires POSIX file permissions and a non-root user",
+    )
+    def test_permission_denied(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            save_file_pt({"a": torch.zeros((2, 2))}, f.name)
+        try:
+            os.chmod(f.name, 0o000)
+            with self.assertRaises(PermissionError):
+                with safe_open(f.name, framework="pt"):
+                    pass
+        finally:
+            os.chmod(f.name, 0o600)
+            os.remove(f.name)
+
 
 class ReadmeTestCase(unittest.TestCase):
     def assertTensorEqual(self, tensors1, tensors2, equality_fn):
