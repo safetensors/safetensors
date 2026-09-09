@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "safetensors"
-version = "0.9.0-dev.0"
+version = "0.9.0-rc.0"
 dependencies = [
  "hashbrown",
  "libc",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "safetensors-python"
-version = "0.9.0-dev.0"
+version = "0.9.0-rc.0"
 dependencies = [
  "libc",
  "memmap2",
