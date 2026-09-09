@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788970921963,
+  "lastUpdate": 1788972154250,
   "repoUrl": "https://github.com/safetensors/safetensors",
   "entries": {
     "Benchmark": [
@@ -52319,6 +52319,121 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.0030405928040785533",
             "extra": "mean: 224.18884739999783 msec\nrounds: 5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "McPatate@users.noreply.github.com",
+            "name": "Luc Georges",
+            "username": "McPatate"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b7c0f38b6ae072c3cc6208933df0c81fbd2ef837",
+          "message": "feat: add prefetch (#828)\n\n* feat: bench script\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: add core engine load planner\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: add cuda bindings\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: add `CudaSink` with `SlabPool` intermediate bounce buffer\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: prefetch loader\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* refactor: move `LoaderError` -> `PyErr` conversion to lib.rs\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* fix(`TensorIter`): add `take(64)` to bound pending tensor iteration\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* refactor: make sure windows builds\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: make sure dependencies are locked\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: batch tensors in device allocated buffers\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: bump deps & MSRV\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* fix: harden prefetch loader\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* fix: fail fast on unsupported dtypes\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* chore: remove cold cache bench file\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* fix: README code fmt\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: update actions pins\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* refactor: `CudaApi::device_guard` -> `CudaApi::with_device`\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* fix(ci): `toolchain` arg is required in dtolnay/rust-toolchain\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n* feat: bump min torch to 2.5\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>\n\n---------\n\nSigned-off-by: Luc Georges <luc.sydney.georges@gmail.com>",
+          "timestamp": "2026-09-09T18:39:32+02:00",
+          "tree_id": "4beb7735acb85a1343c59108a36f9a03cc0f4fab",
+          "url": "https://github.com/safetensors/safetensors/commit/b7c0f38b6ae072c3cc6208933df0c81fbd2ef837"
+        },
+        "date": 1788972151397,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "benches/test_flax.py::test_flax_flax_load",
+            "value": 3.8965719108258785,
+            "unit": "iter/sec",
+            "range": "stddev: 0.007072264295435419",
+            "extra": "mean: 256.63583859999903 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_flax.py::test_flax_sf_load",
+            "value": 5.381306727085266,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0038934201230768095",
+            "extra": "mean: 185.8284707999985 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_paddle_load",
+            "value": 7.161032001922433,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0006889420628825012",
+            "extra": "mean: 139.64467687500104 msec\nrounds: 8"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_sf_load",
+            "value": 373.192516159796,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0003214401264872222",
+            "extra": "mean: 2.6795821370968045 msec\nrounds: 248"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu",
+            "value": 9.129111110450994,
+            "unit": "iter/sec",
+            "range": "stddev: 0.003487246785393205",
+            "extra": "mean: 109.53968988888757 msec\nrounds: 9"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu",
+            "value": 311.0612238301409,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00016927820076158853",
+            "extra": "mean: 3.214801214008157 msec\nrounds: 257"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_pread",
+            "value": 10.564906887062179,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0008794992343943132",
+            "extra": "mean: 94.65298754545611 msec\nrounds: 11"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu_small",
+            "value": 11.107667711680913,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0006247496741125788",
+            "extra": "mean: 90.02790018181693 msec\nrounds: 11"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small",
+            "value": 51.72645768004481,
+            "unit": "iter/sec",
+            "range": "stddev: 0.02602772572937503",
+            "extra": "mean: 19.33246630158831 msec\nrounds: 63"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small_pread",
+            "value": 135.82374491532732,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0002098036243886463",
+            "extra": "mean: 7.36248290476309 msec\nrounds: 126"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_save_cpu",
+            "value": 7.569157029990771,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00027035291844635154",
+            "extra": "mean: 132.11510819999717 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_tf_load",
+            "value": 3.766718175583405,
+            "unit": "iter/sec",
+            "range": "stddev: 0.011526279310322357",
+            "extra": "mean: 265.48309520000544 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_sf_load",
+            "value": 4.326818952025123,
+            "unit": "iter/sec",
+            "range": "stddev: 0.008634119217298716",
+            "extra": "mean: 231.11667279999324 msec\nrounds: 5"
           }
         ]
       }
