@@ -312,7 +312,14 @@ fn buffered_write_to_file<V: View>(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent)?;
 
-    temp.as_file().set_len(total_size as u64)?;
+    // Preallocation is best-effort only when the filesystem reports it as unsupported
+    // (e.g. FUSE/HDFS/S3 ftruncate not implemented). The sequential writes below grow the
+    // file to total_size regardless; surface all other errors such as overflow, space, or IO.
+    if let Err(e) = temp.as_file().set_len(total_size as u64) {
+        if e.kind() != std::io::ErrorKind::Unsupported {
+            return Err(e.into());
+        }
+    }
 
     // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
     // This yields ~30% performance improvement.
