@@ -663,6 +663,17 @@ impl Metadata {
         Ok(start)
     }
 
+    /// [`TensorInfo`]s in data-offset order: contiguous and non-overlapping, enforced by
+    /// `validate` for every `Metadata`. [`Self::tensor_idx`] returns positions into this slice.
+    pub fn tensor_infos(&self) -> &[TensorInfo] {
+        &self.tensors
+    }
+
+    /// Position of `name` in [`Self::tensor_infos`], or `None` if absent.
+    pub fn tensor_idx(&self, name: &str) -> Option<usize> {
+        self.index_map.get(name).copied()
+    }
+
     /// Gives back the tensor metadata
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         let &index = self.index_map.get(name)?;

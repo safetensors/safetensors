@@ -2,7 +2,7 @@
 name = "safetensors"
 version = "0.9.0-dev.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.86"
 homepage = "https://github.com/huggingface/safetensors"
 repository = "https://github.com/huggingface/safetensors"
 documentation = "https://docs.rs/safetensors/"
@@ -27,16 +27,16 @@ serde = { version = "1.0", default-features = false, features = [
   "alloc",
 ] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-hashbrown = { version = "0.16", features = ["serde"] }
+hashbrown = { version = "0.17", features = ["serde"] }
 tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-criterion = "0.6"
+criterion = "0.8"
 memmap2 = "0.9"
-proptest = "1.7"
+proptest = "1.11"
 
 [features]
 default = ["std"]

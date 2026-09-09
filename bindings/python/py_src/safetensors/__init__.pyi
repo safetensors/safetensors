@@ -4,6 +4,8 @@
 #   - module-level imports (`os`, `typing`)
 #   - `__version__: str`
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
+#   - `prefetch` kwarg on `safe_open.__init__` and the return annotation on
+#     `safe_open.tensor_stream`
 #
 # TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
 # `tools/stub-gen` binary using `pyo3-introspection`,
@@ -11,7 +13,7 @@
 # That generator emits typed stubs directly from Rust
 # signatures — no hand-editing, no drift.
 import os
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 __version__: str
 
@@ -172,8 +174,27 @@ class safe_open:
             On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
             shared `MTLBuffer` (1x model memory, no page-cache duplication) and
             loads a full model several times faster than `"mmap"`.
+
+        prefetch (`bool`, *keyword-only*, defaults to `False`):
+            Requires `backend="pread"`, `framework="pt"` and a CUDA device.
+            Starts loading the whole file to the device in the background at
+            open, and hands each tensor out exactly once as a zero-copy view:
+            via `get_tensor` or `tensor_stream()`, whichever asks first.
+            Consume inside the `with` block — closing the file stops the load.
+            Each open file runs 8 reader threads and holds its full data size
+            in device memory until its tensors are consumed; all files share
+            one process-wide 512 MiB pinned staging pool. Raises at open if the
+            file holds a dtype torch cannot represent (F6).
     """
-    def __init__(self, filename, framework, device=..., *, backend: str = "mmap"):
+    def __init__(
+        self,
+        filename,
+        framework,
+        device=...,
+        *,
+        backend: str = "mmap",
+        prefetch: bool = False,
+    ):
         pass
 
     def __enter__(self):
@@ -221,6 +242,8 @@ class safe_open:
         Returns:
             (`Tensor`):
                 The tensor in the framework you opened the file for.
+                With `prefetch=True` each tensor can be taken once; asking
+                again (or after `tensor_stream()` yielded it) raises.
 
         Example:
         ```python
@@ -230,6 +253,25 @@ class safe_open:
             tensor = f.get_tensor("embedding")
 
         ```
+        """
+        pass
+
+    def tensor_stream(self) -> Iterator[Tuple[str, Any]]:
+        """
+        Iterates over every tensor as `(name, tensor)` while the file loads.
+
+        Requires `prefetch=True`. Tensors are yielded as soon as their bytes
+        are on the device, so the order is unspecified and differs run to run.
+        Each tensor is delivered once: names already taken with `get_tensor`
+        are skipped. Iterate inside the `with` block — after the file is
+        closed the next step raises.
+
+        Returned tensors are ready on any stream. If you consume them on a
+        non-default CUDA stream, synchronize it before dropping your last
+        reference to a tensor.
+
+        Returns:
+            (`Iterator[Tuple[str, Tensor]]`)
         """
         pass
 

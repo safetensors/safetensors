@@ -31,7 +31,7 @@ Source = 'https://github.com/huggingface/safetensors'
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.24.6"]
-torch = ["safetensors[numpy]", "torch>=2.4"]
+torch = ["safetensors[numpy]", "torch>=2.5"]
 tensorflow = ["safetensors[numpy]", "tensorflow>=2.11.0"]
 tf-nightly = ["safetensors[numpy]", "tf-nightly"]
 # pinning tf version 2.11.0 for doc-builder
@@ -92,6 +92,7 @@ conflicts = [
 ]
 
 [tool.maturin]
+locked = true
 python-source = "py_src"
 module-name = "safetensors._safetensors_rust"
 bindings = 'pyo3'
