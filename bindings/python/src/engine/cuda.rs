@@ -133,7 +133,7 @@ impl CudaApi {
         })
     }
 
-    pub fn stream_create(&self) -> Result<Stream, CudaError> {
+    fn stream_create(&self) -> Result<Stream, CudaError> {
         let mut s = std::ptr::null_mut();
         self.check(unsafe {
             (self.f.cudaStreamCreateWithFlags)(&mut s, CUDA_STREAM_NON_BLOCKING)
@@ -145,7 +145,7 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaStreamDestroy)(s) })
     }
 
-    pub fn event_create(&self) -> Result<Event, CudaError> {
+    fn event_create(&self) -> Result<Event, CudaError> {
         let mut e = std::ptr::null_mut();
         self.check(unsafe {
             (self.f.cudaEventCreateWithFlags)(&mut e, CUDA_EVENT_DISABLE_TIMING)
@@ -181,15 +181,25 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaStreamWaitEvent)(s, e, 0) })
     }
 
-    pub fn set_device(&self, d: i32) -> Result<(), CudaError> {
+    fn set_device(&self, d: i32) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaSetDevice)(d) })
     }
 
-    pub fn device_guard(&'static self, d: i32) -> Result<DeviceGuard, CudaError> {
+    pub fn with_device<T, E: From<CudaError>>(
+        &self,
+        device: i32,
+        cb: impl FnOnce(&DeviceGuard<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut prev = 0;
         self.check(unsafe { (self.f.cudaGetDevice)(&mut prev) })?;
-        self.set_device(d)?;
-        Ok(DeviceGuard { api: self, prev })
+        self.set_device(device)?;
+        let guard = DeviceGuard {
+            api: self,
+            device,
+            prev,
+            _thread_bound: std::marker::PhantomData,
+        };
+        cb(&guard)
     }
 
     #[cfg(test)]
@@ -220,27 +230,66 @@ impl CudaApi {
     }
 }
 
-pub struct DeviceGuard {
-    api: &'static CudaApi,
+/// Restores the caller's current device on drop.
+pub struct DeviceGuard<'a> {
+    api: &'a CudaApi,
+    device: i32,
     prev: c_int,
+    /// `cudaSetDevice` is per-thread state: the guard must be dropped on the
+    /// thread that created it, so it is `!Send` (raw pointers are `!Send`).
+    _thread_bound: std::marker::PhantomData<*mut ()>,
 }
 
-impl Drop for DeviceGuard {
+impl DeviceGuard<'_> {
+    pub fn id(&self) -> i32 {
+        self.device
+    }
+
+    pub fn api(&self) -> &CudaApi {
+        self.api
+    }
+
+    pub fn stream_create(&self) -> Result<Stream, CudaError> {
+        self.api.stream_create()
+    }
+
+    pub fn event_create(&self) -> Result<Event, CudaError> {
+        self.api.event_create()
+    }
+}
+
+impl Drop for DeviceGuard<'_> {
     fn drop(&mut self) {
         let _ = self.api.set_device(self.prev);
     }
 }
 
+/// Path of the `libcudart` already mapped in this process, from the dynamic
+/// loader's own list (`dl_iterate_phdr`), so it also works where `/proc` is
+/// hardened or absent.
 #[cfg(target_os = "linux")]
 fn find_loaded_cudart() -> Option<CString> {
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    maps.lines()
-        .filter_map(|l| l.split_whitespace().last())
-        .find(|p| {
-            let file = p.rsplit('/').next().unwrap_or(p);
-            file.starts_with("libcudart") && file.contains(".so")
-        })
-        .and_then(|p| CString::new(p).ok())
+    unsafe extern "C" fn visit(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        found: *mut c_void,
+    ) -> c_int {
+        let name = (*info).dlpi_name;
+        if name.is_null() {
+            return 0;
+        }
+        let name = CStr::from_ptr(name);
+        let file = name.to_bytes().rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+        // plain `libcudart.so.13` today; older wheels bundled `libcudart-<hash>.so.11.0`
+        if file.starts_with(b"libcudart") && file.windows(3).any(|w| w == b".so") {
+            *(found as *mut Option<CString>) = Some(name.to_owned());
+            return 1; // stop
+        }
+        0
+    }
+    let mut found: Option<CString> = None;
+    unsafe { libc::dl_iterate_phdr(Some(visit), &mut found as *mut _ as *mut c_void) };
+    found
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -313,31 +362,33 @@ mod test {
     #[test]
     fn test_gpu_roundtrip() {
         let Some(api) = cuda_or_skip() else { return };
-        let _g = api.device_guard(0).unwrap();
-        let s = api.stream_create().unwrap();
-        let (free0, _) = api.mem_get_info().unwrap();
+        api.with_device(0, |d| {
+            let s = d.stream_create().unwrap();
+            let (free0, _) = api.mem_get_info().unwrap();
 
-        let host = api.host_alloc(4096).unwrap();
-        unsafe { std::slice::from_raw_parts_mut(host, 4096) }.fill(0xAB);
-        let dev = api.malloc_async(4096, s).unwrap();
-        api.memcpy_h2d_async(dev, host, 4096, s).unwrap();
-        let e = api.event_create().unwrap();
-        api.event_record(e, s).unwrap();
-        api.event_sync(e).unwrap();
-        assert!(api.event_query(e).unwrap());
+            let host = api.host_alloc(4096).unwrap();
+            unsafe { std::slice::from_raw_parts_mut(host, 4096) }.fill(0xAB);
+            let dev = api.malloc_async(4096, s).unwrap();
+            api.memcpy_h2d_async(dev, host, 4096, s).unwrap();
+            let e = d.event_create().unwrap();
+            api.event_record(e, s).unwrap();
+            api.event_sync(e).unwrap();
+            assert!(api.event_query(e).unwrap());
 
-        api.free_async(dev, s).unwrap();
-        api.event_record(e, s).unwrap();
-        api.event_sync(e).unwrap();
-        api.pool_trim(0).unwrap();
+            api.free_async(dev, s).unwrap();
+            api.event_record(e, s).unwrap();
+            api.event_sync(e).unwrap();
+            api.pool_trim(0).unwrap();
 
-        let (free1, _) = api.mem_get_info().unwrap();
-        assert!(
-            free1 + (16 << 20) >= free0,
-            "pool retained memory after trim"
-        );
+            let (free1, _) = api.mem_get_info().unwrap();
+            assert!(
+                free1 + (16 << 20) >= free0,
+                "pool retained memory after trim"
+            );
 
-        api.stream_wait_event(s, e).unwrap();
-        api.free_host(host).unwrap();
+            api.stream_wait_event(s, e).unwrap();
+            api.free_host(host)
+        })
+        .unwrap();
     }
 }

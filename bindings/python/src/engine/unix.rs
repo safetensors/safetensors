@@ -64,7 +64,7 @@ use std::{
 
 use safetensors::tensor::Metadata;
 
-use crate::engine::cuda::{api, CudaApi, CudaError, Event, Stream};
+use crate::engine::cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream};
 
 #[derive(Debug)]
 pub enum LoaderError {
@@ -136,8 +136,7 @@ impl Allocation {
         stream: Stream,
         bytes: usize,
     ) -> Result<Arc<Self>, LoaderError> {
-        let _g = api.device_guard(device)?;
-        let ptr = api.malloc_async(bytes, stream)?;
+        let ptr = api.with_device(device, |_| api.malloc_async(bytes, stream))?;
         Ok(Arc::new(Self {
             api,
             device,
@@ -153,18 +152,17 @@ impl Allocation {
 /// `__dlpack__(stream=)` negotiation is the planned replacement.
 impl Drop for Allocation {
     fn drop(&mut self) {
-        let Ok(_g) = self.api.device_guard(self.device) else {
-            return;
-        };
         let free = free_stream(self.api, self.device).unwrap_or(self.stream);
-        for stream in [self.stream, DEFAULT_STREAM] {
-            if let Ok(e) = self.api.event_create() {
-                let _ = self.api.event_record(e, stream);
-                let _ = self.api.stream_wait_event(free, e);
-                let _ = self.api.event_destroy(e);
+        let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
+            for stream in [self.stream, DEFAULT_STREAM] {
+                if let Ok(e) = d.event_create() {
+                    let _ = self.api.event_record(e, stream);
+                    let _ = self.api.stream_wait_event(free, e);
+                    let _ = self.api.event_destroy(e);
+                }
             }
-        }
-        let _ = self.api.free_async(self.ptr, free);
+            self.api.free_async(self.ptr, free)
+        });
     }
 }
 
@@ -329,8 +327,8 @@ impl Sink {
 #[derive(Clone, Copy)]
 struct Slab {
     offset: usize,
-    event: Event,
-    device: i32,
+    /// (completion event of the last host2device copy, device id)
+    last_copy: Option<(Event, i32)>,
 }
 
 struct SlabLease {
@@ -348,17 +346,17 @@ impl SlabLease {
         unsafe { std::slice::from_raw_parts_mut(self.ptr(), len) }
     }
 
-    fn release(mut self, cuda: &CudaApi, stream: Stream, device: i32) -> Result<(), CudaError> {
-        if self.slab.device != device {
-            let event = cuda.event_create()?;
-            let _ = cuda.event_destroy(self.slab.event);
-            self.slab = Slab {
-                event,
-                device,
-                ..self.slab
-            };
-        }
-        cuda.event_record(self.slab.event, stream)
+    fn release(mut self, d: &DeviceGuard<'_>, stream: Stream) -> Result<(), CudaError> {
+        let event = match self.slab.last_copy {
+            Some((event, device)) if device == d.id() => event,
+            Some((event, _)) => {
+                let _ = d.api().event_destroy(event);
+                d.event_create()?
+            }
+            None => d.event_create()?,
+        };
+        self.slab.last_copy = Some((event, d.id()));
+        d.api().event_record(event, stream)
     }
 }
 
@@ -382,14 +380,11 @@ impl SlabPool {
     fn new(cuda: &CudaApi, n_slabs: usize, slab_size: usize) -> Result<Self, CudaError> {
         let buffer_ptr = cuda.host_alloc(n_slabs * slab_size)?;
         let free = (0..n_slabs)
-            .map(|i| {
-                Ok(Slab {
-                    offset: i * slab_size,
-                    event: cuda.event_create()?,
-                    device: -1,
-                })
+            .map(|i| Slab {
+                offset: i * slab_size,
+                last_copy: None,
             })
-            .collect::<Result<VecDeque<_>, _>>()?;
+            .collect();
         Ok(Self {
             buffer_ptr,
             slab_size,
@@ -409,7 +404,9 @@ impl SlabPool {
         };
         drop(free);
         let lease = SlabLease { pool: self, slab };
-        cuda.event_sync(lease.slab.event)?;
+        if let Some((event, _)) = lease.slab.last_copy {
+            cuda.event_sync(event)?;
+        }
         Ok(lease)
     }
 
@@ -451,10 +448,10 @@ impl CudaSink {
         plan: Arc<LoadPlan>,
         device: i32,
     ) -> Result<Self, LoaderError> {
-        let _g = api.device_guard(device)?;
         let stream = device_stream(api, device)?;
         CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
         let _ = api.pool_set_release_threshold(device, u64::MAX);
+
         Ok(Self {
             api,
             device,
@@ -496,7 +493,7 @@ impl CudaSink {
     ) -> Result<(), LoaderError> {
         let mut lease = self.pool.acquire(self.api)?;
         read(lease.mut_slice(len))?;
-        let _g = self.api.device_guard(self.device)?;
+
         let chunk_start = chunk_idx * self.plan.chunk_size;
         for alloc in self.plan.chunk_allocations(chunk_idx) {
             let range = &self.plan.allocation_ranges[alloc];
@@ -510,13 +507,18 @@ impl CudaSink {
                 self.stream,
             )?;
         }
-        lease.release(self.api, self.stream, self.device)?;
-        let e = self.api.event_create()?;
+
+        let e = self.api.with_device(self.device, |d| {
+            lease.release(d, self.stream)?;
+            d.event_create()
+        })?;
+
         if let Err(err) = self.api.event_record(e, self.stream) {
             let _ = self.api.event_destroy(e);
             return Err(err.into());
         }
         self.chunk_completion_events[chunk_idx].store(e as u64, Ordering::Release);
+
         Ok(())
     }
 
@@ -578,16 +580,14 @@ impl CudaSink {
             *slot.lock().unwrap() = None;
         }
         if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
-            let Ok(_g) = self.api.device_guard(self.device) else {
-                return;
-            };
-            // NOTE: `let _ =` is intentional, releasing retained memory is best effort
             if let Ok(free) = free_stream(self.api, self.device) {
-                if let Ok(e) = self.api.event_create() {
+                // NOTE: `let _ =` is intentional, releasing retained memory is best effort
+                let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
+                    let e = d.event_create()?;
                     let _ = self.api.event_record(e, free);
                     let _ = self.api.event_sync(e);
-                    let _ = self.api.event_destroy(e);
-                }
+                    self.api.event_destroy(e)
+                });
             }
             let _ = self.api.pool_set_release_threshold(self.device, 0);
             let _ = self.api.pool_trim(self.device);
@@ -635,7 +635,7 @@ fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<
         return Ok(stream as Stream);
     }
 
-    let new = api.stream_create()?;
+    let new = api.with_device(device, |d| d.stream_create())?;
     match slot.compare_exchange(0, new as u64, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Ok(new),
         Err(existing) => {
