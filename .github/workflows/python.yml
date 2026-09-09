@@ -13,7 +13,7 @@ jobs:
         # Lowest and highest, no version specified so that
         # new releases get automatically tested against
         version: [
-          {torch: torch==2.4, python: "3.10", arch: "x64", numpy: numpy==1.26.4},
+          {torch: torch==2.5, python: "3.10", arch: "x64", numpy: numpy},
           {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
         ]
         include:
@@ -106,8 +106,10 @@ jobs:
 
       - name: Install (jax, flax)
         if: runner.os != 'Windows'
+        # resolve jax together with the matrix numpy pin: ml_dtypes>=0.6 needs
+        # numpy 2 and would otherwise upgrade it under a numpy-1 torch
         run:
-          pip install .[jax]
+          pip install .[jax] ${{ matrix.version.numpy }}
         shell: bash
 
       - name: Install (mlx)
