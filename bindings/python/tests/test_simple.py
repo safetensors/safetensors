@@ -1,5 +1,7 @@
 import importlib
 import os
+import platform
+import stat
 import tempfile
 import threading
 import unittest
@@ -127,6 +129,28 @@ class TestCase(unittest.TestCase):
         save_file_pt(tensors, Path(filename))
         load_file_pt(Path(filename))
         os.remove(Path(filename))
+
+    @unittest.skipIf(
+        platform.system() == "Windows", "umask is not available on Windows"
+    )
+    def test_serialization_file_permissions(self):
+        # Regression test for #782: save_file writes through a tempfile +
+        # rename, which must not leak the tempfile's restrictive 0o600 mode
+        # onto the destination.
+        data = np.zeros((2, 2), dtype=np.int32)
+        filename = f"./out_permissions_{threading.get_ident()}.safetensors"
+        old_mask = os.umask(0o022)
+        try:
+            save_file({"test": data}, filename)
+            self.assertEqual(stat.S_IMODE(os.stat(filename).st_mode), 0o644)
+
+            # Overwriting keeps the permissions of the existing file.
+            os.chmod(filename, 0o640)
+            save_file({"test": data}, filename)
+            self.assertEqual(stat.S_IMODE(os.stat(filename).st_mode), 0o640)
+        finally:
+            os.umask(old_mask)
+            os.remove(filename)
 
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
