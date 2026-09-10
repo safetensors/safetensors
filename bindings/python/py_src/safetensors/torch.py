@@ -14,6 +14,19 @@ from safetensors import (
 
 
 def storage_ptr(tensor: torch.Tensor) -> int:
+    """Return the data pointer of the underlying storage of a tensor.
+
+    Handles compatibility across PyTorch versions and meta tensors:
+    falls back to ``tensor.storage().data_ptr()`` on torch 1.10, and
+    returns ``0`` for meta tensors that have no physical storage.
+
+    Args:
+        tensor (`torch.Tensor`): The tensor whose storage pointer to retrieve.
+
+    Returns:
+        `int`: The raw memory address of the tensor's storage, or ``0`` for
+        meta tensors.
+    """
     try:
         return tensor.untyped_storage().data_ptr()
     except Exception:
@@ -34,6 +47,18 @@ def _end_ptr(tensor: torch.Tensor) -> int:
 
 
 def storage_size(tensor: torch.Tensor) -> int:
+    """Return the size in bytes of the underlying storage of a tensor.
+
+    Handles compatibility across PyTorch versions and meta tensors:
+    falls back to ``tensor.storage().size() * element_size`` on torch 1.10,
+    and uses ``tensor.nelement() * element_size`` for meta tensors.
+
+    Args:
+        tensor (`torch.Tensor`): The tensor whose storage size to retrieve.
+
+    Returns:
+        `int`: Total number of bytes in the tensor's storage.
+    """
     try:
         return tensor.untyped_storage().nbytes()
     except AttributeError:
