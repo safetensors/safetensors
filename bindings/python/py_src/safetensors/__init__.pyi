@@ -153,6 +153,15 @@ class TensorSpec:
         """
         pass
 
+class TensorMeta:
+    """A tensor's header entry, as written in the file. No data is read to build it."""
+
+    dtype: str
+    """safetensors dtype name, e.g. `"F32"`"""
+    shape: List[int]
+    data_offsets: Tuple[int, int]
+    """`(start, end)` of the tensor's bytes within the data section"""
+
 class safe_open:
     """
     Opens a safetensors lazily and returns tensors as asked
@@ -300,6 +309,16 @@ class safe_open:
         """
         pass
 
+    def get_tensor_meta(self, name: str) -> TensorMeta:
+        """
+        Returns a tensor's header entry without reading any data. Works on
+        every backend, including after `prefetch()`.
+
+        Args:
+            name (`str`):
+                The name of the tensor
+        """
+        pass
     def keys(self):
         """
         Returns the names of the tensors in the file.

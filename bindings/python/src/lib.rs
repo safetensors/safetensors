@@ -1431,6 +1431,18 @@ impl Open {
         }
     }
 
+    /// A tensor's header entry.
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        let info = self.metadata.info(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("File does not contain tensor {name}"))
+        })?;
+        Ok(TensorMeta {
+            dtype: info.dtype.to_string(),
+            shape: info.shape.clone(),
+            data_offsets: info.data_offsets,
+        })
+    }
+
     pub fn tensor_stream(&self) -> PyResult<TensorStream> {
         let Some(loader) = self.prefetch_loader.as_ref() else {
             return Err(SafetensorError::new_err(
@@ -1573,6 +1585,19 @@ impl safe_open {
         self.inner()?.keys()
     }
 
+    /// Returns a tensor's header entry.
+    ///
+    /// Args:
+    ///     name (`str`):
+    ///         The name of the tensor
+    ///
+    /// Returns:
+    ///     (`TensorMeta`):
+    ///         `dtype`, `shape` and `data_offsets`
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        self.inner()?.get_tensor_meta(name)
+    }
+
     /// Returns the names of the tensors in the file, ordered by offset.
     ///
     /// Returns:
@@ -1685,6 +1710,23 @@ impl safe_open {
     /// Exits the context manager
     pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
         self.inner = None;
+    }
+}
+
+/// A tensor's header entry, as written in the file.
+#[pyclass(frozen, get_all)]
+#[derive(Debug)]
+pub struct TensorMeta {
+    dtype: String,
+    shape: Vec<usize>,
+    /// `(start, end)` of the tensor's bytes within the data section
+    data_offsets: (usize, usize),
+}
+
+#[pymethods]
+impl TensorMeta {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
     }
 }
 
@@ -2704,6 +2746,21 @@ impl _safe_open_handle {
         self.inner()?.keys()
     }
 
+    /// Returns a tensor's header entry without reading any data.
+    ///
+    /// Args:
+    ///     name (`str`):
+    ///         The name of the tensor
+    ///
+    /// Returns:
+    ///     (`TensorMeta`):
+    ///         `dtype` (safetensors name, e.g. `"F32"`), `shape` and `data_offsets`
+    ///         as written in the file header. Works on every backend, including
+    ///         after `prefetch()`.
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        self.inner()?.get_tensor_meta(name)
+    }
+
     /// Returns the names of the tensors in the file, ordered by offset.
     ///
     /// Returns:
@@ -2789,6 +2846,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
     m.add_class::<TensorStream>()?;
     m.add_class::<TensorSpec>()?;
+    m.add_class::<TensorMeta>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;

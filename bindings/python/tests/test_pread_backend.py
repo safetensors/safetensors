@@ -5,6 +5,7 @@ the file, dropping each host buffer immediately after the device transfer so
 cumulative host residency stays bounded at one tensor.
 """
 
+import json
 import os
 import struct
 import sys
@@ -177,6 +178,20 @@ class PreadBackendTests(unittest.TestCase):
             safe_open(
                 path, framework="pt", device="cuda:0", backend="pread", prefetch=True
             )
+
+    def test_get_tensor_meta_matches_header(self):
+        with open(self.path, "rb") as fh:
+            header = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
+        with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
+            for name, entry in header.items():
+                if name == "__metadata__":
+                    continue
+                meta = f.get_tensor_meta(name)
+                self.assertEqual(meta.dtype, entry["dtype"])
+                self.assertEqual(meta.shape, entry["shape"])
+                self.assertEqual(list(meta.data_offsets), entry["data_offsets"])
+            with self.assertRaisesRegex(Exception, "does not contain"):
+                f.get_tensor_meta("nope")
 
     def test_tensor_stream_requires_prefetch(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
