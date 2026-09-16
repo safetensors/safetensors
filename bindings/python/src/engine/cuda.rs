@@ -297,18 +297,11 @@ fn find_loaded_cudart() -> Option<CString> {
     None
 }
 
-/// Attach to the CUDA runtime the framework already loaded
-fn open_cudart() -> *mut c_void {
-    match find_loaded_cudart() {
-        Some(path) => unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) },
-        None => std::ptr::null_mut(),
-    }
-}
-
 pub fn api() -> Option<&'static CudaApi> {
     static API: OnceLock<Option<CudaApi>> = OnceLock::new();
     API.get_or_init(|| unsafe {
-        let h = open_cudart();
+        let path = find_loaded_cudart()?;
+        let h = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
         if h.is_null() {
             return None;
         }
