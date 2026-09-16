@@ -6,6 +6,7 @@
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
 #   - the `prefetch` method on `safe_open` and the return annotation on
 #     `safe_open.tensor_stream`
+#   - the `PrefetchPlan` alias and the `TensorMeta` / `PySafeSlice` classes
 #
 # TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
 # `tools/stub-gen` binary using `pyo3-introspection`,
@@ -227,7 +228,7 @@ class safe_open:
                 fetched from this handle. `None` (the default) loads every
                 tensor whole.
 
-        Raises if the file holds a dtype torch cannot represent (F6), if a
+        Raises if a planned tensor has a dtype torch cannot represent (F6), if a
         slice has a step other than 1, or if a sliced tensor is 0-d.
         """
         pass

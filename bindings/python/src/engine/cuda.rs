@@ -298,8 +298,11 @@ fn find_loaded_cudart() -> Option<CString> {
 }
 
 pub fn api() -> Option<&'static CudaApi> {
-    static API: OnceLock<Option<CudaApi>> = OnceLock::new();
-    API.get_or_init(|| unsafe {
+    static API: OnceLock<CudaApi> = OnceLock::new();
+    if let Some(api) = API.get() {
+        return Some(api);
+    }
+    let api = unsafe {
         let path = find_loaded_cudart()?;
         let h = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
         if h.is_null() {
@@ -311,12 +314,13 @@ pub fn api() -> Option<&'static CudaApi> {
         if p.is_null() {
             return None;
         }
-        Some(CudaApi {
+        CudaApi {
             f,
             err_str: std::mem::transmute::<*mut c_void, GetErrorString>(p),
-        })
-    })
-    .as_ref()
+        }
+    };
+    let _ = API.set(api);
+    API.get()
 }
 
 #[cfg(test)]

@@ -1018,7 +1018,26 @@ impl Open {
                 )));
             };
 
-            let idx = slice.indices(n_rows as isize)?;
+            for attr in ["start", "stop"] {
+                let bound = slice.getattr(attr)?;
+                if bound.is_none() {
+                    continue;
+                }
+                let v: isize = bound.extract().map_err(|_| {
+                    SafetensorError::new_err(format!(
+                        "prefetch plan slice bounds for {name} must be integers or None"
+                    ))
+                })?;
+                // Python would clamp silently; a plan that misses the tensor is a bug
+                if v > n_rows as isize || v < -(n_rows as isize) {
+                    return Err(SafetensorError::new_err(format!(
+                        "prefetch plan slice {attr} {v} for {name} is out of range for {n_rows} rows"
+                    )));
+                }
+            }
+            let idx = slice.indices(n_rows as isize).map_err(|e| {
+                SafetensorError::new_err(format!("invalid prefetch plan slice for {name}: {e}"))
+            })?;
             if idx.step != 1 {
                 return Err(SafetensorError::new_err(format!(
                     "prefetch plan slices must have step 1, got {} for {name}",
@@ -1724,7 +1743,7 @@ impl safe_open {
     ///         fetched from this handle. `None` (the default) loads every
     ///         tensor whole.
     ///
-    /// Raises if the file holds a dtype torch cannot represent (F6), if a
+    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
     /// slice has a step other than 1, or if a sliced tensor is 0-d.
     #[pyo3(signature = (plan=None))]
     pub fn prefetch(&mut self, plan: Option<&PyBound<'_, PyDict>>) -> PyResult<()> {
@@ -1749,7 +1768,7 @@ impl safe_open {
         self.inner()?.keys()
     }
 
-    /// Returns a tensor's header entry.
+    /// Returns a tensor's header entry without reading any data.
     ///
     /// Args:
     ///     name (`str`):
@@ -1757,7 +1776,8 @@ impl safe_open {
     ///
     /// Returns:
     ///     (`TensorMeta`):
-    ///         `dtype`, `shape` and `data_offsets`
+    ///         `dtype` (safetensors name, e.g. `"F32"`), `shape` and `data_offsets`
+    ///         as written in the file header.
     pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
         self.inner()?.get_tensor_meta(name)
     }

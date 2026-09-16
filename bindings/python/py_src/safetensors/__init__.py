@@ -1,6 +1,8 @@
 # Re-export this
 from ._safetensors_rust import (  # noqa: F401
+    PySafeSlice,
     SafetensorError,
+    TensorMeta,
     TensorSpec,
     __version__,
     deserialize,

@@ -179,7 +179,7 @@ class PreadBackendTests(unittest.TestCase):
                 f.prefetch({"fp32_2d": 3})
 
     def test_prefetch_rejects_unsupported_dtype(self):
-        # F6 has no torch dtype: refuse at open, before any device memory moves.
+        # F6 has no torch dtype: refuse at prefetch, before any device memory moves.
         path = os.path.join(self.tempdir.name, "f6.safetensors")
         header = b'{"x":{"dtype":"F6_E2M3","shape":[4],"data_offsets":[0,3]}}'
         with open(path, "wb") as fh:
@@ -315,6 +315,18 @@ class PrefetchCudaTests(unittest.TestCase):
         self.assertLess(
             used, 176 * mib, f"{used / mib:.0f} MiB resident, gap was allocated"
         )
+
+    def test_plan_rejects_out_of_range_rows(self):
+        # Python would clamp slice(0, 10) on 3 rows to 3 rows; a plan is explicit
+        with safe_open(
+            self.path, framework="pt", device="cuda:0", backend="pread"
+        ) as f:
+            with self.assertRaisesRegex(Exception, "out of range"):
+                f.prefetch({"fp32_2d": slice(0, 10)})
+            with self.assertRaisesRegex(Exception, "invalid prefetch plan slice"):
+                f.prefetch({"fp32_2d": slice(0, 3, 0)})
+            f.prefetch({"fp32_2d": slice(-3, 3)})  # in range, negative start allowed
+            self.assertEqual(tuple(f.get_tensor("fp32_2d").shape), (3, 4))
 
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as f:

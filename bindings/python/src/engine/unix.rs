@@ -76,6 +76,7 @@ pub enum LoaderError {
     Closed,
     Cuda(CudaError),
     CudaRuntimeLoad,
+    InvalidDevice(i32),
     Io(std::io::Error),
     WorkerFailed(String),
 }
@@ -92,7 +93,11 @@ impl Display for LoaderError {
             Self::CudaRuntimeLoad => write!(
                 f,
                 "no CUDA runtime is loaded in this process; import a CUDA-enabled \
-                 framework (torch) before opening with prefetch=True"
+                 framework (torch) before calling prefetch()"
+            ),
+            Self::InvalidDevice(d) => write!(
+                f,
+                "device index {d} is out of range (0..{MAX_DEVICES})"
             ),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::WorkerFailed(msg) => f.write_str(msg),
@@ -205,8 +210,9 @@ impl LoadPlan {
         let chunk_size = chunk_size.get();
         let min_allocation_size = min_allocation_size.get();
         assert!(
-            spans.windows(2).all(|w| w[0].end <= w[1].start),
-            "spans must be sorted by start and disjoint"
+            spans.iter().all(|s| s.start <= s.end)
+                && spans.windows(2).all(|w| w[0].end <= w[1].start),
+            "spans must be sorted by start and disjoint, each with start <= end"
         );
 
         let mut allocation_file_ranges: Vec<Range<usize>> = Vec::new();
@@ -375,7 +381,7 @@ impl SlabLease {
     }
 
     fn release(mut self, d: &DeviceGuard<'_>, stream: Stream) -> Result<(), CudaError> {
-        let event = match self.slab.last_copy {
+        let event = match self.slab.last_copy.take() {
             Some((event, device)) if device == d.id() => event,
             Some((event, _)) => {
                 let _ = d.api().event_destroy(event);
@@ -713,6 +719,10 @@ impl Loader {
         spans: Vec<Span>,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
+        if !(0..MAX_DEVICES as i32).contains(&device) {
+            return Err(LoaderError::InvalidDevice(device));
+        }
+        let threads = threads.max(1);
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -728,7 +738,7 @@ impl Loader {
             CHUNK_SIZE,
             MIN_ALLOCATION_SIZE,
         ));
-        let pool = pool(cuda_api)?;
+        let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
             file,
             error: OnceLock::new(),
