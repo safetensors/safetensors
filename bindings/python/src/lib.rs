@@ -753,6 +753,7 @@ impl Open {
                     offset,
                     device_idx as i32,
                     PREFETCH_THREADS,
+                    None,
                 )?)
             } else {
                 None

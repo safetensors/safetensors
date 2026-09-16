@@ -1,49 +1,55 @@
-//! CUDA prefetch engine: load a whole safetensors data section into device
-//! memory in the background and hand tensors out, once each, as they land.
+//! CUDA prefetch engine: load byte spans of a safetensors data section into
+//! device memory in the background and hand tensors out, once each, as they
+//! land.
 //!
-//! Two partitions of the data section that do not nest:
+//! Three nested units, computed once at open from the requested spans
+//! (default: the full data range of every tensor):
 //!
 //! ```text
-//! tensors  |t0 |  t1  |     t2     |  t3  |        t4       | t5 | t6  |
-//! chunks   |   c0   |   c1   |   c2   |   c3   |   c4   |   c5   | c6  |
-//! ranges   |        range 0        |         range 1        |  range 2 |
+//! tensors  |t0 |  t1  |     t2     |  t3  |       t4        | t5 | t6  |
+//! spans    |S0#|..|S1#|S2#|...............|#######S3########|#S4#|#S5##|
+//! allocs   |A0 |  |  A1   |               |       A2        |    A3    |
+//! chunks   |c0 |  |  c1   |               |   c2   |   c3   |   c4   |c|
 //! ```
 //!
-//! - chunks: fixed `CHUNK_SIZE` grid, the unit of movement (one `pread`, one
-//!   slab, one set of copies). `LoadPlan::tensor_chunks` maps a tensor to the
-//!   chunks it needs.
-//! - ranges: `LoadPlan::allocation_ranges`, the unit of residence (one
-//!   `cudaMallocAsync` each). Cut at tensor ends so a tensor never crosses a
-//!   range; every range but the last is >= `MIN_ALLOCATION_SIZE`. A chunk may
-//!   overlap two ranges (c2 and c5 above), hence <= 2 copies per chunk. The
-//!   layout is identity: a tensor's device address is its range base plus
-//!   (file offset - range start), so tensors are views and are never copied
-//!   again.
+//! - spans [`LoadPlan::spans`]: a byte interval lying within one tensor's
+//!   data. The delivery unit: `take` hands out one span as a device view.
+//! - allocation file ranges ([`LoadPlan::allocation_file_ranges`]): the allocation unit, the byte
+//!   interval each device buffer [`Allocation`] covers. Contiguous spans are
+//!   concatenated into one allocation up to the first span end at or past
+//!   [`MIN_ALLOCATION_SIZE`], or up to the end of the contiguous run if that
+//!   comes first: far fewer allocations than one per tensor, without hoarding
+//!   a whole file in a single buffer, which keeps device memory use balanced.
+//! - chunks ([`LoadPlan::chunks`]): slices of at most [`CHUNK_SIZE`] of one allocation.
+//!   The I/O unit: one `pread`, one slab, one `memcpy`, one event.
+//!   `LoadPlan::span_alloc` and `span_chunks` record, per span, the
+//!   `Allocation` it lives in and the chunks that carry its bytes.
 //!
 //! Data flow, per file:
 //!
 //! ```text
 //! worker threads
-//!   c = next_chunk.fetch_add(1)
-//!   lease = SlabPool::acquire()          pinned host slab (process-global
-//!   pread(chunk c) -> lease              pool), reused once the copy that
-//!   memcpyAsync(lease -> device)         last used it completes; <= 2 copies
-//!                                        per chunk on STREAMS[device]
-//!   chunk_completion_events[c] = event   recorded after the copies; 0 while
+//!   c = next_chunk.fetch_add(1)          next entry of LoadPlan::chunks
+//!   lease = SlabPool::acquire()          a pinned host slab from the shared
+//!                                        pool; waits for its previous copy
+//!   pread(chunk c) -> lease              one read per chunk
+//!   memcpyAsync(lease -> device)         one copy per chunk into its Allocation,
+//!                                        on STREAMS[device]
+//!   chunk_completion_events[c] = event   recorded after the copy; 0 while
 //!                                        the chunk is still pending
 //! consumer
-//!   take_tensor(t) / TensorIter::next    wait the events of t's chunks, then
+//!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
 //!     -> CudaBuffer                      a view into Arc<Allocation>, handed
 //!                                        out once (AlreadyDelivered after)
-//!   drop(last view of a range)           free_async on FREE_STREAMS[device],
+//!   drop(last view of an Allocation)     free_async on FREE_STREAMS[device],
 //!                                        fenced on the load stream and the
 //!                                        legacy default stream
 //! ```
 //!
-//! `Loader` owns the worker threads; `LoaderInner` (file, plan, sink, chunk
-//! counter, first error) is shared with them and with `TensorIter`. Closing
+//! [`Loader`] owns the worker threads; [`LoaderInner`] (file, plan, sink, chunk
+//! counter, first error) is shared with them and with [`TensorIter`]. Closing
 //! signals the workers, joins them, then releases the sink: an outstanding
-//! iterator yields `Err(Closed)` once and is exhausted. `CUDA_ACTIVE_SINKS`
+//! iterator yields `Err(Closed)` once and is exhausted. [`CUDA_ACTIVE_SINKS`]
 //! counts live sinks per device so the mempool keeps its memory while any
 //! file is loading and is trimmed when the last one releases.
 
@@ -116,9 +122,9 @@ const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
 /// unless the caller uses an explicit stream context.
 const DEFAULT_STREAM: Stream = std::ptr::null_mut();
 
-/// One `allocation_range` of device memory — the only malloc/free site for
-/// tensor memory. Freed when the sink clears its slot and the last
-/// `CudaBuffer` view is dropped.
+/// One [`LoadPlan::allocation_file_ranges`] entry as device memory, the only
+/// malloc/free site for tensor memory. Freed when the sink clears its slot and
+/// the last [`CudaBuffer`] view is dropped.
 struct Allocation {
     api: &'static CudaApi,
     device: i32,
@@ -147,7 +153,7 @@ impl Allocation {
 }
 
 /// Frees on the per-device free stream once it has waited on the load stream
-/// (our pending copies) and the legacy default stream (consumer reads).
+/// (our pending copies) and the default stream (consumer reads).
 /// Consumers on other streams must sync before dropping their last view;
 /// `__dlpack__(stream=)` negotiation is the planned replacement.
 impl Drop for Allocation {
@@ -166,13 +172,30 @@ impl Drop for Allocation {
     }
 }
 
+/// A byte interval `start..end` within one tensor's data
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub tensor_idx: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Geometry of one load. Every interval here is a byte range within the file's
+/// data section; device addresses never appear in the plan.
 struct LoadPlan {
-    tensor_offsets: Box<[(usize, usize)]>,
-    data_len: usize,
-    allocation_ranges: Box<[Range<usize>]>,
+    spans: Box<[Span]>,
+    /// per span, the [`Allocation`] holding it; `None` for a zero-size span
+    span_alloc: Box<[Option<usize>]>,
+    /// per span, the `chunks` that carry its bytes; empty for a zero-size span
+    span_chunks: Box<[Range<usize>]>,
+    /// in file data section byte interval each [`Allocation`] covers
+    allocation_file_ranges: Box<[Range<usize>]>,
+    /// in file data section byte interval of each chunk: at most [`CHUNK_SIZE`],
+    /// inside one allocation
+    chunks: Box<[Range<usize>]>,
+    /// per chunk, the [`Allocation`] it lands in
+    chunk_alloc: Box<[usize]>,
     in_file_offset: usize,
-    n_chunks: usize,
-    chunk_size: usize,
 }
 
 impl LoadPlan {
@@ -181,68 +204,90 @@ impl LoadPlan {
         in_file_offset: usize,
         chunk_size: NonZeroUsize,
         min_allocation_size: NonZeroUsize,
+        spans: Option<Vec<Span>>,
     ) -> Self {
         let chunk_size = chunk_size.get();
         let min_allocation_size = min_allocation_size.get();
-        let tensor_offsets: Box<[(usize, usize)]> = metadata
-            .tensor_infos()
-            .iter()
-            .map(|info| info.data_offsets)
-            .collect();
-        let data_len = metadata.data_len();
+        let mut spans = spans.unwrap_or_else(|| {
+            metadata
+                .tensor_infos()
+                .iter()
+                .enumerate()
+                .map(|(tensor_idx, info)| Span {
+                    tensor_idx,
+                    start: info.data_offsets.0,
+                    end: info.data_offsets.1,
+                })
+                .collect()
+        });
+        spans.sort_by_key(|s| s.start);
+        assert!(
+            spans.windows(2).all(|w| w[0].end <= w[1].start),
+            "spans overlap"
+        );
 
-        let mut allocation_ranges = Vec::new();
-        let mut alloc_start = 0;
-        for &(_, end) in tensor_offsets.iter() {
-            if end - alloc_start >= min_allocation_size {
-                allocation_ranges.push(alloc_start..end);
-                alloc_start = end;
+        let mut allocation_file_ranges: Vec<Range<usize>> = Vec::new();
+        let mut span_alloc: Vec<Option<usize>> = vec![None; spans.len()];
+        let (mut alloc_start, mut prev_end) = (0, 0);
+        for (i, span) in spans.iter().enumerate() {
+            if span.start == span.end {
+                continue; // no bytes: no range, no chunks
+            }
+            // gap between spans
+            if span.start != prev_end {
+                if prev_end > alloc_start {
+                    allocation_file_ranges.push(alloc_start..prev_end);
+                }
+                alloc_start = span.start;
+            }
+            span_alloc[i] = Some(allocation_file_ranges.len());
+            prev_end = span.end;
+            if prev_end - alloc_start >= min_allocation_size {
+                allocation_file_ranges.push(alloc_start..prev_end);
+                alloc_start = prev_end;
             }
         }
-        if alloc_start < data_len {
-            allocation_ranges.push(alloc_start..data_len);
+        if prev_end > alloc_start {
+            allocation_file_ranges.push(alloc_start..prev_end);
         }
 
-        let n_chunks = data_len.div_ceil(chunk_size);
+        let mut chunks: Vec<Range<usize>> = Vec::new();
+        let mut chunk_alloc: Vec<usize> = Vec::new();
+        let mut first_chunk = Vec::with_capacity(allocation_file_ranges.len());
+        for (alloc_idx, alloc_file_range) in allocation_file_ranges.iter().enumerate() {
+            first_chunk.push(chunks.len());
+            let mut start = alloc_file_range.start;
+            while start < alloc_file_range.end {
+                let end = (start + chunk_size).min(alloc_file_range.end);
+                chunks.push(start..end);
+                chunk_alloc.push(alloc_idx);
+                start = end;
+            }
+        }
+
+        let span_chunks = spans
+            .iter()
+            .zip(&span_alloc)
+            .map(|(span, &alloc_idx)| match alloc_idx {
+                Some(a) => {
+                    let base = allocation_file_ranges[a].start;
+                    let first = first_chunk[a];
+                    first + (span.start - base) / chunk_size
+                        ..first + (span.end - 1 - base) / chunk_size + 1
+                }
+                None => 0..0,
+            })
+            .collect();
 
         Self {
-            tensor_offsets,
-            data_len,
-            allocation_ranges: allocation_ranges.into_boxed_slice(),
+            spans: spans.into_boxed_slice(),
+            span_alloc: span_alloc.into_boxed_slice(),
+            span_chunks,
+            allocation_file_ranges: allocation_file_ranges.into_boxed_slice(),
+            chunks: chunks.into_boxed_slice(),
+            chunk_alloc: chunk_alloc.into_boxed_slice(),
             in_file_offset,
-            n_chunks,
-            chunk_size,
         }
-    }
-
-    fn chunk_len(&self, chunk_idx: usize) -> usize {
-        self.chunk_size
-            .min(self.data_len - chunk_idx * self.chunk_size)
-    }
-
-    fn chunk_file_offset(&self, chunk_idx: usize) -> usize {
-        self.in_file_offset + chunk_idx * self.chunk_size
-    }
-}
-
-impl LoadPlan {
-    fn allocation_at(&self, offset: usize) -> usize {
-        self.allocation_ranges.partition_point(|r| r.end <= offset)
-    }
-
-    fn chunk_allocations(&self, chunk_idx: usize) -> Range<usize> {
-        let start = chunk_idx * self.chunk_size;
-        let end = start + self.chunk_len(chunk_idx);
-        self.allocation_at(start)..self.allocation_at(end - 1) + 1
-    }
-
-    /// Chunk idx list that contain slices of a given tensor
-    fn tensor_chunks(&self, tensor: usize) -> Range<usize> {
-        let (s, e) = &self.tensor_offsets[tensor];
-        if s == e {
-            return 0..0;
-        }
-        (s / self.chunk_size)..((e - 1) / self.chunk_size + 1)
     }
 }
 
@@ -276,26 +321,26 @@ enum Sink {
 }
 
 impl Sink {
+    /// `read(buffer, offset)` fills the chunk's slab from the source
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        len: usize,
-        read: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         match self {
-            Self::Cuda(sink) => sink.load_chunk(chunk_idx, len, read),
+            Self::Cuda(sink) => sink.load_chunk(chunk_idx, read),
         }
     }
 
-    fn wait_ready(&self, tensor: usize) -> Result<(), LoaderError> {
+    fn wait_ready(&self, span: usize) -> Result<(), LoaderError> {
         match self {
-            Self::Cuda(sink) => sink.wait_ready(tensor),
+            Self::Cuda(sink) => sink.wait_ready(span),
         }
     }
 
-    fn take(&self, tensor: usize) -> Result<DeviceBuffer, LoaderError> {
+    fn take(&self, span: usize) -> Result<DeviceBuffer, LoaderError> {
         match self {
-            Self::Cuda(sink) => Ok(DeviceBuffer::Cuda(sink.take(tensor)?)),
+            Self::Cuda(sink) => Ok(DeviceBuffer::Cuda(sink.take(span)?)),
         }
     }
 
@@ -317,9 +362,9 @@ impl Sink {
         }
     }
 
-    fn fully_scheduled(&self, tensor: usize) -> bool {
+    fn fully_scheduled(&self, span: usize) -> bool {
         match self {
-            Self::Cuda(sink) => sink.fully_scheduled(tensor),
+            Self::Cuda(sink) => sink.fully_scheduled(span),
         }
     }
 }
@@ -457,13 +502,13 @@ impl CudaSink {
             device,
             stream,
             pool,
-            allocations: (0..plan.allocation_ranges.len())
+            allocations: (0..plan.allocation_file_ranges.len())
                 .map(|_| Mutex::new(None))
                 .collect(),
-            delivered: (0..plan.tensor_offsets.len())
+            delivered: (0..plan.spans.len())
                 .map(|_| AtomicBool::new(false))
                 .collect(),
-            chunk_completion_events: (0..plan.n_chunks).map(|_| AtomicU64::new(0)).collect(),
+            chunk_completion_events: (0..plan.chunks.len()).map(|_| AtomicU64::new(0)).collect(),
             closed: AtomicBool::new(false),
             released: AtomicBool::new(false),
             plan,
@@ -478,8 +523,8 @@ impl CudaSink {
         if self.closed.load(Ordering::Acquire) {
             return Err(LoaderError::Closed);
         }
-        let range = &self.plan.allocation_ranges[alloc_idx];
-        let alloc = Allocation::new(self.api, self.device, self.stream, range.end - range.start)?;
+        let bytes = &self.plan.allocation_file_ranges[alloc_idx];
+        let alloc = Allocation::new(self.api, self.device, self.stream, bytes.len())?;
         let ptr = alloc.ptr;
         *slot = Some(alloc);
         Ok(ptr)
@@ -488,25 +533,24 @@ impl CudaSink {
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        len: usize,
-        read: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
+        let chunk = self.plan.chunks[chunk_idx].clone();
+        let alloc_idx = self.plan.chunk_alloc[chunk_idx];
         let mut lease = self.pool.acquire(self.api)?;
-        read(lease.mut_slice(len))?;
+        read(
+            lease.mut_slice(chunk.len()),
+            (self.plan.in_file_offset + chunk.start) as u64,
+        )?;
 
-        let chunk_start = chunk_idx * self.plan.chunk_size;
-        for alloc in self.plan.chunk_allocations(chunk_idx) {
-            let range = &self.plan.allocation_ranges[alloc];
-            let dst = self.allocation_ptr(alloc)?;
-            let start = chunk_start.max(range.start);
-            let end = (chunk_start + len).min(range.end);
-            self.api.memcpy_h2d_async(
-                dst + (start - range.start) as u64,
-                unsafe { lease.ptr().add(start - chunk_start) },
-                end - start,
-                self.stream,
-            )?;
-        }
+        let alloc_start = self.plan.allocation_file_ranges[alloc_idx].start;
+        let dst = self.allocation_ptr(alloc_idx)?;
+        self.api.memcpy_h2d_async(
+            dst + (chunk.start - alloc_start) as u64,
+            lease.ptr(),
+            chunk.len(),
+            self.stream,
+        )?;
 
         let e = self.api.with_device(self.device, |d| {
             lease.release(d, self.stream)?;
@@ -522,8 +566,8 @@ impl CudaSink {
         Ok(())
     }
 
-    fn wait_ready(&self, tensor: usize) -> Result<(), LoaderError> {
-        for chunk in self.plan.tensor_chunks(tensor) {
+    fn wait_ready(&self, span: usize) -> Result<(), LoaderError> {
+        for chunk in self.plan.span_chunks[span].clone() {
             let mut i = 0;
             let e = loop {
                 match self.chunk_completion_events[chunk].load(Ordering::Acquire) {
@@ -546,26 +590,26 @@ impl CudaSink {
         Ok(())
     }
 
-    fn take(&self, tensor: usize) -> Result<CudaBuffer, LoaderError> {
-        if self.delivered[tensor].load(Ordering::Acquire) {
+    fn take(&self, span: usize) -> Result<CudaBuffer, LoaderError> {
+        if self.delivered[span].load(Ordering::Acquire) {
             return Err(LoaderError::AlreadyDelivered);
         }
-        let (start, end) = self.plan.tensor_offsets[tensor];
+        let Span { start, end, .. } = self.plan.spans[span];
         let mut buffer = CudaBuffer {
             _alloc: None,
             device: self.device,
             ptr: 0,
             len: end - start,
         };
-        if start != end {
-            let alloc_idx = self.plan.allocation_at(start);
+        if let Some(alloc_idx) = self.plan.span_alloc[span] {
             let Some(alloc) = self.allocations[alloc_idx].lock().unwrap().clone() else {
                 return Err(LoaderError::Closed);
             };
-            buffer.ptr = alloc.ptr + (start - self.plan.allocation_ranges[alloc_idx].start) as u64;
+            buffer.ptr =
+                alloc.ptr + (start - self.plan.allocation_file_ranges[alloc_idx].start) as u64;
             buffer._alloc = Some(alloc);
         }
-        if self.delivered[tensor].swap(true, Ordering::AcqRel) {
+        if self.delivered[span].swap(true, Ordering::AcqRel) {
             return Err(LoaderError::AlreadyDelivered);
         }
         Ok(buffer)
@@ -602,9 +646,9 @@ impl CudaSink {
         self.closed.store(true, Ordering::Release);
     }
 
-    fn fully_scheduled(&self, tensor: usize) -> bool {
-        self.plan
-            .tensor_chunks(tensor)
+    fn fully_scheduled(&self, span: usize) -> bool {
+        self.plan.span_chunks[span]
+            .clone()
             .all(|c| self.chunk_completion_events[c].load(Ordering::Acquire) != 0)
     }
 }
@@ -662,10 +706,10 @@ struct LoaderInner {
 }
 
 impl LoaderInner {
-    fn take_tensor(&self, tensor: usize) -> Result<DeviceBuffer, LoaderError> {
+    fn take_tensor(&self, span: usize) -> Result<DeviceBuffer, LoaderError> {
         self.sink
-            .wait_ready(tensor)
-            .and_then(|()| self.sink.take(tensor))
+            .wait_ready(span)
+            .and_then(|()| self.sink.take(span))
             .map_err(|e| match (e, self.error.get()) {
                 (LoaderError::Closed, Some(err)) => LoaderError::WorkerFailed(err.to_string()),
                 (e, _) => e,
@@ -685,6 +729,7 @@ impl Loader {
         in_file_offset: usize,
         device: i32,
         threads: usize,
+        spans: Option<Vec<Span>>,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
         let plan = Arc::new(LoadPlan::new(
@@ -692,6 +737,7 @@ impl Loader {
             in_file_offset,
             CHUNK_SIZE,
             MIN_ALLOCATION_SIZE,
+            spans,
         ));
         let pool = pool(cuda_api)?;
         let inner = Arc::new(LoaderInner {
@@ -712,8 +758,9 @@ impl Loader {
         Ok(Self { inner, workers })
     }
 
-    pub fn take_tensor(&self, tensor: usize) -> Result<DeviceBuffer, LoaderError> {
-        self.inner.take_tensor(tensor)
+    /// `span` indexes `LoadPlan::spans` (the tensor index for the default spans)
+    pub fn take_tensor(&self, span: usize) -> Result<DeviceBuffer, LoaderError> {
+        self.inner.take_tensor(span)
     }
 
     pub fn close(&mut self) {
@@ -727,7 +774,7 @@ impl Loader {
     pub fn iter(&self) -> TensorIter {
         TensorIter {
             inner: self.inner.clone(),
-            pending: (0..self.inner.plan.tensor_offsets.len()).collect(),
+            pending: (0..self.inner.plan.spans.len()).collect(),
         }
     }
 }
@@ -791,16 +838,12 @@ fn worker(loader: Arc<LoaderInner>) {
             return;
         }
         let chunk_idx = loader.next_chunk.fetch_add(1, Ordering::Relaxed);
-        if chunk_idx >= loader.plan.n_chunks {
+        if chunk_idx >= loader.plan.chunks.len() {
             return;
         }
-        let res = loader
-            .sink
-            .load_chunk(chunk_idx, loader.plan.chunk_len(chunk_idx), |buffer| {
-                loader
-                    .file
-                    .read_exact_at(buffer, loader.plan.chunk_file_offset(chunk_idx) as u64)
-            });
+        let res = loader.sink.load_chunk(chunk_idx, |buffer, offset| {
+            loader.file.read_exact_at(buffer, offset)
+        });
         if let Err(err) = res {
             if !matches!(err, LoaderError::Closed) {
                 let _ = loader.error.set(err);
@@ -820,7 +863,15 @@ mod tests {
         Dtype,
     };
 
-    use super::LoadPlan;
+    use super::{LoadPlan, Span};
+
+    fn sp(tensor_idx: usize, start: usize, end: usize) -> Span {
+        Span {
+            tensor_idx,
+            start,
+            end,
+        }
+    }
 
     fn t(name: &str, start: usize, len: usize) -> (String, TensorInfo) {
         (
@@ -833,126 +884,155 @@ mod tests {
         )
     }
 
-    fn check_plan(plan: &LoadPlan, min_allocation_size: usize) {
-        let mut cursor = 0;
-        for r in plan.allocation_ranges.iter() {
-            assert_eq!(r.start, cursor, "gap/overlap between allocation ranges");
-            assert!(r.end > r.start);
-            cursor = r.end;
+    fn plan(
+        tensors: Vec<(String, TensorInfo)>,
+        chunk_size: usize,
+        min_allocation_size: usize,
+        spans: Option<Vec<Span>>,
+    ) -> LoadPlan {
+        let metadata = Metadata::new(None, tensors).unwrap();
+        let plan = LoadPlan::new(
+            &metadata,
+            0,
+            NonZeroUsize::new(chunk_size).unwrap(),
+            NonZeroUsize::new(min_allocation_size).unwrap(),
+            spans,
+        );
+        check_plan(&plan, chunk_size, min_allocation_size);
+        plan
+    }
+
+    fn check_plan(plan: &LoadPlan, chunk_size: usize, min_allocation_size: usize) {
+        let ranges = &plan.allocation_file_ranges;
+        assert_eq!(plan.spans.len(), plan.span_alloc.len());
+        assert_eq!(plan.spans.len(), plan.span_chunks.len());
+        // spans: sorted, disjoint, each non-empty one inside its allocation
+        for w in plan.spans.windows(2) {
+            assert!(
+                w[0].end <= w[1].start,
+                "spans overlap or are unsorted: {w:?}"
+            );
         }
-        assert_eq!(cursor, plan.data_len);
-        let ends: HashSet<usize> = plan.tensor_offsets.iter().map(|&(_, e)| e).collect();
-        for r in plan.allocation_ranges.iter().rev().skip(1) {
-            assert!(
-                ends.contains(&r.end),
-                "cut at {} is not a tensor end",
-                r.end
-            );
-            assert!(
-                r.end - r.start >= min_allocation_size,
-                "undersized non-tail range {r:?}"
-            );
-            for &(_, t) in plan.tensor_offsets.iter() {
+        for (i, s) in plan.spans.iter().enumerate() {
+            let (alloc, chunks) = (plan.span_alloc[i], &plan.span_chunks[i]);
+            if s.start == s.end {
                 assert!(
-                    !(t > r.start && t < r.end && t - r.start >= min_allocation_size),
-                    "range {r:?} should have been cut earlier, at tensor end {t}"
+                    alloc.is_none() && chunks.is_empty(),
+                    "empty span placed: {s:?}"
                 );
-            }
-        }
-        for &(s, e) in plan.tensor_offsets.iter() {
-            if s == e {
                 continue;
             }
-            let r = &plan.allocation_ranges[plan.allocation_at(s)];
-            assert!(r.start <= s && e <= r.end, "tensor {s}..{e} crosses {r:?}");
+            let r = &ranges[alloc.expect("non-empty span has an allocation")];
+            assert!(
+                r.start <= s.start && s.end <= r.end,
+                "span {s:?} crosses {r:?}"
+            );
         }
-
-        for c in 0..plan.n_chunks {
-            let (chunk_start, chunk_end) =
-                (c * plan.chunk_size, c * plan.chunk_size + plan.chunk_len(c));
-            let got = plan.chunk_allocations(c);
-            for (i, r) in plan.allocation_ranges.iter().enumerate() {
-                assert_eq!(
-                    got.contains(&i),
-                    r.start < chunk_end && chunk_start < r.end,
-                    "chunk {c} vs range {i}"
+        // allocations: sorted, disjoint, bounded by span boundaries, cut at gaps and
+        // at the first span end >= min_allocation_size and nowhere else
+        let starts: HashSet<usize> = plan.spans.iter().map(|s| s.start).collect();
+        let ends: HashSet<usize> = plan.spans.iter().map(|s| s.end).collect();
+        for r in ranges.iter() {
+            assert!(r.end > r.start, "empty range {r:?}");
+            assert!(
+                starts.contains(&r.start) && ends.contains(&r.end),
+                "{r:?} not span-aligned"
+            );
+            for s in plan.spans.iter() {
+                assert!(
+                    !(s.end > r.start && s.end < r.end && s.end - r.start >= min_allocation_size),
+                    "range {r:?} should have been cut at span end {}",
+                    s.end
                 );
             }
-            if min_allocation_size >= plan.chunk_size {
-                assert!(got.len() <= 2, "chunk {c} spans {} allocations", got.len());
+        }
+        for w in ranges.windows(2) {
+            assert!(
+                w[0].end <= w[1].start,
+                "ranges overlap or are unsorted: {w:?}"
+            );
+            if w[0].end == w[1].start {
+                assert!(
+                    w[0].len() >= min_allocation_size,
+                    "undersized cut without a gap: {w:?}"
+                );
             }
-            for (t, &(s, e)) in plan.tensor_offsets.iter().enumerate() {
+        }
+        // chunks: tile every allocation exactly, <= chunk_size, never crossing one
+        let mut c = 0;
+        for (i, r) in ranges.iter().enumerate() {
+            let mut cursor = r.start;
+            while cursor < r.end {
+                let chunk = &plan.chunks[c];
+                assert_eq!(plan.chunk_alloc[c], i);
                 assert_eq!(
-                    plan.tensor_chunks(t).contains(&c),
-                    s != e && s < chunk_end && chunk_start < e,
-                    "tensor {t} vs chunk {c}"
+                    chunk.start, cursor,
+                    "chunk {c} does not continue allocation {i}"
+                );
+                assert!(chunk.len() <= chunk_size && chunk.end <= r.end);
+                cursor = chunk.end;
+                c += 1;
+            }
+        }
+        assert_eq!(c, plan.chunks.len(), "chunks outside every allocation");
+        assert_eq!(plan.chunks.len(), plan.chunk_alloc.len());
+        // a span's chunks == the chunks it intersects
+        for (s, chunks) in plan.spans.iter().zip(plan.span_chunks.iter()) {
+            for (c, chunk) in plan.chunks.iter().enumerate() {
+                assert_eq!(
+                    chunks.contains(&c),
+                    s.start != s.end && s.start < chunk.end && chunk.start < s.end,
+                    "span {s:?} vs chunk {c} {chunk:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn test_plan_allocation_ranges() {
-        let chunk_size = NonZeroUsize::new(5).unwrap();
-        let min_allocation_size = NonZeroUsize::new(12).unwrap();
-        let metadata = Metadata::new(
-            None,
+    fn test_plan_allocations() {
+        let p = plan(
             vec![t("first", 0, 5), t("second", 5, 7), t("third", 12, 6)],
-        )
-        .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-
-        assert_eq!(
-            load_plan.allocation_ranges,
-            vec![0..12, 12..18].into_boxed_slice(),
+            5,
+            12,
+            None,
         );
-        check_plan(&load_plan, 12);
+        assert_eq!(
+            p.allocation_file_ranges,
+            vec![0..12, 12..18].into_boxed_slice()
+        );
     }
 
     #[test]
-    fn test_allocation_ranges_oversized_tensor() {
+    fn test_allocations_oversized_tensor() {
         // floor 8: cut at the first tensor end >= 8 bytes in; the 30-byte
-        // tensor forces a large range; the 3-byte tail stays undersized
-        let chunk_size = NonZeroUsize::new(5).unwrap();
-        let min_allocation_size = NonZeroUsize::new(8).unwrap();
-        let metadata = Metadata::new(
-            None,
+        // tensor forces a large allocation; the 3-byte tail stays undersized
+        let p = plan(
             vec![t("a", 0, 5), t("b", 5, 7), t("big", 12, 30), t("c", 42, 3)],
-        )
-        .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        assert_eq!(
-            load_plan.allocation_ranges,
-            vec![0..12, 12..42, 42..45].into_boxed_slice(),
+            5,
+            8,
+            None,
         );
-        check_plan(&load_plan, 8);
+        assert_eq!(
+            p.allocation_file_ranges,
+            vec![0..12, 12..42, 42..45].into_boxed_slice()
+        );
     }
 
     #[test]
     fn test_chunk_len_exact_multiple_of_chunk_size() {
-        let chunk_size = NonZeroUsize::new(5).unwrap();
-        let min_allocation_size = NonZeroUsize::new(12).unwrap();
-        let metadata = Metadata::new(None, vec![t("first", 0, 10)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        check_plan(&load_plan, 12);
+        let p = plan(vec![t("first", 0, 10)], 5, 12, None);
+        assert_eq!(p.chunks.len(), 2);
     }
 
     #[test]
     fn test_multi_chunk_span() {
-        let chunk_size = NonZeroUsize::new(5).unwrap();
-        let min_allocation_size = NonZeroUsize::new(12).unwrap();
-        let metadata = Metadata::new(None, vec![t("first", 0, 42)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        assert_eq!(load_plan.tensor_chunks(0), 0..9);
-        check_plan(&load_plan, 12);
+        let p = plan(vec![t("first", 0, 42)], 5, 12, None);
+        assert_eq!(p.span_chunks[0], 0..9);
     }
 
     #[test]
     fn test_many_tensors_in_single_chunk() {
-        let chunk_size = NonZeroUsize::new(20).unwrap();
-        let min_allocation_size = NonZeroUsize::new(20).unwrap();
-        let metadata = Metadata::new(
-            None,
+        plan(
             vec![
                 t("a", 0, 1),
                 t("b", 1, 1),
@@ -966,27 +1046,21 @@ mod tests {
                 t("j", 11, 6),
                 t("k", 17, 3),
             ],
-        )
-        .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        check_plan(&load_plan, 20);
+            20,
+            20,
+            None,
+        );
     }
 
     #[test]
     fn test_chunk_size_larger_than_data() {
-        let chunk_size = NonZeroUsize::new(4242).unwrap();
-        let min_allocation_size = NonZeroUsize::new(4242).unwrap();
-        let metadata = Metadata::new(None, vec![t("a", 0, 5), t("b", 5, 3)]).unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        check_plan(&load_plan, 4242);
+        let p = plan(vec![t("a", 0, 5), t("b", 5, 3)], 4242, 4242, None);
+        assert_eq!(p.chunks.len(), 1);
     }
 
     #[test]
     fn test_empty_slices() {
-        let chunk_size = NonZeroUsize::new(5).unwrap();
-        let min_allocation_size = NonZeroUsize::new(5).unwrap();
-        let metadata = Metadata::new(
-            None,
+        plan(
             vec![
                 t("z0", 0, 0),
                 t("a", 0, 5),
@@ -994,9 +1068,94 @@ mod tests {
                 t("b", 5, 3),
                 t("z2", 8, 0),
             ],
-        )
-        .unwrap();
-        let load_plan = LoadPlan::new(&metadata, 0, chunk_size, min_allocation_size);
-        check_plan(&load_plan, 5);
+            5,
+            5,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_spans_with_a_gap() {
+        // spans for a and c only: two allocations, no chunk covers the gap
+        let tensors = vec![t("a", 0, 5), t("b", 5, 7), t("c", 12, 6)];
+        let p = plan(tensors, 5, 12, Some(vec![sp(0, 0, 5), sp(2, 12, 18)]));
+        assert_eq!(
+            p.allocation_file_ranges,
+            vec![0..5, 12..18].into_boxed_slice()
+        );
+        assert_eq!(p.chunks.len(), 3); // 0..5 | 12..17, 17..18
+        assert_eq!(p.span_chunks[0], 0..1);
+        assert_eq!(p.span_chunks[1], 1..3);
+    }
+
+    #[test]
+    fn test_span_inside_one_tensor() {
+        // bytes 14..17 of "big": the only allocation is that sub-span
+        let p = plan(
+            vec![t("a", 0, 5), t("b", 5, 7), t("big", 12, 30)],
+            5,
+            12,
+            Some(vec![sp(2, 14, 17)]),
+        );
+        assert_eq!(p.allocation_file_ranges.len(), 1);
+        assert_eq!(p.allocation_file_ranges[0], 14..17);
+        assert_eq!(p.chunks.len(), 1);
+        assert_eq!(p.span_alloc[0], Some(0));
+    }
+
+    #[test]
+    fn test_adjacent_partial_spans_share_a_range() {
+        // tail of a + head of b are contiguous: one allocation, two spans
+        let p = plan(
+            vec![t("a", 0, 5), t("b", 5, 7)],
+            5,
+            12,
+            Some(vec![sp(0, 3, 5), sp(1, 5, 7)]),
+        );
+        assert_eq!(p.allocation_file_ranges.len(), 1);
+        assert_eq!(p.allocation_file_ranges[0], 3..7);
+        assert_eq!(p.span_alloc[0], p.span_alloc[1]);
+        assert_eq!(p.chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_spans_are_sorted_by_start() {
+        let tensors = vec![t("a", 0, 5), t("b", 5, 7), t("c", 12, 6)];
+        let p = plan(tensors, 5, 12, Some(vec![sp(2, 12, 18), sp(0, 0, 5)]));
+        assert_eq!(
+            p.spans.iter().map(|s| s.tensor_idx).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert_eq!(
+            p.allocation_file_ranges,
+            vec![0..5, 12..18].into_boxed_slice()
+        );
+    }
+
+    #[test]
+    fn test_size_cut_then_gap() {
+        // first run reaches the floor at 12 and is cut there; the uncovered bytes
+        // 12..20 open a new allocation; the tail run is undersized but closed by end
+        let p = plan(
+            vec![
+                t("a", 0, 5),
+                t("b", 5, 7),
+                t("c", 12, 8),
+                t("d", 20, 3),
+                t("e", 23, 4),
+            ],
+            5,
+            12,
+            Some(vec![
+                sp(0, 0, 5),
+                sp(1, 5, 12),
+                sp(3, 20, 23),
+                sp(4, 23, 27),
+            ]),
+        );
+        assert_eq!(
+            p.allocation_file_ranges,
+            vec![0..12, 20..27].into_boxed_slice()
+        );
     }
 }

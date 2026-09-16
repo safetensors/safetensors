@@ -43,6 +43,13 @@ impl Display for LoaderError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub tensor_idx: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
 pub struct Loader;
 
 impl Loader {
@@ -52,6 +59,7 @@ impl Loader {
         _in_file_offset: usize,
         _device: i32,
         _threads: usize,
+        _spans: Option<Vec<Span>>,
     ) -> Result<Self, LoaderError> {
         Err(LoaderError)
     }
