@@ -19,7 +19,6 @@ from safetensors import safe_open
 from safetensors.torch import load_file as load_file_pt
 from safetensors.torch import load_model, save_file, save_model
 
-
 SOURCE_TENSORS = {
     "fp32_2d": torch.arange(12, dtype=torch.float32).reshape(3, 4).contiguous(),
     "bf16_2d": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4).contiguous(),
@@ -151,20 +150,33 @@ class PreadBackendTests(unittest.TestCase):
                 _ = f.get_tensors()
 
     def test_prefetch_requires_pread(self):
-        with self.assertRaisesRegex(Exception, 'backend="pread"'):
-            safe_open(
-                self.path, framework="pt", device="cpu", backend="mmap", prefetch=True
-            )
+        with safe_open(self.path, framework="pt", device="cpu", backend="mmap") as f:
+            with self.assertRaisesRegex(Exception, 'backend="pread"'):
+                f.prefetch()
 
     def test_prefetch_requires_pt(self):
-        with self.assertRaisesRegex(Exception, 'framework="pt"'):
-            safe_open(self.path, framework="numpy", backend="pread", prefetch=True)
+        with safe_open(self.path, framework="numpy", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, 'framework="pt"'):
+                f.prefetch()
 
     def test_prefetch_requires_cuda(self):
-        with self.assertRaisesRegex(Exception, "cuda"):
-            safe_open(
-                self.path, framework="pt", device="cpu", backend="pread", prefetch=True
-            )
+        with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, "cuda"):
+                f.prefetch()
+
+    def test_prefetch_plan_rejects_bad_entries(self):
+        # plan parsing happens before any device work, so these run without a GPU
+        with safe_open(
+            self.path, framework="pt", device="cuda:0", backend="pread"
+        ) as f:
+            with self.assertRaisesRegex(Exception, "does not contain"):
+                f.prefetch({"nope": None})
+            with self.assertRaisesRegex(Exception, "step 1"):
+                f.prefetch({"fp32_2d": slice(0, 3, 2)})
+            with self.assertRaisesRegex(Exception, "0-d"):
+                f.prefetch({"scalar_fp32": slice(0, 1)})
+            with self.assertRaisesRegex(Exception, "None or a slice"):
+                f.prefetch({"fp32_2d": 3})
 
     def test_prefetch_rejects_unsupported_dtype(self):
         # F6 has no torch dtype: refuse at open, before any device memory moves.
@@ -174,10 +186,9 @@ class PreadBackendTests(unittest.TestCase):
             fh.write(struct.pack("<Q", len(header)))
             fh.write(header)
             fh.write(bytes([0, 0, 0]))
-        with self.assertRaisesRegex(Exception, "F6_E2M3"):
-            safe_open(
-                path, framework="pt", device="cuda:0", backend="pread", prefetch=True
-            )
+        with safe_open(path, framework="pt", device="cuda:0", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, "F6_E2M3"):
+                f.prefetch()
 
     def test_get_tensor_meta_matches_header(self):
         with open(self.path, "rb") as fh:
@@ -195,7 +206,7 @@ class PreadBackendTests(unittest.TestCase):
 
     def test_tensor_stream_requires_prefetch(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
-            with self.assertRaisesRegex(Exception, "prefetch=True"):
+            with self.assertRaisesRegex(Exception, "prefetch"):
                 f.tensor_stream()
 
     def test_numpy_framework(self):
@@ -218,7 +229,7 @@ class PreadBackendTests(unittest.TestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
 class PrefetchCudaTests(unittest.TestCase):
-    """`safe_open(..., backend="pread", prefetch=True)`: background load into
+    """`safe_open(..., backend="pread")` + `prefetch()`: background load into
     device memory, tensors handed out once as zero-copy views."""
 
     def setUp(self):
@@ -229,14 +240,118 @@ class PrefetchCudaTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def _open(self, path=None):
-        return safe_open(
-            path or self.path,
-            framework="pt",
-            device="cuda:0",
-            backend="pread",
-            prefetch=True,
+    def _open(self, path=None, plan=None):
+        f = safe_open(
+            path or self.path, framework="pt", device="cuda:0", backend="pread"
         )
+        f.prefetch(plan)
+        return f
+
+    def test_plan_rows_match_source(self):
+        plan = {"fp32_2d": slice(1, 3), "i64_1d": slice(2, 5), "fp16_3d": None}
+        with self._open(plan=plan) as f:
+            self.assertTrue(
+                torch.equal(
+                    f.get_tensor("fp32_2d").cpu(), SOURCE_TENSORS["fp32_2d"][1:3]
+                )
+            )
+            self.assertTrue(
+                torch.equal(f.get_tensor("i64_1d").cpu(), SOURCE_TENSORS["i64_1d"][2:5])
+            )
+            with self.assertRaisesRegex(Exception, "not in the prefetch plan"):
+                f.get_tensor("bf16_2d")
+            streamed = dict(f.tensor_stream())
+        self.assertEqual(set(streamed), {"fp16_3d"})  # the two others were taken
+        self.assertTrue(
+            torch.equal(streamed["fp16_3d"].cpu(), SOURCE_TENSORS["fp16_3d"])
+        )
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two CUDA devices")
+    def test_non_default_device(self):
+        # the engine's threads start on device 0; every copy must still land on cuda:1
+        torch.cuda.set_device(0)
+        with safe_open(
+            self.path, framework="pt", device="cuda:1", backend="pread"
+        ) as f:
+            f.prefetch()
+            first = f.get_tensor("fp32_2d")
+            streamed = dict(f.tensor_stream())
+        streamed["fp32_2d"] = first
+        for t in streamed.values():
+            self.assertEqual(t.device, torch.device("cuda:1"))
+        self._assert_matches_source(streamed)
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two CUDA devices")
+    def test_slabs_move_between_devices(self):
+        # pinned slabs are process-wide; their last-copy events rebind per device
+        for device in ("cuda:0", "cuda:1", "cuda:0"):
+            with safe_open(
+                self.path, framework="pt", device=device, backend="pread"
+            ) as f:
+                f.prefetch()
+                streamed = dict(f.tensor_stream())
+            for t in streamed.values():
+                self.assertEqual(t.device, torch.device(device))
+            self._assert_matches_source(streamed)
+
+    def test_plan_gap_is_not_allocated(self):
+        # a, b, c of 64 MiB each; the plan skips b: the device must hold ~128 MiB, not 192
+        mib = 2**20
+        path = os.path.join(self.tempdir.name, "gap.safetensors")
+        save_file(
+            {k: torch.zeros(16 * mib, dtype=torch.float32) for k in ("a", "b", "c")},
+            path,
+        )
+        torch.cuda.synchronize()
+        free_before, _ = torch.cuda.mem_get_info(0)
+        with safe_open(path, framework="pt", device="cuda:0", backend="pread") as f:
+            f.prefetch({"a": None, "c": None})
+            held = dict(f.tensor_stream())
+            torch.cuda.synchronize()
+            free_after, _ = torch.cuda.mem_get_info(0)
+        self.assertEqual(set(held), {"a", "c"})
+        used = free_before - free_after
+        self.assertGreaterEqual(used, 120 * mib, f"{used / mib:.0f} MiB")
+        self.assertLess(
+            used, 176 * mib, f"{used / mib:.0f} MiB resident, gap was allocated"
+        )
+
+    def test_plan_empty_rows(self):
+        with self._open(plan={"fp32_2d": slice(2, 2)}) as f:
+            t = f.get_tensor("fp32_2d")
+        self.assertEqual(tuple(t.shape), (0, 4))
+        self.assertEqual(t.dtype, torch.float32)
+
+    def test_prefetch_twice_raises(self):
+        with self._open() as f:
+            with self.assertRaisesRegex(Exception, "already called"):
+                f.prefetch()
+
+    def test_slicing_apis_raise_after_prefetch(self):
+        with self._open() as f:
+            with self.assertRaisesRegex(Exception, "get_slice is not available"):
+                f.get_slice("fp32_2d")
+            with self.assertRaisesRegex(Exception, "get_tensors is not available"):
+                f.get_tensors()
+            self.assertEqual(f.get_tensor_meta("fp32_2d").shape, [3, 4])
+
+    @unittest.skipUnless(
+        hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
+    )
+    def test_plan_rows_of_packed_fp4(self):
+        # F4 shape [4, 8] packs two elements per byte: 4 bytes per row
+        path = os.path.join(self.tempdir.name, "fp4.safetensors")
+        header = b'{"x":{"dtype":"F4","shape":[4,8],"data_offsets":[0,16]}}'
+        raw = bytes(range(16))
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(raw)
+        with self._open(path, plan={"x": slice(1, 3)}) as f:
+            x = f.get_tensor("x")
+        self.assertEqual(x.dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(tuple(x.shape), (2, 4))
+        self.assertEqual(x.view(torch.uint8).cpu().flatten().tolist(), list(raw[4:12]))
 
     def _assert_matches_source(self, sd):
         self.assertEqual(set(sd.keys()), set(SOURCE_TENSORS.keys()))

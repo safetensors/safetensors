@@ -2,8 +2,6 @@ use std::fmt::Display;
 use std::fs::File;
 use std::sync::Arc;
 
-use safetensors::tensor::Metadata;
-
 pub enum CudaBuffer {}
 
 impl CudaBuffer {
@@ -45,7 +43,6 @@ impl Display for LoaderError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
-    pub tensor_idx: usize,
     pub start: usize,
     pub end: usize,
 }
@@ -55,16 +52,15 @@ pub struct Loader;
 impl Loader {
     pub fn load(
         _file: Arc<File>,
-        _metadata: &Metadata,
         _in_file_offset: usize,
         _device: i32,
         _threads: usize,
-        _spans: Option<Vec<Span>>,
+        _spans: Vec<Span>,
     ) -> Result<Self, LoaderError> {
         Err(LoaderError)
     }
 
-    pub fn take_tensor(&self, _tensor: usize) -> Result<DeviceBuffer, LoaderError> {
+    pub fn take_tensor(&self, _idx: usize) -> Result<DeviceBuffer, LoaderError> {
         Err(LoaderError)
     }
 
