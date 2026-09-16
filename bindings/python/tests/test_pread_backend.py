@@ -325,6 +325,8 @@ class PrefetchCudaTests(unittest.TestCase):
                 f.prefetch({"fp32_2d": slice(0, 10)})
             with self.assertRaisesRegex(Exception, "invalid prefetch plan slice"):
                 f.prefetch({"fp32_2d": slice(0, 3, 0)})
+            with self.assertRaisesRegex(Exception, "selects no tensors"):
+                f.prefetch({})
             f.prefetch({"fp32_2d": slice(-3, 3)})  # in range, negative start allowed
             self.assertEqual(tuple(f.get_tensor("fp32_2d").shape), (3, 4))
 

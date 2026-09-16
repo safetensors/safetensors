@@ -970,6 +970,9 @@ impl Open {
             });
         }
 
+        if rows_of.is_some() && spans.is_empty() {
+            return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
+        }
         let loader = Loader::load(
             file.clone(),
             self.offset,
