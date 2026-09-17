@@ -118,6 +118,25 @@ class TestCase(unittest.TestCase):
         self.assertEqual(out1[8:].index(b"\x00") + 8, 104)
         self.assertEqual((out1[8:].index(b"\x00") + 8) % 8, 0)
 
+    def test_serialization_preserves_non_c_contiguous_arrays(self):
+        arrays = {
+            "fortran": np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)),
+            "strided": np.arange(30, dtype=np.int64).reshape(5, 6)[:, ::2],
+            "big_endian_fortran": np.asfortranarray(
+                np.arange(12, dtype=">i4").reshape(3, 4)
+            ),
+        }
+
+        from_bytes = load(save(arrays))
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "arrays.safetensors"
+            save_file(arrays, filename)
+            from_file = load_file(filename)
+
+        for name, expected in arrays.items():
+            np.testing.assert_array_equal(from_bytes[name], expected)
+            np.testing.assert_array_equal(from_file[name], expected)
+
     def test_accept_path(self):
         tensors = {
             "a": torch.zeros((2, 2)),
