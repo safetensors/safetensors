@@ -68,7 +68,7 @@ def _filter_shared_not_shared(
                 filtered_tensors.append({name})
             else:
                 filtered_tensors[-1].add(name)
-            last_stop = stop
+            last_stop = max(last_stop, stop)
 
     return filtered_tensors
 
@@ -110,6 +110,8 @@ def _remove_duplicate_names(
     shareds = _find_shared_tensors(state_dict)
     to_remove = defaultdict(list)
     for shared in shareds:
+        if len(shared) < 2:
+            continue
         complete_names = set(
             [name for name in shared if _is_complete(state_dict[name])]
         )
