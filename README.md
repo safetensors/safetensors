@@ -102,6 +102,10 @@ Notes:
    moment.
  - Order: 'C' or row-major.
  - Notes: Some smaller than 1 byte dtypes appeared, which make alignment tricky. Non traditional APIs might be required for those.
+ - `U3` stores unsigned integers in `0..=7` as one continuous three-bit
+   MSB-first stream. Its byte length is `ceil(3 * product(shape) / 8)`. Only
+   the final byte may be partial, and its unused least-significant bits MUST
+   be zero.
 
 
 ### Yet another format ?
