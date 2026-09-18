@@ -268,7 +268,7 @@ class PrefetchCudaTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two CUDA devices")
     def test_non_default_device(self):
-        # the engine's threads start on device 0; every copy must still land on cuda:1
+        # the calling thread stays on device 0; every copy must still land on cuda:1
         torch.cuda.set_device(0)
         with safe_open(
             self.path, framework="pt", device="cuda:1", backend="pread"
@@ -329,6 +329,37 @@ class PrefetchCudaTests(unittest.TestCase):
                 f.prefetch({})
             f.prefetch({"fp32_2d": slice(-3, 3)})  # in range, negative start allowed
             self.assertEqual(tuple(f.get_tensor("fp32_2d").shape), (3, 4))
+
+    def test_delivered_allocations_are_released_before_close(self):
+        # a handle kept open must not pin shards whose tensors were all handed out and dropped:
+        # loading the same 192 MiB file twice with both handles open costs about one file
+        mib = 2**20
+        path = os.path.join(self.tempdir.name, "twice.safetensors")
+        save_file(
+            {k: torch.zeros(16 * mib, dtype=torch.float32) for k in ("a", "b", "c")},
+            path,
+        )
+        torch.cuda.synchronize()
+        free_before, _ = torch.cuda.mem_get_info(0)
+        handles = []
+        for _ in range(2):
+            f = safe_open(path, framework="pt", device="cuda:0", backend="pread")
+            f.prefetch()
+            handles.append(f)
+            tensors = dict(f.tensor_stream())
+            self.assertEqual(set(tensors), {"a", "b", "c"})
+            del tensors
+            torch.cuda.synchronize()  # the frees are issued at drop; let them complete
+        free_after, _ = torch.cuda.mem_get_info(0)
+        for f in handles:
+            f.__exit__(None, None, None)
+        used = free_before - free_after
+        self.assertGreaterEqual(
+            used, 150 * mib, f"{used / mib:.0f} MiB: nothing stayed resident"
+        )
+        self.assertLess(
+            used, 300 * mib, f"{used / mib:.0f} MiB resident with both handles open"
+        )
 
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as f:

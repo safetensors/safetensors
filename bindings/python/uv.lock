@@ -3071,7 +3071,7 @@ requires-dist = [
     { name = "tensorflow", marker = "extra == 'pinned-tf'", specifier = "==2.18.0" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = ">=2.11.0" },
     { name = "tf-nightly", marker = "extra == 'tf-nightly'" },
-    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.4" },
+    { name = "torch", marker = "extra == 'torch'", specifier = ">=2.5" },
 ]
 provides-extras = ["all", "convert", "dev", "jax", "mlx", "numpy", "paddlepaddle", "pinned-tf", "quality", "tensorflow", "testing", "tf-nightly", "torch"]
 

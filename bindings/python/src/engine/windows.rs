@@ -16,6 +16,10 @@ impl CudaBuffer {
     pub(crate) fn device(&self) -> i32 {
         match *self {}
     }
+
+    pub(crate) fn consumed_on(&self, _stream: u64) {
+        match *self {}
+    }
 }
 
 pub enum DeviceBuffer {
