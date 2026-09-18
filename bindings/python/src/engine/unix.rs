@@ -41,6 +41,8 @@
 //!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
 //!     -> CudaBuffer                      a view into Arc<Allocation>, handed
 //!                                        out once (AlreadyDelivered after)
+//!   take of the last span of an Allocation  the sink drops its reference: the
+//!                                        consumer's views now own the memory
 //!   drop(last view of an Allocation)     free_async on FREE_STREAMS[device],
 //!                                        fenced on the load stream and the
 //!                                        legacy default stream
@@ -133,6 +135,9 @@ struct Allocation {
     device: i32,
     stream: Stream,
     ptr: u64,
+    /// streams consumers were on when a view was handed out (see
+    /// [`CudaBuffer::consumed_on`]); the free waits for them as well
+    consumer_streams: Mutex<Vec<u64>>,
 }
 
 unsafe impl Send for Allocation {}
@@ -151,19 +156,24 @@ impl Allocation {
             device,
             stream,
             ptr,
+            consumer_streams: Mutex::new(Vec::new()),
         }))
     }
 }
 
 /// Frees on the per-device free stream once it has waited on the load stream
-/// (our pending copies) and the default stream (consumer reads).
-/// Consumers on other streams must sync before dropping their last view;
-/// `__dlpack__(stream=)` negotiation is the planned replacement.
+/// (our pending copies), the legacy default stream and every stream a view was
+/// handed out on (the consumer's current stream at that time). A consumer that
+/// reads on yet another stream must sync before dropping its last view.
 impl Drop for Allocation {
     fn drop(&mut self) {
         let free = free_stream(self.api, self.device).unwrap_or(self.stream);
+        let consumers = std::mem::take(&mut *self.consumer_streams.lock().unwrap());
         let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
-            for stream in [self.stream, DEFAULT_STREAM] {
+            let fenced = [self.stream, DEFAULT_STREAM]
+                .into_iter()
+                .chain(consumers.into_iter().map(|s| s as Stream));
+            for stream in fenced {
                 if let Ok(e) = d.event_create() {
                     let _ = self.api.event_record(e, stream);
                     let _ = self.api.stream_wait_event(free, e);
@@ -298,6 +308,21 @@ impl CudaBuffer {
 
     pub(crate) fn device(&self) -> i32 {
         self.device
+    }
+
+    /// Records the stream the consumer is about to use this view on (its
+    /// current stream at hand-out), so the allocation's free waits for that
+    /// stream too. `0` is the legacy default stream, always fenced.
+    pub(crate) fn consumed_on(&self, stream: u64) {
+        if stream == 0 {
+            return;
+        }
+        if let Some(alloc) = &self._alloc {
+            let mut streams = alloc.consumer_streams.lock().unwrap();
+            if !streams.contains(&stream) {
+                streams.push(stream);
+            }
+        }
     }
 }
 
@@ -466,6 +491,9 @@ struct CudaSink {
     pool: &'static SlabPool,
     plan: Arc<LoadPlan>,
     allocations: Box<[Mutex<Option<Arc<Allocation>>>]>,
+    /// spans not yet taken; at zero the sink drops its own
+    /// reference so the memory lives exactly as long as the consumer's views
+    in_alloc_pending: Box<[AtomicUsize]>,
     delivered: Box<[AtomicBool]>,
     chunk_completion_events: Box<[AtomicU64]>,
     closed: AtomicBool,
@@ -494,6 +522,13 @@ impl CudaSink {
             allocations: (0..plan.allocation_file_ranges.len())
                 .map(|_| Mutex::new(None))
                 .collect(),
+            in_alloc_pending: {
+                let mut n = vec![0usize; plan.allocation_file_ranges.len()];
+                for &a in plan.span_alloc.iter().flatten() {
+                    n[a] += 1;
+                }
+                n.into_iter().map(AtomicUsize::new).collect()
+            },
             delivered: (0..plan.spans.len())
                 .map(|_| AtomicBool::new(false))
                 .collect(),
@@ -591,7 +626,11 @@ impl CudaSink {
         };
         if let Some(alloc_idx) = self.plan.span_alloc[idx] {
             let Some(alloc) = self.allocations[alloc_idx].lock().unwrap().clone() else {
-                return Err(LoaderError::Closed);
+                return Err(if self.delivered[idx].load(Ordering::Acquire) {
+                    LoaderError::AlreadyDelivered
+                } else {
+                    LoaderError::Closed
+                });
             };
             buffer.ptr =
                 alloc.ptr + (start - self.plan.allocation_file_ranges[alloc_idx].start) as u64;
@@ -599,6 +638,11 @@ impl CudaSink {
         }
         if self.delivered[idx].swap(true, Ordering::AcqRel) {
             return Err(LoaderError::AlreadyDelivered);
+        }
+        if let Some(alloc_idx) = self.plan.span_alloc[idx] {
+            if self.in_alloc_pending[alloc_idx].fetch_sub(1, Ordering::AcqRel) == 1 {
+                *self.allocations[alloc_idx].lock().unwrap() = None;
+            }
         }
         Ok(buffer)
     }
@@ -750,7 +794,10 @@ impl Loader {
             .map(|_| {
                 std::thread::spawn({
                     let inner = inner.clone();
-                    || worker(inner)
+                    move || {
+                        let _ = cuda_api.set_device(device);
+                        worker(inner)
+                    }
                 })
             })
             .collect();

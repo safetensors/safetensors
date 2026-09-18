@@ -2489,6 +2489,12 @@ fn cuda_tensor_from_buffer(
     if buffer.len() == 0 {
         return torch_empty_cuda(py, torch, dtype, &storage_shape, buffer.device());
     }
+
+    let stream: u64 = torch
+        .getattr(intern!(py, "_C"))?
+        .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (buffer.device(),))?
+        .extract()?;
+    buffer.consumed_on(stream);
     let device = dlpack::cuda_device(buffer.device());
     // Tensors are views at their packed file offset inside a shared allocation,
     // which may be misaligned for the element type: stage through a flat uint8
