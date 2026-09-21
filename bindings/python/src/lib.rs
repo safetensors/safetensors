@@ -666,9 +666,13 @@ impl Open {
         backend: Backend,
     ) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|e| match e.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                PyPermissionError::new_err(format!("Permission denied: {}", filename.display()))
-            }
+            // Passing (errno, strerror, filename) sets `.errno` and `.filename` on the
+            // exception. EACCES is 13 on Linux, macOS and the Windows CRT alike.
+            std::io::ErrorKind::PermissionDenied => PyPermissionError::new_err((
+                13,
+                "Permission denied",
+                filename.display().to_string(),
+            )),
             std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
                 filename.display()
