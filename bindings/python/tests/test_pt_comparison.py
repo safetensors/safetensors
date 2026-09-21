@@ -181,6 +181,28 @@ class TorchTestCase(unittest.TestCase):
         # TODO RuntimeError: "eq_cpu" not implemented for 'Float4_e2m1fn_x2'
         # self.assertEqual(reloaded["test2"], test2)
 
+    def test_get_slice_fp4(self):
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            return  # torch.float4_e2m1fn_x2 requires 2.8
+
+        data = {
+            "test": torch.empty((2, 4), device="cpu", dtype=torch.float4_e2m1fn_x2),
+        }
+        local = "./tests/data/out_safe_pt_mmap_fp4_slice.safetensors"
+
+        save_file(data, local)
+        with safe_open(local, framework="pt", device="cpu") as f:
+            tensor_slice = f.get_slice("test")
+            self.assertEqual(tensor_slice.get_dtype(), "F4")
+            self.assertEqual(tensor_slice.get_shape(), [2, 8])
+
+            reloaded = tensor_slice[:]
+            self.assertEqual(reloaded.dtype, torch.float4_e2m1fn_x2)
+            self.assertEqual(tuple(reloaded.shape), (2, 4))
+            self.assertTrue(reloaded.view(torch.uint8).equal(data["test"].view(torch.uint8)))
+            with self.assertRaisesRegex(Exception, "last dimension"):
+                tensor_slice[:, :2]
+
     def test_zero_sized(self):
         data = {
             "test": torch.zeros((2, 0), dtype=torch.float),
