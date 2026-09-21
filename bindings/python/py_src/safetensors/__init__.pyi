@@ -215,8 +215,9 @@ class safe_open:
         Requires `framework="pt"`, `backend="pread"` and a CUDA `device`, and
         may be called once per handle. Afterwards `get_tensor` hands each
         tensor out exactly once as a zero-copy view of device memory and
-        `tensor_stream()` yields them as they land. Memory is held until the
-        handle is closed, so consume inside the `with` block. Each open file
+        `tensor_stream()` yields them as they land. An allocation's memory is
+        freed once every tensor in it has been taken and dropped; allocations
+        with untaken tensors are held until the handle is closed. Each open file
         runs 8 reader threads; all files share one process-wide 512 MiB pinned
         staging pool.
 

@@ -268,7 +268,7 @@ class PrefetchCudaTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two CUDA devices")
     def test_non_default_device(self):
-        # the calling thread stays on device 0; every copy must still land on cuda:1
+        # the calling thread is on device 0 at the call; every copy must still land on cuda:1
         torch.cuda.set_device(0)
         with safe_open(
             self.path, framework="pt", device="cuda:1", backend="pread"

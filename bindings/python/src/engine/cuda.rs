@@ -1,5 +1,5 @@
 use std::{
-    ffi::{c_char, c_int, c_uint, c_void, CStr, CString},
+    ffi::{c_char, c_int, c_uint, c_ulonglong, c_void, CStr, CString},
     sync::OnceLock,
 };
 
@@ -72,18 +72,13 @@ impl std::fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 type CtxGetCurrent = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
-type PrimaryCtxGetState = unsafe extern "C" fn(c_int, *mut libc::c_uint, *mut c_int) -> c_int;
+type PrimaryCtxGetState = unsafe extern "C" fn(c_int, *mut c_uint, *mut c_int) -> c_int;
 // cudaGetDriverEntryPointByVersion (CUDA >= 12.5; the only form left in 13) and
 // cudaGetDriverEntryPoint (11.3 .. 12.x): resolve a driver symbol through the runtime
-type EntryPointByVersion = unsafe extern "C" fn(
-    *const c_char,
-    *mut *mut c_void,
-    libc::c_uint,
-    libc::c_ulonglong,
-    *mut c_int,
-) -> Err;
+type EntryPointByVersion =
+    unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_uint, c_ulonglong, *mut c_int) -> Err;
 type EntryPoint =
-    unsafe extern "C" fn(*const c_char, *mut *mut c_void, libc::c_ulonglong, *mut c_int) -> Err;
+    unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_ulonglong, *mut c_int) -> Err;
 
 pub struct CudaApi {
     f: Fns,
@@ -363,7 +358,7 @@ pub fn api() -> Option<&'static CudaApi> {
             let by_version = CString::new("cudaGetDriverEntryPointByVersion").unwrap();
             let p = libc::dlsym(h, by_version.as_ptr());
             if !p.is_null() {
-                // 12000: the ABI version of the symbol; both of ours have one
+                // 12000: the CUDA 12.0 ABI; neither symbol has a newer revision
                 let get = std::mem::transmute::<*mut c_void, EntryPointByVersion>(p);
                 if get(name.as_ptr(), &mut ptr, 12000, 0, std::ptr::null_mut()) != 0 {
                     ptr = std::ptr::null_mut();

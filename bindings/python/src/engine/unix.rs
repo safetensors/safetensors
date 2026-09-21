@@ -43,9 +43,12 @@
 //!                                        out once (AlreadyDelivered after)
 //!   take of the last span of an Allocation  the sink drops its reference: the
 //!                                        consumer's views now own the memory
+//!                                        (partly taken allocations are held
+//!                                        until close)
 //!   drop(last view of an Allocation)     free_async on FREE_STREAMS[device],
-//!                                        fenced on the load stream and the
-//!                                        legacy default stream
+//!                                        fenced on the load stream, the legacy
+//!                                        default stream and the streams the
+//!                                        views were handed out on
 //! ```
 //!
 //! [`Loader`] owns the worker threads; [`LoaderInner`] (file, plan, sink, chunk
