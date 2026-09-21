@@ -345,7 +345,11 @@ pub fn slice_byte_ranges(
     let mut newshape = Vec::with_capacity(n_shape);
 
     // Minimum span is the span of 1 item;
-    let mut span = dtype.bitsize();
+    // Bit-level quantities are kept in u64 so they cannot wrap on 32-bit
+    // targets. The byte offsets converted back below are bounded by the
+    // tensor's total byte size, which `TensorView::new`/`Metadata::validate`
+    // already proved fits usize, so the conversions cannot truncate.
+    let mut span = dtype.bitsize() as u64;
     let mut indices: Vec<(usize, usize)> = vec![];
     // Everything is row major.
     for (i, &dim) in shape.iter().enumerate().rev() {
@@ -380,32 +384,35 @@ pub fn slice_byte_ranges(
                 if step == 1 && start == 0 && stop == dim {
                     // Full range, nothing sliced yet; just grow the span.
                 } else if step == 1 {
-                    if start * span % 8 != 0 {
+                    if start as u64 * span % 8 != 0 {
                         return Err(InvalidSlice::MisalignedSlice);
                     }
-                    let offset = (start * span) / 8;
-                    if stop * span % 8 != 0 {
+                    let offset = (start as u64 * span / 8) as usize;
+                    if stop as u64 * span % 8 != 0 {
                         return Err(InvalidSlice::MisalignedSlice);
                     }
-                    let small_span = (stop * span) / 8 - offset;
+                    let small_span = (stop as u64 * span / 8) as usize - offset;
                     indices.push((offset, offset + small_span));
                 } else {
                     // Strided innermost dim: each kept element is its own run.
                     for n in (start..stop).step_by(step) {
-                        if n * span % 8 != 0 || (n + 1) * span % 8 != 0 {
+                        if n as u64 * span % 8 != 0 || (n as u64 + 1) * span % 8 != 0 {
                             return Err(InvalidSlice::MisalignedSlice);
                         }
-                        indices.push(((n * span) / 8, ((n + 1) * span) / 8));
+                        indices.push((
+                            (n as u64 * span / 8) as usize,
+                            ((n as u64 + 1) * span / 8) as usize,
+                        ));
                     }
                 }
             } else {
                 let capacity = (stop - start).div_ceil(step) * indices.len();
                 let mut newindices = Vec::with_capacity(capacity);
                 for n in (start..stop).step_by(step) {
-                    if n * span % 8 != 0 {
+                    if n as u64 * span % 8 != 0 {
                         return Err(InvalidSlice::MisalignedSlice);
                     }
-                    let offset = (n * span) / 8;
+                    let offset = (n as u64 * span / 8) as usize;
                     for (old_start, old_stop) in &indices {
                         newindices.push((old_start + offset, old_stop + offset));
                     }
@@ -413,7 +420,7 @@ pub fn slice_byte_ranges(
                 indices = newindices;
             }
         }
-        span *= dim;
+        span *= dim as u64;
     }
     if indices.is_empty() {
         // Empty `slices` (or all unbounded full-range slices): no slicing
@@ -423,7 +430,7 @@ pub fn slice_byte_ranges(
         if total_bits % 8 != 0 {
             return Err(InvalidSlice::MisalignedSlice);
         }
-        indices.push((0, total_bits / 8));
+        indices.push((0, (total_bits / 8) as usize));
     }
     let newshape = newshape.into_iter().rev().collect();
     Ok((indices, newshape))
@@ -445,6 +452,25 @@ impl<'data> Iterator for SliceIterator<'data> {
 mod tests {
     use super::*;
     use crate::tensor::{Dtype, TensorView};
+
+    #[test]
+    fn test_slice_byte_ranges_large_tensor() {
+        // 196_761_600 F32 elements is ~6.3e9 bits, more than a 32-bit usize
+        // holds; the byte offsets all fit. The bit-level intermediates must
+        // not wrap on 32-bit targets.
+        let (ranges, newshape) = slice_byte_ranges(
+            Dtype::F32,
+            &[196_761_600],
+            &[TensorIndexer::Narrow(
+                Bound::Included(196_000_000),
+                Bound::Excluded(196_000_004),
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+        assert_eq!(ranges, vec![(784_000_000, 784_000_016)]);
+        assert_eq!(newshape, vec![4]);
+    }
 
     #[test]
     fn test_helpers() {
