@@ -91,7 +91,7 @@ impl Display for LoaderError {
         match self {
             Self::AlreadyDelivered => write!(
                 f,
-                "tensor already delivered (prefetch hands each tensor out once, via get_tensor or tensor_stream)"
+                "tensor already delivered (prefetch hands each tensor out once, via take or iteration)"
             ),
             Self::Closed => write!(f, "prefetch loader closed"),
             Self::Cuda(e) => write!(f, "{e}"),

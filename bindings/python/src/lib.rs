@@ -665,6 +665,10 @@ struct SpanMeta {
 /// by iterating, as a zero-copy view of device memory. An allocation's memory is
 /// freed once every tensor in it has been taken and dropped; allocations with
 /// untaken tensors are held until the loader is closed.
+///
+/// Tensors are ready on any stream when handed out. The free is fenced on the
+/// CUDA stream that was current at hand-out; a consumer that reads a tensor on
+/// another stream must synchronize it before dropping the last reference.
 #[pyclass]
 pub struct PrefetchLoader {
     loader: Loader,
@@ -726,16 +730,22 @@ impl PrefetchLoader {
 
     /// Stops the background load and releases every tensor not taken yet.
     /// Tensors already handed out keep their memory.
-    pub fn close(&mut self) {
-        self.loader.close();
+    pub fn close(&mut self, py: Python<'_>) {
+        py.detach(|| self.loader.close());
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
-        self.close();
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Py<PyAny>,
+        _exc_value: Py<PyAny>,
+        _traceback: Py<PyAny>,
+    ) {
+        self.close(py);
     }
 }
 
@@ -959,13 +969,15 @@ impl Open {
         }
 
         let device = device.unwrap_or_else(|| self.device.clone());
-        let Device::Cuda(device_idx) = device else {
-            return Err(SafetensorError::new_err(format!(
-                "prefetch loads to cuda devices, not {device}"
-            )));
+        let device_idx = match device {
+            // a bare index is torch's spelling of `cuda:N`; prefetch has no other device kind
+            Device::Cuda(index) | Device::Anonymous(index) => index as i32,
+            other => {
+                return Err(SafetensorError::new_err(format!(
+                    "prefetch loads to cuda devices, not {other}"
+                )))
+            }
         };
-
-        let device_idx = device_idx as i32;
         let rows_of = match plan {
             Some(plan) => Some(self.parse_plan(plan)?),
             None => None,
@@ -1864,30 +1876,6 @@ impl safe_open {
     pub fn get_slice(&self, name: &str) -> PyResult<PySafeSlice> {
         self.inner()?.get_slice(name)
     }
-
-    /// Iterates over every tensor as `(name, tensor)` while the file loads.
-    ///
-    /// Requires `prefetch()` to have been called. Tensors are yielded as soon as
-    /// their bytes are on the device, so the order is unspecified.
-    /// Each tensor is delivered once: names already taken with `get_tensor`
-    /// are skipped. Iterate inside the `with` block — after the file is
-    /// closed the next step raises.
-    ///
-    /// Returned tensors are ready on any stream. If you consume them on a
-    /// non-default CUDA stream, synchronize it before dropping your last
-    /// reference to a tensor.
-    ///
-    /// Returns:
-    ///     (`Iterator[Tuple[str, Tensor]]`)
-    ///
-    /// Example:
-    /// ```python
-    /// from safetensors import safe_open
-    ///
-    /// with safe_open("model.safetensors", framework="pt") as f:
-    ///     for name, tensor in f.prefetch(device=0):
-    ///         ...
-    /// ```
 
     /// Start the context manager
     pub fn __enter__(slf: Py<Self>) -> Py<Self> {

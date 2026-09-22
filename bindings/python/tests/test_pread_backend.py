@@ -205,9 +205,15 @@ class PreadBackendTests(unittest.TestCase):
                 f.get_tensor_meta("nope")
 
     def test_prefetch_device_overrides_the_handle(self):
-        with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
+        # the device check runs before any CUDA call: a cuda handle asked to load to cpu must refuse
+        with safe_open(
+            self.path, framework="pt", device="cuda:0", backend="pread"
+        ) as f:
             with self.assertRaisesRegex(Exception, "cuda devices, not cpu"):
                 f.prefetch(device="cpu")
+
+    def test_prefetch_loader_is_exported(self):
+        from safetensors import PrefetchLoader  # noqa: F401
 
     def test_numpy_framework(self):
         np_path = os.path.join(self.tempdir.name, "np.safetensors")
@@ -408,6 +414,36 @@ class PrefetchCudaTests(unittest.TestCase):
             device="cuda:0"
         )  # handle collected at once
         self._assert_matches_source(dict(loader))
+
+    def test_int_device(self):
+        # torch spells cuda:N as a bare N, on the handle and on the call
+        with safe_open(self.path, framework="pt", device=0) as f:
+            with f.prefetch() as loader:
+                self._assert_matches_source(dict(loader))
+        with safe_open(self.path, framework="pt") as f:
+            with f.prefetch(device=0) as loader:
+                self._assert_matches_source(dict(loader))
+
+    def test_names_len_and_repeated_iteration(self):
+        with self._open() as loader:
+            self.assertEqual(loader.names(), self.handle.offset_keys())  # file order
+            self.assertEqual(len(loader), len(SOURCE_TENSORS))
+            first = dict(loader)
+            second = dict(loader)  # a second pass finds nothing left
+        self.assertEqual(set(first), set(SOURCE_TENSORS))
+        self.assertEqual(second, {})
+
+    def test_take_after_close_raises(self):
+        loader = self._open()
+        loader.close()
+        with self.assertRaisesRegex(Exception, "closed"):
+            loader.take("fp32_2d")
+
+    def test_prefetch_on_closed_handle_raises(self):
+        f = safe_open(self.path, framework="pt")
+        f.__exit__(None, None, None)
+        with self.assertRaisesRegex(Exception, "closed"):
+            f.prefetch(device="cuda:0")
 
     def test_threads(self):
         with self._open(threads=2) as loader:
