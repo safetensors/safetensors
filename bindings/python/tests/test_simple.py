@@ -372,6 +372,17 @@ class ReadmeTestCase(unittest.TestCase):
                 tensor = slice_[[0, 1]]
             self.assertEqual(str(cm.exception), "Non empty lists are not implemented")
 
+            # Regression test: a slice whose start is after its stop (both
+            # still within bounds) must be rejected cleanly rather than
+            # underflowing the byte-offset arithmetic.
+            with self.assertRaises(SafetensorError) as cm:
+                tensor = slice_[3:1]
+            self.assertEqual(
+                str(cm.exception),
+                "Error during slicing [3:1] with shape [10, 5]: "
+                "index 3 out of bounds for tensor dimension #0 of size 10",
+            )
+
             with self.assertRaises(SafetensorError) as cm:
                 tensor = slice_[2:, 20]
             self.assertEqual(

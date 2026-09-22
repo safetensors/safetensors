@@ -361,8 +361,12 @@ pub fn slice_byte_ranges(
                     (start, stop, step.get())
                 }
             };
-            if start >= dim || stop > dim {
-                let asked = if start >= dim {
+            if start >= dim || stop > dim || start > stop {
+                // `start > stop` (both otherwise in-bounds) falls through to
+                // the byte-offset arithmetic below unless caught here: the
+                // `step == 1` fast path computes `stop * span / 8 - offset`,
+                // which underflows `usize` instead of erroring.
+                let asked = if start >= dim || start > stop {
                     start
                 } else {
                     stop.saturating_sub(1)
@@ -759,6 +763,36 @@ mod tests {
                 ],
             ),
             Err(InvalidSlice::TooManySlices)
+        );
+    }
+
+    #[test]
+    fn test_start_after_stop() {
+        // Regression test: `start > stop` with *both* still `< dim` (so
+        // neither previously passed a `>= dim`/`> dim` check) used to fall
+        // through to the byte-offset arithmetic and underflow `usize`
+        // instead of being rejected up front.
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let attn_0 = TensorView::new(Dtype::F32, vec![5], &data).unwrap();
+
+        assert_eq!(
+            SliceIterator::new(
+                &attn_0,
+                &[TensorIndexer::Narrow(
+                    Bound::Included(3),
+                    Bound::Excluded(1),
+                    NonZeroUsize::MIN,
+                )],
+            ),
+            Err(InvalidSlice::SliceOutOfRange {
+                asked: 3,
+                dim_index: 0,
+                dim_size: 5,
+            })
         );
     }
 }
