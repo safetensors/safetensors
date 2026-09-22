@@ -970,7 +970,6 @@ impl Open {
 
         let device = device.unwrap_or_else(|| self.device.clone());
         let device_idx = match device {
-            // a bare index is torch's spelling of `cuda:N`; prefetch has no other device kind
             Device::Cuda(index) | Device::Anonymous(index) => index as i32,
             other => {
                 return Err(SafetensorError::new_err(format!(
