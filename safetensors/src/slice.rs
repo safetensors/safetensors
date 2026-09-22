@@ -347,6 +347,13 @@ pub fn slice_byte_ranges(
     // Minimum span is the span of 1 item;
     let mut span = dtype.bitsize();
     let mut indices: Vec<(usize, usize)> = vec![];
+    // Set when an explicit slice selects zero elements. Such a slice can
+    // leave `indices` empty — the strided branch below iterates
+    // `(start..stop).step_by(step)`, which pushes nothing when the range is
+    // empty — which is indistinguishable from "no slicing happened yet",
+    // and a later dimension can refill `indices` on top of it. Either way
+    // the result must be empty, so record it and settle it once at the end.
+    let mut empty_selection = false;
     // Everything is row major.
     for (i, &dim) in shape.iter().enumerate().rev() {
         if i >= slices.len() {
@@ -375,6 +382,9 @@ pub fn slice_byte_ranges(
             }
             if !matches!(slice, TensorIndexer::Select(_)) {
                 newshape.push((stop - start).div_ceil(step));
+            }
+            if start == stop {
+                empty_selection = true;
             }
             if indices.is_empty() {
                 if step == 1 && start == 0 && stop == dim {
@@ -415,7 +425,12 @@ pub fn slice_byte_ranges(
         }
         span *= dim;
     }
-    if indices.is_empty() {
+    if empty_selection {
+        // Some dimension selected zero elements, so `newshape` has a zero in
+        // it and the result is empty no matter what the other dimensions
+        // contributed.
+        indices.clear();
+    } else if indices.is_empty() {
         // Empty `slices` (or all unbounded full-range slices): no slicing
         // happened, the whole tensor is the result. `span` ended as
         // bitsize * product(shape).
@@ -760,5 +775,91 @@ mod tests {
             ),
             Err(InvalidSlice::TooManySlices)
         );
+    }
+
+    #[test]
+    fn test_empty_strided_slice() {
+        // Regression test: a slice that selects zero elements with a step
+        // greater than one pushes no byte ranges (the strided branch
+        // iterates an empty range), which used to be indistinguishable from
+        // "no slicing happened" and fell through to the whole-tensor
+        // fallback. The result then contradicted its own `newshape`.
+        let data: Vec<u8> = (0..16u8).collect();
+        let tensor = TensorView::new(Dtype::U8, vec![8], &data[..8]).unwrap();
+
+        for (start, stop, step) in [(0usize, 0usize, 2usize), (4, 4, 3), (7, 7, 5)] {
+            let iterator = SliceIterator::new(
+                &tensor,
+                &[TensorIndexer::Narrow(
+                    Bound::Included(start),
+                    Bound::Excluded(stop),
+                    NonZeroUsize::new(step).unwrap(),
+                )],
+            )
+            .unwrap();
+            assert_eq!(iterator.newshape(), vec![0]);
+            assert_eq!(iterator.remaining_byte_len(), 0);
+            assert_eq!(iterator.count(), 0);
+        }
+
+        // The same empty range with `step == 1` already behaved correctly;
+        // keep it pinned so the two paths cannot drift apart again.
+        let iterator = SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Narrow(
+                Bound::Included(4),
+                Bound::Excluded(4),
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+
+        // An empty selection on the outer dimension empties the result.
+        let tensor2d = TensorView::new(Dtype::U8, vec![4, 4], &data).unwrap();
+        let iterator = SliceIterator::new(
+            &tensor2d,
+            &[TensorIndexer::Narrow(
+                Bound::Included(0),
+                Bound::Excluded(0),
+                NonZeroUsize::new(2).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0, 4]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.count(), 0);
+
+        // An empty selection on an INNER dimension must not be undone by a
+        // later dimension refilling the byte ranges.
+        let iterator = SliceIterator::new(
+            &tensor2d,
+            &[
+                TensorIndexer::Narrow(Bound::Excluded(0), Bound::Unbounded, NonZeroUsize::MIN),
+                TensorIndexer::Narrow(
+                    Bound::Included(0),
+                    Bound::Excluded(0),
+                    NonZeroUsize::new(4).unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![3, 0]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.count(), 0);
+
+        // A full-range slice still returns the whole tensor.
+        let iterator = SliceIterator::new(
+            &tensor2d,
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![4, 4]);
+        assert_eq!(iterator.remaining_byte_len(), 16);
     }
 }
