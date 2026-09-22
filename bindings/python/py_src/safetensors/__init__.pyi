@@ -243,7 +243,11 @@ class safe_open:
         pass
 
     def prefetch(
-        self, plan: Optional[PrefetchPlan] = None, *, device: Optional[Union[str, int]] = None, threads: int = 8
+        self,
+        plan: Optional[PrefetchPlan] = None,
+        *,
+        device: Optional[Union[str, int]] = None,
+        threads: int = 8,
     ) -> "PrefetchLoader":
         """
         Start loading the file's tensors to a CUDA device in the background.
