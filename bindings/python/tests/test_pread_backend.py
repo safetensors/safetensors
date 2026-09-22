@@ -446,9 +446,11 @@ class PrefetchCudaTests(unittest.TestCase):
             f.prefetch(device="cuda:0")
 
     def test_threads(self):
-        with self._open(threads=2) as loader:
-            sd = dict(loader)
-        self._assert_matches_source(sd)
+        # readers are capped at one per chunk: tiny files spawn few, absurd requests spawn none extra
+        for threads in (2, 10_000):
+            with self._open(threads=threads) as loader:
+                sd = dict(loader)
+            self._assert_matches_source(sd)
 
     @unittest.skipUnless(
         hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
