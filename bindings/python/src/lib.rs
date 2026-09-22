@@ -661,8 +661,8 @@ struct SpanMeta {
 }
 
 /// The tensors of one file loading to a CUDA device in the background, see
-/// [`safe_open::prefetch`]. Each tensor is handed out once, by `take` or by
-/// iterating, as a zero-copy view of device memory. An allocation's memory is
+/// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
+/// by iterating, as a zero-copy view of device memory. An allocation's memory is
 /// freed once every tensor in it has been taken and dropped; allocations with
 /// untaken tensors are held until the loader is closed.
 #[pyclass]
@@ -672,7 +672,6 @@ pub struct PrefetchLoader {
     spans: Vec<SpanMeta>,
     /// tensor name -> span index
     index_map: HashMap<String, usize>,
-    framework: Framework,
 }
 
 impl PrefetchLoader {
@@ -702,13 +701,13 @@ impl PrefetchLoader {
 
     /// Takes `name`'s tensor, waiting if its bytes have not landed yet.
     ///
-    /// Each tensor can be taken once, by `take` or by iterating the loader;
-    /// asking again raises. Rows planned as a slice come back as that slice.
+    /// Each tensor can be taken once, by [`Self::take`] or by iterating the
+    /// loader; asking again raises. Rows planned as a slice come back as that slice.
     pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         let (buffer, meta) = self.take_buffer(py, name)?;
         match buffer {
             DeviceBuffer::Cuda(buffer) => {
-                cuda_tensor_from_buffer(py, &self.framework, meta.dtype, &meta.shape, buffer)
+                cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)
             }
         }
     }
@@ -718,11 +717,9 @@ impl PrefetchLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> TensorStream {
         let iter = slf.loader.iter();
         let entries = slf.spans.clone();
-        let framework = slf.framework.clone();
         TensorStream {
             iter,
             entries,
-            framework,
             _keepalive: Some(Py::from(slf).into_any()),
         }
     }
@@ -1030,7 +1027,6 @@ impl Open {
             loader,
             spans: metas,
             index_map,
-            framework: self.framework.clone(),
         })
     }
 
@@ -1640,14 +1636,13 @@ impl From<LoaderError> for PyErr {
     }
 }
 
-/// Iterator over a `PrefetchLoader`: `(name, tensor)` pairs in readiness
+/// Iterator over a [`PrefetchLoader`]: `(name, tensor)` pairs in readiness
 /// order, each tensor delivered once.
 #[pyclass]
 pub struct TensorStream {
     iter: TensorIter,
     /// per span, aligned with the loader's spans
     entries: Vec<SpanMeta>,
-    framework: Framework,
     _keepalive: Option<Py<PyAny>>,
 }
 
@@ -1664,13 +1659,9 @@ impl TensorStream {
             Some(Ok((idx, buffer))) => {
                 let meta = &mut self.entries[idx];
                 let tensor = match buffer {
-                    DeviceBuffer::Cuda(buffer) => cuda_tensor_from_buffer(
-                        py,
-                        &self.framework,
-                        meta.dtype,
-                        &meta.shape,
-                        buffer,
-                    )?,
+                    DeviceBuffer::Cuda(buffer) => {
+                        cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)?
+                    }
                 };
                 Ok(Some((std::mem::take(&mut meta.name), tensor)))
             }
@@ -1729,10 +1720,10 @@ impl safe_open {
 
     /// Start loading the file's tensors to a CUDA device in the background.
     ///
-    /// Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)`
-    /// or by iterating it as `(name, tensor)` pairs in readiness order, as
-    /// zero-copy views of device memory. The handle itself is unchanged: its
-    /// header queries and `get_slice` keep working, and several loaders can be
+    /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
+    /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
+    /// readiness order, as zero-copy views of device memory. The handle itself
+    /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
     /// started from one handle (for instance one per device). Requires
     /// `framework="pt"`; works with either backend. Each loader runs `threads`
     /// reader threads; all loaders in the process share one pinned staging
@@ -2483,16 +2474,10 @@ fn torch_empty_cuda(
 
 fn cuda_tensor_from_buffer(
     py: Python<'_>,
-    framework: &Framework,
     dtype: Dtype,
     logical_shape: &[usize],
     buffer: CudaBuffer,
 ) -> PyResult<Py<PyAny>> {
-    if !matches!(framework, Framework::Pytorch) {
-        return Err(SafetensorError::new_err(
-            "prefetch loading currently only supports pytorch",
-        ));
-    }
     let torch = get_module(py, &TORCH_MODULE)?;
     let storage_shape = torch_storage_shape(dtype, logical_shape)?;
 
@@ -2929,7 +2914,7 @@ impl _safe_open_handle {
         Ok(Self { inner })
     }
 
-    /// See `safe_open.prefetch`.
+    /// See [`safe_open::prefetch`].
     #[pyo3(signature = (plan=None, *, device=None, threads=8))]
     pub fn prefetch(
         &self,
