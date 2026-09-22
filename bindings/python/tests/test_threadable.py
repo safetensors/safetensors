@@ -1,11 +1,14 @@
+import os
+import sys
+import threading
+import time
 import unittest
 from concurrent import futures
-import threading
+
 import numpy as np
-from safetensors import TensorSpec, serialize_file
 from safetensors.numpy import load_file
-import time
-import os
+
+from safetensors import TensorSpec, serialize_file
 
 
 class TestCase(unittest.TestCase):
@@ -16,13 +19,18 @@ class TestCase(unittest.TestCase):
         tensor_a = np.random.randn(2000, 20000).astype(np.float32)
         tensor_b = np.random.randint(0, 128, (20000, 2000), dtype=np.int8)
 
+        # TensorSpec consumes raw bytes in the format's little-endian order.
+        tensor_a_storage = (
+            tensor_a if sys.byteorder == "little" else tensor_a.byteswap(inplace=False)
+        )
+
         # Build the tensor dict with data pointers (as serialize_file expects)
         tensor_data = {
             "tensor_a": TensorSpec(
                 dtype=tensor_a.dtype.name,
                 shape=tensor_a.shape,
-                data_ptr=tensor_a.ctypes.data,
-                data_len=tensor_a.nbytes,
+                data_ptr=tensor_a_storage.ctypes.data,
+                data_len=tensor_a_storage.nbytes,
             ),
             "tensor_b": TensorSpec(
                 dtype=tensor_b.dtype.name,
