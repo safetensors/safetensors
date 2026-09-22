@@ -30,6 +30,8 @@ pub enum SafeTensorError {
     TensorInvalidInfo,
     /// The offsets declared for tensor with name `String` in the header are invalid
     InvalidOffset(String),
+    /// The tensor name is reserved by the safetensors format.
+    InvalidTensorName(String),
     /// IoError
     #[cfg(feature = "std")]
     IoError(std::io::Error),
@@ -76,6 +78,9 @@ impl Display for SafeTensorError {
             TensorNotFound(name) => write!(f, "tensor `{name}` not found"),
             TensorInvalidInfo => write!(f, "invalid shape, data type, or offset for tensor"),
             InvalidOffset(name) => write!(f, "invalid offset for tensor `{name}`"),
+            InvalidTensorName(name) => {
+                write!(f, "tensor name `{name}` is reserved for metadata")
+            }
             #[cfg(feature = "std")]
             IoError(error) => write!(f, "I/O error: {error}"),
             InvalidTensorView(dtype, shape, n_bytes) => {
@@ -604,6 +609,14 @@ impl Metadata {
         metadata: Option<HashMap<String, String>>,
         tensors: Vec<(String, TensorInfo)>,
     ) -> Result<Self, SafeTensorError> {
+        if tensors
+            .iter()
+            .any(|(name, _)| name.as_str() == "__metadata__")
+        {
+            return Err(SafeTensorError::InvalidTensorName(
+                "__metadata__".to_string(),
+            ));
+        }
         let mut index_map = HashMap::with_capacity(tensors.len());
 
         let tensors: Vec<_> = tensors
@@ -1155,6 +1168,36 @@ mod tests {
             ]
         );
         let _parsed = SafeTensors::deserialize(&out).unwrap();
+    }
+
+    #[test]
+    fn test_rejects_reserved_metadata_tensor_name() {
+        let data = [1u8, 2, 3, 4];
+
+        let view = TensorView::new(Dtype::U8, vec![4], &data).unwrap();
+        let error = serialize([("__metadata__", view)], None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tensor name `__metadata__` is reserved for metadata"
+        );
+
+        #[cfg(feature = "std")]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let filename = directory.path().join("reserved-name.safetensors");
+            let view = TensorView::new(Dtype::U8, vec![4], &data).unwrap();
+            let error = serialize_to_file([("__metadata__", view)], None, &filename).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "tensor name `__metadata__` is reserved for metadata"
+            );
+            assert!(!filename.exists());
+        }
+
+        let view = TensorView::new(Dtype::U8, vec![4], &data).unwrap();
+        let serialized = serialize([("__metadata___", view)], None).unwrap();
+        let tensors = SafeTensors::deserialize(&serialized).unwrap();
+        assert_eq!(tensors.tensor("__metadata___").unwrap().data(), &data);
     }
 
     #[test]
