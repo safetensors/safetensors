@@ -1,3 +1,4 @@
+import errno
 import importlib
 import os
 import tempfile
@@ -181,6 +182,25 @@ class ErrorsTestCase(unittest.TestCase):
             with safe_open("notafile", framework="pt"):
                 pass
         self.assertEqual(str(ctx.exception), "No such file or directory: notafile")
+
+    @unittest.skipIf(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        "requires POSIX file permissions and a non-root user",
+    )
+    def test_permission_denied(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            save_file_pt({"a": torch.zeros((2, 2))}, f.name)
+        original_mode = os.stat(f.name).st_mode
+        try:
+            os.chmod(f.name, 0o000)
+            with self.assertRaises(PermissionError) as ctx:
+                with safe_open(f.name, framework="pt"):
+                    pass
+            self.assertEqual(ctx.exception.errno, errno.EACCES)
+            self.assertEqual(ctx.exception.filename, f.name)
+        finally:
+            os.chmod(f.name, original_mode)
+            os.remove(f.name)
 
 
 class ReadmeTestCase(unittest.TestCase):
