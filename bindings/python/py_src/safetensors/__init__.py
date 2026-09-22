@@ -1,5 +1,6 @@
 # Re-export this
 from ._safetensors_rust import (  # noqa: F401
+    PrefetchLoader,
     PySafeSlice,
     SafetensorError,
     TensorMeta,

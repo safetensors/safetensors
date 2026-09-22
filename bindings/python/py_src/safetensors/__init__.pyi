@@ -4,8 +4,7 @@
 #   - module-level imports (`os`, `typing`)
 #   - `__version__: str`
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
-#   - the `prefetch` method on `safe_open` and the return annotation on
-#     `safe_open.tensor_stream`
+#   - the `prefetch` method on `safe_open` and the `PrefetchLoader` class
 #   - the `PrefetchPlan` alias and the `TensorMeta` / `PySafeSlice` classes
 #
 # TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
@@ -176,6 +175,37 @@ class PySafeSlice:
     def __getitem__(self, index: Any) -> Any:
         pass
 
+class PrefetchLoader:
+    """
+    The tensors of one file loading to a CUDA device in the background, returned by
+    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating, as a
+    zero-copy view of device memory. An allocation's memory is freed once every tensor in it
+    has been taken and dropped; allocations with untaken tensors are held until `close`.
+    """
+
+    def names(self) -> List[str]:
+        """The names this loader hands out, in file order."""
+        pass
+    def __len__(self) -> int:
+        pass
+    def take(self, name: str) -> Any:
+        """
+        Takes `name`'s tensor, waiting if its bytes have not landed yet. Each tensor can be
+        taken once, by `take` or by iterating the loader; asking again raises. Rows planned
+        as a slice come back as that slice.
+        """
+        pass
+    def __iter__(self) -> Iterator[Tuple[str, Any]]:
+        """`(name, tensor)` pairs as their bytes land (unspecified order); tensors already taken are skipped."""
+        pass
+    def close(self) -> None:
+        """Stops the background load and releases every tensor not taken yet; tensors already handed out keep their memory."""
+        pass
+    def __enter__(self) -> "PrefetchLoader":
+        pass
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        pass
+
 class safe_open:
     """
     Opens a safetensors lazily and returns tensors as asked
@@ -208,26 +238,29 @@ class safe_open:
     ):
         pass
 
-    def prefetch(self, plan: Optional[PrefetchPlan] = None) -> None:
+    def prefetch(
+        self, plan: Optional[PrefetchPlan] = None, *, device: Optional[Union[str, int]] = None, threads: int = 8
+    ) -> "PrefetchLoader":
         """
-        Start loading the file's tensors to the device in the background.
+        Start loading the file's tensors to a CUDA device in the background.
 
-        Requires `framework="pt"`, `backend="pread"` and a CUDA `device`, and
-        may be called once per handle. Afterwards `get_tensor` hands each
-        tensor out exactly once as a zero-copy view of device memory and
-        `tensor_stream()` yields them as they land. An allocation's memory is
-        freed once every tensor in it has been taken and dropped; allocations
-        with untaken tensors are held until the handle is closed. Each open file
-        runs 8 reader threads; all files share one process-wide 512 MiB pinned
-        staging pool.
+        Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
+        iterating it as `(name, tensor)` pairs in readiness order, as zero-copy views of
+        device memory. The handle itself is unchanged: its header queries and `get_slice`
+        keep working, and several loaders can be started from one handle (for instance one
+        per device). Requires `framework="pt"`; works with either backend. Each loader runs
+        `threads` reader threads; all loaders in the process share one pinned staging pool.
 
         Args:
             plan (`Dict[str, Optional[slice]]`, *optional*):
                 Which tensors to load: keys are tensor names, values `None` for
                 the whole tensor or a step-1 `slice` along its first dimension.
-                Tensors absent from the plan are not loaded and cannot be
-                fetched from this handle. `None` (the default) loads every
-                tensor whole.
+                Tensors absent from the plan are not loaded by this loader.
+                `None` (the default) loads every tensor whole.
+            device (`str` or `int`, *optional*):
+                The CUDA device to load to; defaults to the handle's `device`.
+            threads (`int`, defaults to 8):
+                Reader threads for this loader.
 
         Raises if a planned tensor has a dtype torch cannot represent (F6), if a
         slice has a step other than 1, or if a sliced tensor is 0-d.
@@ -279,8 +312,6 @@ class safe_open:
         Returns:
             (`Tensor`):
                 The tensor in the framework you opened the file for.
-                After `prefetch()` each tensor can be taken once; asking
-                again (or after `tensor_stream()` yielded it) raises.
 
         Example:
         ```python
@@ -293,24 +324,6 @@ class safe_open:
         """
         pass
 
-    def tensor_stream(self) -> Iterator[Tuple[str, Any]]:
-        """
-        Iterates over every tensor as `(name, tensor)` while the file loads.
-
-        Requires `prefetch()` to have been called. Tensors are yielded as soon as their bytes
-        are on the device, so the order is unspecified and differs run to run.
-        Each tensor is delivered once: names already taken with `get_tensor`
-        are skipped. Iterate inside the `with` block — after the file is
-        closed the next step raises.
-
-        Returned tensors are ready on any stream. If you consume them on a
-        non-default CUDA stream, synchronize it before dropping your last
-        reference to a tensor.
-
-        Returns:
-            (`Iterator[Tuple[str, Tensor]]`)
-        """
-        pass
 
     def get_tensors(self):
         """
@@ -340,7 +353,7 @@ class safe_open:
     def get_tensor_meta(self, name: str) -> TensorMeta:
         """
         Returns a tensor's header entry without reading any data. Works on
-        every backend, including after `prefetch()`.
+        every backend.
 
         Args:
             name (`str`):
