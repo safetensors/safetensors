@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from safetensors import (
+    SafetensorError,
     TensorSpec,
     deserialize,
     safe_open,
@@ -363,6 +364,7 @@ def load_file(
 def load(data: bytes) -> Dict[str, torch.Tensor]:
     """
     Loads a safetensors file into torch format from pure bytes.
+    For packed FP4 tensors, the last dimension uses PyTorch's packed storage units.
 
     Args:
         data (`bytes`):
@@ -442,6 +444,12 @@ _TYPES = {
     "C64": torch.complex64,
 }
 
+if _float8_e8m0 is not None:
+    _TYPES["F8_E8M0"] = _float8_e8m0
+
+if _float4_e2m1_x2 is not None:
+    _TYPES["F4"] = _float4_e2m1_x2
+
 if hasattr(torch, "uint64"):  # Torch 2.3.0+
     _TYPES.update(
         {
@@ -460,12 +468,20 @@ def _view2torch(safeview) -> Dict[str, torch.Tensor]:
     result = {}
     for k, v in safeview:
         dtype = _getdtype(v["dtype"])
+        shape = v["shape"]
+        if dtype == _float4_e2m1_x2:
+            if not shape or shape[-1] % 2 != 0:
+                raise SafetensorError(
+                    f"f4_x2 dtype requires the last dim be divisible by 2 in torch: got {shape}"
+                )
+            # PyTorch packs two FP4 values per element along the last dimension.
+            shape[-1] //= 2
         if len(v["data"]) == 0:
             # Workaround because frombuffer doesn't accept zero-size tensors
-            assert any(x == 0 for x in v["shape"])
-            arr = torch.empty(v["shape"], dtype=dtype)
+            assert any(x == 0 for x in shape)
+            arr = torch.empty(shape, dtype=dtype)
         else:
-            arr = torch.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])
+            arr = torch.frombuffer(v["data"], dtype=dtype).reshape(shape)
         if sys.byteorder == "big":
             arr = torch.from_numpy(arr.numpy().byteswap(inplace=False))
         result[k] = arr

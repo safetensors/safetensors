@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import load, load_file, save, save_file
 
 
@@ -125,16 +125,20 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test"].dtype, torch.float8_e5m2)
         self.assertEqual(reloaded["test"].item(), -0.5)
 
+    @unittest.skipIf(
+        not hasattr(torch, "float8_e8m0fnu"), "float8_e8m0fnu requires torch 2.8"
+    )
     def test_odd_dtype_fp8_e8m0(self):
-        if not hasattr(torch, "float8_e8m0fnu"):
-            return  # torch.float8_e8m0fnu requires 2.8
-
         # E8M0 only represents positive powers of 2, so pick one that casts without loss.
         data = {"test": torch.tensor([0.5], dtype=torch.float8_e8m0fnu)}
         local = "./tests/data/out_safe_pt_mmap_small_e8m0.safetensors"
 
         save_file(data, local)
         reloaded = load_file(local)
+        self.assertEqual(reloaded["test"].dtype, torch.float8_e8m0fnu)
+        self.assertEqual(reloaded["test"].item(), 0.5)
+
+        reloaded = load(save(data))
         self.assertEqual(reloaded["test"].dtype, torch.float8_e8m0fnu)
         self.assertEqual(reloaded["test"].item(), 0.5)
 
@@ -160,26 +164,40 @@ class TorchTestCase(unittest.TestCase):
         self.assertEqual(reloaded["test2"].dtype, torch.float8_e5m2fnuz)
         self.assertEqual(reloaded["test2"].item(), 0.5)
 
+    @unittest.skipIf(
+        not hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
+    )
     def test_odd_dtype_fp4(self):
-        if not hasattr(torch, "float4_e2m1fn_x2"):
-            return  # torch.float4_e2m1fn_x2 requires 2.8
-
-        test1 = torch.tensor([0.0], dtype=torch.float8_e8m0fnu)
-        test2 = torch.empty(2, 2, device="cpu", dtype=torch.float4_e2m1fn_x2)
-        data = {
-            "test1": test1,
-            "test2": test2,
-        }
+        packed_bytes = torch.arange(8, dtype=torch.uint8).reshape(2, 4)
+        data = {"test": packed_bytes.view(torch.float4_e2m1fn_x2)}
         local = "./tests/data/out_safe_pt_mmap_fp4.safetensors"
 
         save_file(data, local)
-        reloaded = load_file(local)
-        # note: PyTorch doesn't implement torch.equal for float8 so we just compare the single element
-        self.assertEqual(reloaded["test1"].dtype, torch.float8_e8m0fnu)
-        self.assertEqual(reloaded["test1"], test1)
-        self.assertEqual(reloaded["test2"].dtype, torch.float4_e2m1fn_x2)
-        # TODO RuntimeError: "eq_cpu" not implemented for 'Float4_e2m1fn_x2'
-        # self.assertEqual(reloaded["test2"], test2)
+        for reloaded in (load_file(local), load(save(data))):
+            self.assertEqual(reloaded["test"].dtype, torch.float4_e2m1fn_x2)
+            self.assertEqual(reloaded["test"].shape, packed_bytes.shape)
+            self.assertTrue(
+                torch.equal(reloaded["test"].view(torch.uint8), packed_bytes)
+            )
+
+    @unittest.skipIf(
+        not hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
+    )
+    def test_zero_sized_fp4(self):
+        tensor = torch.empty((0, 4), dtype=torch.float4_e2m1fn_x2)
+        reloaded = load(save({"test": tensor}))["test"]
+        self.assertEqual(reloaded.dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(reloaded.shape, tensor.shape)
+
+    @unittest.skipIf(
+        not hasattr(torch, "float4_e2m1fn_x2"), "float4_e2m1fn_x2 requires torch 2.8"
+    )
+    def test_zero_sized_fp4_odd_dimension(self):
+        # The format allows this empty shape, but Torch cannot pack an odd FP4 width.
+        header = b'{"test":{"dtype":"F4","shape":[0,3],"data_offsets":[0,0]}}'
+        header += b" " * (-len(header) % 8)
+        with self.assertRaises(SafetensorError):
+            load(len(header).to_bytes(8, "little") + header)
 
     def test_zero_sized(self):
         data = {
