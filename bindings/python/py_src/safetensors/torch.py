@@ -569,6 +569,9 @@ def _flatten_as_ptr(
     _evaluate_tensors_for_save(tensors)
     flattened = {}
     for k, v in tensors.items():
+        # Conjugate and negative view bits change a tensor's logical values without
+        # changing its storage. Materialize them before reading from data_ptr().
+        v = v.resolve_conj().resolve_neg()
         # XXX: doing this check later on instead of in _evaluate_tensors_for_save
         # since on old versions of torch, SparseTensorImpl do not implement is_contiguous
         # and we do the sparsity check in _evaluate_tensors_for_save.
