@@ -785,7 +785,7 @@ impl Open {
 
         // SAFETY: Mmap is used to prevent allocating in Rust
         // before making a copy within Python.
-        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
+        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&*file)? };
 
         let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
             SafetensorError::new_err(format!("Error while deserializing header: {e}"))

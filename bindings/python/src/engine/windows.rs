@@ -68,6 +68,8 @@ impl Loader {
         Err(LoaderError)
     }
 
+    pub fn close(&mut self) {}
+
     pub fn iter(&self) -> TensorIter {
         TensorIter
     }
