@@ -752,9 +752,15 @@ impl<'data> TensorView<'data> {
         shape: Vec<usize>,
         data: &'data [u8],
     ) -> Result<Self, SafeTensorError> {
-        let n_elements: usize = shape.iter().product();
+        let n_elements: usize = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
 
-        let nbits = n_elements * dtype.bitsize();
+        let nbits = n_elements
+            .checked_mul(dtype.bitsize())
+            .ok_or(SafeTensorError::ValidationOverflow)?;
         if nbits % 8 != 0 {
             return Err(SafeTensorError::MisalignedSlice);
         }
@@ -1591,6 +1597,16 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+    }
+
+    #[test]
+    fn test_tensor_view_validation_overflow() {
+        let data = [];
+        let view = TensorView::new(Dtype::U8, vec![usize::MAX, 2], &data);
+        assert!(matches!(view, Err(SafeTensorError::ValidationOverflow)));
+
+        let view = TensorView::new(Dtype::U64, vec![usize::MAX], &data);
+        assert!(matches!(view, Err(SafeTensorError::ValidationOverflow)));
     }
 
     #[test]
