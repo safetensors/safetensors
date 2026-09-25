@@ -332,11 +332,16 @@ class ReadmeTestCase(unittest.TestCase):
         with safe_open(filename, framework="np", zero_copy=True) as f:
             tensor = f.get_tensor("a")
             part = f.get_slice("a")[2:, 1]
-        # Read-only views into the file that outlive the handle.
+        # Views into the file that outlive the handle.
         self.assertTrue(np.array_equal(tensor, A))
         self.assertTrue(np.array_equal(part, A[2:, 1]))
-        self.assertFalse(tensor.flags.writeable)
         self.assertTrue(np.shares_memory(tensor, part))
+
+        # Copy-on-write, like framework="pt": writes are seen by views from
+        # the same handle but never reach the file.
+        tensor[3, 1] = -1.0
+        self.assertEqual(part[1], -1.0)
+        self.assertTrue(np.array_equal(load_file(filename)["a"], A))
 
         with self.assertRaises(SafetensorError):
             safe_open(filename, framework="pt", zero_copy=True)

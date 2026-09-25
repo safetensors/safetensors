@@ -234,8 +234,10 @@ class safe_open:
 
         zero_copy (`bool`, *keyword-only*, defaults to `False`):
             Only for `framework="numpy"` with the `"mmap"` backend. Returns
-            read-only numpy views into a memory map of the file instead of
-            copies, for `get_tensor` and `get_slice(...)[...]` alike.
+            numpy views into a copy-on-write memory map of the file instead of
+            copies, for `get_tensor` and `get_slice(...)[...]` alike, like the
+            `pt` framework does. Writes to them never reach the file, but are
+            seen by other arrays from the same handle.
     """
     def __init__(
         self,
