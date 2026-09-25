@@ -231,6 +231,11 @@ class safe_open:
             On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
             shared `MTLBuffer` (1x model memory, no page-cache duplication) and
             loads a full model several times faster than `"mmap"`.
+
+        zero_copy (`bool`, *keyword-only*, defaults to `False`):
+            Only for `framework="numpy"` with the `"mmap"` backend. Returns
+            read-only numpy views into a memory map of the file instead of
+            copies, for `get_tensor` and `get_slice(...)[...]` alike.
     """
     def __init__(
         self,
@@ -239,6 +244,7 @@ class safe_open:
         device=...,
         *,
         backend: str = "mmap",
+        zero_copy: bool = False,
     ):
         pass
 

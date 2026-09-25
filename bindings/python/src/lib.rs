@@ -757,6 +757,9 @@ struct Open {
     storage: Arc<Storage>,
     /// The open file, for loaders started with [`Open::prefetch`]
     file: Arc<File>,
+    /// `numpy.memmap` of the whole file when opened with `zero_copy=True`;
+    /// tensors are returned as read-only views into it.
+    np_mmap: Option<Arc<Py<PyAny>>>,
 }
 
 impl Open {
@@ -765,7 +768,13 @@ impl Open {
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
+        if zero_copy && (framework != Framework::Numpy || backend != Backend::Mmap) {
+            return Err(SafetensorError::new_err(format!(
+                "zero_copy=True requires framework=\"numpy\" and backend=\"mmap\", got framework={framework} and backend={backend}"
+            )));
+        }
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
@@ -820,6 +829,7 @@ impl Open {
                 device,
                 storage: Arc::new(Storage::Pread(file.clone())),
                 file,
+                np_mmap: None,
             });
         }
 
@@ -916,6 +926,27 @@ impl Open {
 
         let storage = Arc::new(storage);
 
+        let np_mmap = if zero_copy {
+            // np_mmap = numpy.memmap(filename, dtype=numpy.uint8, mode="r")
+            Some(Arc::new(Python::attach(|py| -> PyResult<Py<PyAny>> {
+                let numpy = get_module(py, &NUMPY_MODULE)?;
+                let kwargs = [
+                    (intern!(py, "dtype"), get_pydtype(numpy, Dtype::U8, true)?),
+                    (
+                        intern!(py, "mode"),
+                        intern!(py, "r").clone().into_any().unbind(),
+                    ),
+                ]
+                .into_py_dict(py)?;
+                Ok(numpy
+                    .getattr(intern!(py, "memmap"))?
+                    .call((filename,), Some(&kwargs))?
+                    .unbind())
+            })?))
+        } else {
+            None
+        };
+
         Ok(Self {
             metadata,
             offset,
@@ -923,6 +954,7 @@ impl Open {
             device,
             storage,
             file,
+            np_mmap,
         })
     }
 
@@ -1157,6 +1189,12 @@ impl Open {
             && torch_supports_mps_dlpack()
         {
             return self.get_tensor_mps(name, info);
+        }
+
+        if let Some(np_mmap) = &self.np_mmap {
+            return Python::attach(|py| {
+                Ok(numpy_mmap_view(py, np_mmap, info, self.offset)?.unbind())
+            });
         }
 
         match &self.storage.as_ref() {
@@ -1620,6 +1658,7 @@ impl Open {
                 offset: self.offset,
                 device: self.device.clone(),
                 storage: self.storage.clone(),
+                np_mmap: self.np_mmap.clone(),
             })
         } else {
             Err(SafetensorError::new_err(format!(
@@ -1699,6 +1738,11 @@ impl TensorStream {
 ///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
 ///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
 ///         loads a full model several times faster than `"mmap"`.
+///
+///     zero_copy (`bool`, *keyword-only*, defaults to `False`):
+///         Only for `framework="numpy"` with the `"mmap"` backend. Returns
+///         read-only numpy views into a memory map of the file instead of
+///         copies, for `get_tensor` and `get_slice(...)[...]` alike.
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
@@ -1718,14 +1762,15 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, zero_copy=false))]
     fn new(
         filename: PathBuf,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, zero_copy)?);
         Ok(Self { inner })
     }
 
@@ -1911,6 +1956,7 @@ struct PySafeSlice {
     offset: usize,
     device: Device,
     storage: Arc<Storage>,
+    np_mmap: Option<Arc<Py<PyAny>>>,
 }
 
 use std::fmt;
@@ -2108,6 +2154,25 @@ impl PySafeSlice {
             && torch_supports_mps_dlpack()
         {
             return self.slice_mps(slices);
+        }
+
+        if let Some(np_mmap) = &self.np_mmap {
+            // Validate like the copying path, so errors are the same.
+            let indexers = parse_indexers(slices, &self.info.shape)?;
+            safetensors::slice::slice_byte_ranges(self.info.dtype, &self.info.shape, &indexers)
+                .map_err(|e| {
+                    SafetensorError::new_err(format!(
+                        "Error during slicing {} with shape {:?}: {e}",
+                        Disp(indexers.clone()),
+                        self.info.shape,
+                    ))
+                })?;
+            // Basic numpy indexing (slices / ints) returns a view, not a copy.
+            return Python::attach(|py| {
+                Ok(numpy_mmap_view(py, np_mmap, &self.info, self.offset)?
+                    .get_item(slices)?
+                    .unbind())
+            });
         }
 
         match &self.storage.as_ref() {
@@ -2672,6 +2737,37 @@ impl<'py> PinnedCpuDest<'py> {
     }
 }
 
+/// `np_mmap[start:stop].view(dtype).reshape(shape)`: a read-only numpy view
+/// of one tensor, keeping the memory map alive through its `base`.
+fn numpy_mmap_view<'py>(
+    py: Python<'py>,
+    np_mmap: &Py<PyAny>,
+    info: &TensorInfo,
+    offset: usize,
+) -> PyResult<PyBound<'py, PyAny>> {
+    let numpy = get_module(py, &NUMPY_MODULE)?;
+    let dtype = get_pydtype(numpy, info.dtype, true)?;
+    let start = (info.data_offsets.0 + offset) as isize;
+    let stop = (info.data_offsets.1 + offset) as isize;
+    let mut array = np_mmap
+        .bind(py)
+        .get_item(PySlice::new(py, start, stop, 1))?
+        // Drop the `numpy.memmap` subclass, a plain `ndarray` is expected.
+        .call_method1(
+            intern!(py, "view"),
+            (numpy.getattr(intern!(py, "ndarray"))?,),
+        )?
+        .call_method1(intern!(py, "view"), (dtype,))?;
+    let byteorder: String = PyModule::import(py, intern!(py, "sys"))?
+        .getattr(intern!(py, "byteorder"))?
+        .extract()?;
+    if byteorder == "big" {
+        // The file is little-endian, a copy is unavoidable.
+        array = array.call_method1(intern!(py, "byteswap"), (false,))?;
+    }
+    array.call_method1(intern!(py, "reshape"), (info.shape.clone(),))
+}
+
 fn create_tensor<'a>(
     framework: &'a Framework,
     dtype: Dtype,
@@ -2884,12 +2980,13 @@ impl _safe_open_handle {
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, zero_copy=false))]
     fn new(
         f: Py<PyAny>,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
         let filename = Python::attach(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
@@ -2897,7 +2994,7 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, zero_copy)?);
         Ok(Self { inner })
     }
 
