@@ -603,6 +603,9 @@ enum Storage {
     // Paddle can handle the whole lifecycle.
     // https://www.paddlepaddle.org.cn/documentation/docs/en/develop/api/paddle/MmapStorage_en.html
     Paddle(OnceLock<Py<PyAny>>),
+    /// Numpy mmap for `zero_copy=True`: a copy-on-write `numpy.memmap` of the
+    /// whole file. Tensors are views into it, which keep it alive.
+    Numpy(Py<PyAny>),
     /// Holds an open file handle and
     /// serves each tensor via `pread(2)` into a fresh per-tensor host
     /// buffer, with framework/device-specific buffer choices for performance.
@@ -765,7 +768,13 @@ impl Open {
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
+        if zero_copy && (framework != Framework::Numpy || backend != Backend::Mmap) {
+            return Err(SafetensorError::new_err(format!(
+                "zero_copy=True requires framework=\"numpy\" and backend=\"mmap\", got framework={framework} and backend={backend}"
+            )));
+        }
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
@@ -910,6 +919,24 @@ impl Open {
                 } else {
                     Ok(Storage::Mmap(buffer))
                 }
+            })?,
+            Framework::Numpy if zero_copy => Python::attach(|py| -> PyResult<Storage> {
+                // numpy.memmap(filename, dtype=numpy.uint8, mode="c"): copy-on-write
+                // like torch's `from_file(shared=False)`, so arrays are writable
+                // but writes never reach the file. `buffer` is dropped.
+                let numpy = get_module(py, &NUMPY_MODULE)?;
+                let kwargs = [
+                    (intern!(py, "dtype"), get_pydtype(numpy, Dtype::U8, true)?),
+                    (
+                        intern!(py, "mode"),
+                        intern!(py, "c").clone().into_any().unbind(),
+                    ),
+                ]
+                .into_py_dict(py)?;
+                let np_mmap = numpy
+                    .getattr(intern!(py, "memmap"))?
+                    .call((filename,), Some(&kwargs))?;
+                Ok(Storage::Numpy(np_mmap.unbind()))
             })?,
             _ => Storage::Mmap(buffer),
         };
@@ -1160,6 +1187,9 @@ impl Open {
         }
 
         match &self.storage.as_ref() {
+            Storage::Numpy(np_mmap) => {
+                Python::attach(|py| Ok(numpy_mmap_view(py, np_mmap, info, self.offset)?.unbind()))
+            }
             Storage::Mmap(mmap) => {
                 let data =
                     &mmap[info.data_offsets.0 + self.offset..info.data_offsets.1 + self.offset];
@@ -1454,6 +1484,9 @@ impl Open {
                         // Paddle has its own CUDA path via Storage::Paddle.
                         unreachable!("Storage::Paddle does not route through pinned CUDA path");
                     }
+                    Storage::Numpy(_) => {
+                        unreachable!("Storage::Numpy is only used with framework=\"numpy\"")
+                    }
                 }
             }
 
@@ -1504,6 +1537,9 @@ impl Open {
                     return Err(SafetensorError::new_err(
                         "Paddle + MPS is not a supported combination",
                     ));
+                }
+                Storage::Numpy(_) => {
+                    unreachable!("Storage::Numpy is only used with framework=\"numpy\"")
                 }
             }
         }
@@ -1699,6 +1735,13 @@ impl TensorStream {
 ///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
 ///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
 ///         loads a full model several times faster than `"mmap"`.
+///
+///     zero_copy (`bool`, *keyword-only*, defaults to `False`):
+///         Only for `framework="numpy"` with the `"mmap"` backend. Returns
+///         numpy views into a copy-on-write memory map of the file instead of
+///         copies, for `get_tensor` and `get_slice(...)[...]` alike, like the
+///         `pt` framework does. Writes to them never reach the file, but are
+///         seen by other arrays from the same handle.
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
@@ -1718,14 +1761,15 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, zero_copy=false))]
     fn new(
         filename: PathBuf,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, zero_copy)?);
         Ok(Self { inner })
     }
 
@@ -2048,6 +2092,9 @@ impl PySafeSlice {
                     Ok(())
                 })?,
                 Storage::Paddle(_) => unreachable!("Paddle excluded at __getitem__ entry"),
+                Storage::Numpy(_) => {
+                    unreachable!("Storage::Numpy is only used with framework=\"numpy\"")
+                }
             }
         }
 
@@ -2111,6 +2158,24 @@ impl PySafeSlice {
         }
 
         match &self.storage.as_ref() {
+            Storage::Numpy(np_mmap) => {
+                // Validate like the copying path, so errors are the same.
+                let indexers = parse_indexers(slices, &self.info.shape)?;
+                safetensors::slice::slice_byte_ranges(self.info.dtype, &self.info.shape, &indexers)
+                    .map_err(|e| {
+                        SafetensorError::new_err(format!(
+                            "Error during slicing {} with shape {:?}: {e}",
+                            Disp(indexers.clone()),
+                            self.info.shape,
+                        ))
+                    })?;
+                // Basic numpy indexing (slices / ints) returns a view, not a copy.
+                Python::attach(|py| {
+                    Ok(numpy_mmap_view(py, np_mmap, &self.info, self.offset)?
+                        .get_item(slices)?
+                        .unbind())
+                })
+            }
             Storage::Mmap(mmap) => {
                 let data = &mmap[self.info.data_offsets.0 + self.offset
                     ..self.info.data_offsets.1 + self.offset];
@@ -2672,6 +2737,37 @@ impl<'py> PinnedCpuDest<'py> {
     }
 }
 
+/// `np_mmap[start:stop].view(dtype).reshape(shape)`: a numpy view of one
+/// tensor, keeping the memory map alive through its `base`.
+fn numpy_mmap_view<'py>(
+    py: Python<'py>,
+    np_mmap: &Py<PyAny>,
+    info: &TensorInfo,
+    offset: usize,
+) -> PyResult<PyBound<'py, PyAny>> {
+    let numpy = get_module(py, &NUMPY_MODULE)?;
+    let dtype = get_pydtype(numpy, info.dtype, true)?;
+    let start = (info.data_offsets.0 + offset) as isize;
+    let stop = (info.data_offsets.1 + offset) as isize;
+    let mut array = np_mmap
+        .bind(py)
+        .get_item(PySlice::new(py, start, stop, 1))?
+        // Drop the `numpy.memmap` subclass, a plain `ndarray` is expected.
+        .call_method1(
+            intern!(py, "view"),
+            (numpy.getattr(intern!(py, "ndarray"))?,),
+        )?
+        .call_method1(intern!(py, "view"), (dtype,))?;
+    let byteorder: String = PyModule::import(py, intern!(py, "sys"))?
+        .getattr(intern!(py, "byteorder"))?
+        .extract()?;
+    if byteorder == "big" {
+        // The file is little-endian, a copy is unavoidable.
+        array = array.call_method1(intern!(py, "byteswap"), (false,))?;
+    }
+    array.call_method1(intern!(py, "reshape"), (info.shape.clone(),))
+}
+
 fn create_tensor<'a>(
     framework: &'a Framework,
     dtype: Dtype,
@@ -2884,12 +2980,13 @@ impl _safe_open_handle {
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, zero_copy=false))]
     fn new(
         f: Py<PyAny>,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        zero_copy: bool,
     ) -> PyResult<Self> {
         let filename = Python::attach(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
@@ -2897,7 +2994,7 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, zero_copy)?);
         Ok(Self { inner })
     }
 
