@@ -123,6 +123,19 @@ class AlreadyExists(Exception):
 
 
 def check_file_size(sf_filename: str, pt_filename: str):
+    """Assert that a converted safetensors file is not more than 1 % larger than the source PyTorch file.
+
+    A size difference larger than 1 % usually indicates that duplicate or
+    unexpected tensors were included in the conversion.
+
+    Args:
+        sf_filename (`str`): Path to the converted ``.safetensors`` file.
+        pt_filename (`str`): Path to the original PyTorch checkpoint file.
+
+    Raises:
+        `RuntimeError`: If the safetensors file is more than 1 % larger than
+        the PyTorch file.
+    """
     sf_size = os.stat(sf_filename).st_size
     pt_size = os.stat(pt_filename).st_size
 
@@ -136,6 +149,24 @@ def check_file_size(sf_filename: str, pt_filename: str):
 
 
 def rename(pt_filename: str) -> str:
+    """Convert a PyTorch checkpoint filename to the corresponding safetensors filename.
+
+    Strips the original extension, appends ``.safetensors``, and replaces the
+    legacy ``pytorch_model`` prefix with ``model``.
+
+    Args:
+        pt_filename (`str`): Path or filename of the PyTorch checkpoint, e.g.
+            ``"path/to/pytorch_model.bin"``.
+
+    Returns:
+        `str`: The equivalent safetensors path, e.g. ``"path/to/model.safetensors"``.
+
+    Example:
+        ```py
+        >>> rename("weights/pytorch_model.bin")
+        'weights/model.safetensors'
+        ```
+    """
     filename, ext = os.path.splitext(pt_filename)
     local = f"{filename}.safetensors"
     local = local.replace("pytorch_model", "model")
@@ -218,6 +249,26 @@ def convert_file(
     sf_filename: str,
     discard_names: List[str],
 ):
+    """Convert a single PyTorch checkpoint file to the safetensors format.
+
+    Loads the checkpoint, removes duplicate tensors (keeping one canonical
+    name per shared storage), forces all tensors to be contiguous, saves the
+    result as a ``.safetensors`` file, and verifies that:
+
+    - The output file size is within 1 % of the source file size.
+    - Every tensor round-trips identically through the new format.
+
+    Args:
+        pt_filename (`str`): Path to the source PyTorch ``.bin`` checkpoint.
+        sf_filename (`str`): Destination path for the ``.safetensors`` file.
+            Parent directories are created automatically.
+        discard_names (`List[str]`): Tensor names that should be dropped from
+            the output (e.g. tied embedding weights that are stored elsewhere).
+
+    Raises:
+        `RuntimeError`: If the file-size check fails or if any tensor does not
+        round-trip exactly after conversion.
+    """
     loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
     if "state_dict" in loaded:
         loaded = loaded["state_dict"]
