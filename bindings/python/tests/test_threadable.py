@@ -88,6 +88,8 @@ class TestCase(unittest.TestCase):
                     tensor_b,
                     err_msg=f"tensor_b mismatch in {file_name}",
                 )
+                # The arrays map the file, which Windows can't delete while mapped.
+                del loaded
         finally:
             # Clean up all temporary files
             for file_name in file_names:
