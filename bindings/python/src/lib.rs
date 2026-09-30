@@ -24,7 +24,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::num::NonZeroUsize;
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -977,20 +977,21 @@ impl Open {
                 )))
             }
         };
-        let rows_of = match plan {
+        let regions = match plan {
             Some(plan) => Some(self.parse_plan(plan)?),
             None => None,
         };
 
         let mut spans = Vec::new();
+        let mut gathers = Vec::new();
         let mut metas = Vec::new();
         let mut index_map = HashMap::new();
         for name in self.metadata.offset_keys() {
-            let rows = match &rows_of {
+            let indexers = match &regions {
                 None => None,
-                Some(rows_of) => match rows_of.get(&name) {
+                Some(regions) => match regions.get(&name) {
                     None => continue,
-                    Some(rows) => rows.clone(),
+                    Some(indexers) => indexers.clone(),
                 },
             };
 
@@ -1008,21 +1009,24 @@ impl Open {
             }
 
             let (start, end) = info.data_offsets;
-            let mut shape = info.shape.clone();
-            let span = match rows {
-                None => Span { start, end },
-                Some(rows) => {
-                    // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
-                    let row_bytes = (end - start).checked_div(shape[0]).unwrap_or(0);
-                    shape[0] = rows.len();
-                    Span {
-                        start: start + rows.start * row_bytes,
-                        end: start + rows.end * row_bytes,
-                    }
+            let (span, shape, gather) = match indexers {
+                None => (Span { start, end }, info.shape.clone(), None),
+                Some(indexers) => {
+                    let region =
+                        safetensors::slice::slice_region(info.dtype, &info.shape, &indexers)
+                            .map_err(|e| {
+                                SafetensorError::new_err(format!("cannot plan {name}: {e}"))
+                            })?;
+                    let span = Span {
+                        start: start + region.read.start,
+                        end: start + region.read.end,
+                    };
+                    (span, region.shape, region.gather)
                 }
             };
             index_map.insert(name.clone(), spans.len());
             spans.push(span);
+            gathers.push(gather);
             metas.push(SpanMeta {
                 name,
                 dtype: info.dtype,
@@ -1030,10 +1034,17 @@ impl Open {
             });
         }
 
-        if rows_of.is_some() && spans.is_empty() {
+        if regions.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        let loader = Loader::load(
+            self.file.clone(),
+            self.offset,
+            device_idx,
+            threads,
+            spans,
+            gathers,
+        )?;
         Ok(PrefetchLoader {
             loader,
             spans: metas,
@@ -1041,79 +1052,66 @@ impl Open {
         })
     }
 
-    /// Validates a prefetch plan into `name -> rows`, `None` meaning the whole tensor.
+    /// Validates a prefetch plan into `name -> indexers` (one list per leading dimension), `None` meaning the
+    /// whole tensor. A value is any index `get_slice` takes (an int, a slice, `...`, or a tuple of those), where a
+    /// dimension's entry in a tuple can also be a list of ints and slices, kept in order along that dimension.
     fn parse_plan(
         &self,
         plan: &PyBound<'_, PyDict>,
-    ) -> PyResult<HashMap<String, Option<Range<usize>>>> {
-        let mut rows_of = HashMap::with_capacity(plan.len());
+    ) -> PyResult<HashMap<String, Option<Vec<Vec<TensorIndexer>>>>> {
+        let mut regions = HashMap::with_capacity(plan.len());
         for (key, value) in plan.iter() {
             let name: String = key
                 .extract()
                 .map_err(|_| SafetensorError::new_err("prefetch plan keys must be tensor names"))?;
-
             let info = self.metadata.info(&name).ok_or_else(|| {
                 SafetensorError::new_err(format!("File does not contain tensor {name}"))
             })?;
-
             if value.is_none() {
-                rows_of.insert(name, None);
+                regions.insert(name, None);
                 continue;
             }
-
-            let slice = value.cast::<PySlice>().map_err(|_| {
-                SafetensorError::new_err(format!(
-                    "prefetch plan values must be None or a slice, got {} for {name}",
-                    value.get_type()
-                ))
-            })?;
-
-            let Some(&n_rows) = info.shape.first() else {
-                return Err(SafetensorError::new_err(format!(
-                    "cannot slice rows of the 0-d tensor {name}"
-                )));
-            };
-
-            for attr in ["start", "stop"] {
-                let bound = slice.getattr(attr)?;
-                if bound.is_none() {
+            let items: Vec<PyBound<'_, PyAny>> = match value.cast::<PyTuple>() {
+                Ok(tuple) if tuple.iter().any(|it| it.is_instance_of::<PyList>()) => {
+                    tuple.iter().collect()
+                }
+                // no lists: exactly what `get_slice` takes
+                _ => {
+                    let indexers = parse_indexers(&value, &info.shape)?;
+                    regions.insert(
+                        name,
+                        Some(indexers.into_iter().map(|ix| vec![ix]).collect()),
+                    );
                     continue;
                 }
-                let v: isize = bound.extract().map_err(|_| {
-                    SafetensorError::new_err(format!(
-                        "prefetch plan slice bounds for {name} must be integers or None"
-                    ))
-                })?;
-                // Python would clamp silently; a plan that misses the tensor is a bug
-                if v > n_rows as isize || v < -(n_rows as isize) {
-                    return Err(SafetensorError::new_err(format!(
-                        "prefetch plan slice {attr} {v} for {name} is out of range for {n_rows} rows"
-                    )));
-                }
-            }
-            let idx = slice.indices(n_rows as isize).map_err(|e| {
-                SafetensorError::new_err(format!("invalid prefetch plan slice for {name}: {e}"))
-            })?;
-            if idx.step != 1 {
+            };
+            if items.len() > info.shape.len() {
                 return Err(SafetensorError::new_err(format!(
-                    "prefetch plan slices must have step 1, got {} for {name}",
-                    idx.step
+                    "cannot plan {name}: {}",
+                    safetensors::slice::InvalidSlice::TooManySlices
                 )));
             }
-
-            let nbytes = info.data_offsets.1 - info.data_offsets.0;
-            let row_bytes = nbytes.checked_div(n_rows).unwrap_or(0);
-            if row_bytes * n_rows != nbytes {
-                return Err(SafetensorError::new_err(format!(
-                    "cannot slice rows of {name}: a row is not a whole number of bytes"
-                )));
+            let mut per_dim = Vec::with_capacity(items.len());
+            for (dim, item) in items.iter().enumerate() {
+                let one = |it: &PyBound<'_, PyAny>| -> PyResult<TensorIndexer> {
+                    if it.is_instance_of::<PyEllipsis>() {
+                        return Err(SafetensorError::new_err(format!(
+                            "cannot plan {name}: `...` cannot be combined with lists"
+                        )));
+                    }
+                    Ok(parse_indexers(it, &info.shape[dim..=dim])?.remove(0))
+                };
+                per_dim.push(match item.cast::<PyList>() {
+                    Ok(list) => list
+                        .iter()
+                        .map(|it| one(&it))
+                        .collect::<PyResult<Vec<_>>>()?,
+                    Err(_) => vec![one(item)?],
+                });
             }
-
-            let start = idx.start as usize;
-            rows_of.insert(name, Some(start..start + idx.slicelength));
+            regions.insert(name, Some(per_dim));
         }
-
-        Ok(rows_of)
+        Ok(regions)
     }
 
     /// Returns a full tensor
@@ -1741,18 +1739,26 @@ impl safe_open {
     /// pool.
     ///
     /// Args:
-    ///     plan (`Dict[str, Optional[slice]]`, *optional*):
-    ///         Which tensors to load: keys are tensor names, values `None` for
-    ///         the whole tensor or a step-1 `slice` along its first dimension.
-    ///         Tensors absent from the plan are not loaded by this loader.
-    ///         `None` (the default) loads every tensor whole.
+    ///     plan (`Dict[str, Optional[Any]]`, *optional*):
+    ///         Which tensors to load, and which part of each: keys are tensor
+    ///         names, values `None` for the whole tensor or any index `get_slice`
+    ///         takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
+    ///         dimension's entry can also be a list of ints and slices, kept in
+    ///         order along that dimension (e.g. the two halves of a fused
+    ///         projection). A tensor comes back as exactly that part, contiguous,
+    ///         as indexing `get_slice` would give it. Only the part is copied to
+    ///         the device; the rows around it are read from the file. Tensors
+    ///         absent from the plan are not loaded by this loader. `None` (the
+    ///         default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
     ///         The CUDA device to load to; defaults to the handle's `device`.
     ///     threads (`int`, defaults to 8):
     ///         Reader threads for this loader.
     ///
-    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
-    /// slice has a step other than 1, or if a sliced tensor is 0-d.
+    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if an
+    /// index falls outside its dimension, if the entries of a dimension overlap or
+    /// are out of order, if there are more entries than dimensions, if a sub-byte
+    /// dtype is not cut on whole bytes, or if the part is too fragmented to copy.
     ///
     /// Example:
     /// ```python

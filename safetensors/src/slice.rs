@@ -8,8 +8,7 @@ use core::ops::{
 };
 
 /// Error representing invalid slicing attempt
-#[derive(Debug)]
-#[cfg_attr(test, derive(Eq, PartialEq))]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InvalidSlice {
     /// When the client asked for more slices than the tensors has dimensions
     TooManySlices,
@@ -25,6 +24,16 @@ pub enum InvalidSlice {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// The ranges given for one dimension of a region overlap or are not in increasing order
+    UnorderedRanges {
+        /// The rank of the dimension
+        dim_index: usize,
+    },
+    /// The region would take more than [`MAX_REGION_COPIES`] strided copies to gather
+    TooFragmented {
+        /// The number of copies it would take
+        copies: usize,
+    },
 }
 
 impl Display for InvalidSlice {
@@ -42,6 +51,12 @@ impl Display for InvalidSlice {
             }
             InvalidSlice::MisalignedSlice => {
                 write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            }
+            InvalidSlice::UnorderedRanges { dim_index } => {
+                write!(f, "the ranges of tensor dimension #{dim_index} overlap or are not in increasing order")
+            }
+            InvalidSlice::TooFragmented { copies } => {
+                write!(f, "the region would take {copies} strided copies to gather, more than {MAX_REGION_COPIES}")
             }
         }
     }
@@ -429,6 +444,268 @@ pub fn slice_byte_ranges(
     Ok((indices, newshape))
 }
 
+/// `height` runs of `width` bytes, `src_pitch` apart in the source (offsets from the first byte of
+/// [`Region::read`]) and `dst_pitch` apart in the compact destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StridedCopy {
+    /// Offset of the first run in the source
+    pub src: usize,
+    /// Offset of the first run in the destination
+    pub dst: usize,
+    /// Bytes per run
+    pub width: usize,
+    /// Number of runs
+    pub height: usize,
+    /// Bytes between the starts of two runs in the source
+    pub src_pitch: usize,
+    /// Bytes between the starts of two runs in the destination
+    pub dst_pitch: usize,
+}
+
+/// The copies that turn the bytes read for a [`Region`] into its compact result, `len` bytes long.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gather {
+    /// The strided copies, which together fill the result exactly once
+    pub copies: Vec<StridedCopy>,
+    /// The result's size in bytes
+    pub len: usize,
+}
+
+/// Where a region of a tensor lives in its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    /// The bytes to read, relative to the tensor's first byte
+    pub read: Range<usize>,
+    /// The result's shape (dimensions indexed with [`TensorIndexer::Select`] dropped)
+    pub shape: Vec<usize>,
+    /// `None` when the bytes read are the result as is
+    pub gather: Option<Gather>,
+}
+
+/// A region taking more strided copies than this is refused ([`InvalidSlice::TooFragmented`]).
+pub const MAX_REGION_COPIES: usize = 1 << 16;
+
+/// Plans a region of a row-major tensor: the bytes to read and, when they aren't the result as is, the strided
+/// copies that gather the result compactly.
+///
+/// `slices` holds one list of indexers per leading dimension (dimensions left out are kept whole). A list with
+/// several entries keeps all of them, in order, along that dimension; a single [`TensorIndexer::Select`] drops the
+/// dimension from the result, as it does when slicing. Full trailing dimensions fold into the element and a
+/// dimension whose inner neighbour is kept whole merges with it, so a column slice of any rank is one strided copy.
+#[allow(clippy::single_range_in_vec_init)] // one range per dimension
+pub fn slice_region(
+    dtype: Dtype,
+    shape: &[usize],
+    slices: &[Vec<TensorIndexer>],
+) -> Result<Region, InvalidSlice> {
+    if slices.len() > shape.len() {
+        return Err(InvalidSlice::TooManySlices);
+    }
+    // one sorted, disjoint list of element ranges per dimension, and whether the dimension stays in the result
+    let mut ranges: Vec<Vec<Range<usize>>> = Vec::with_capacity(shape.len());
+    let mut result_shape = Vec::with_capacity(shape.len());
+    for (i, &dim) in shape.iter().enumerate() {
+        let Some(indexers) = slices.get(i) else {
+            ranges.push(vec![0..dim]);
+            result_shape.push(dim);
+            continue;
+        };
+        let out_of_range = |asked| InvalidSlice::SliceOutOfRange {
+            dim_index: i,
+            asked,
+            dim_size: dim,
+        };
+        let mut kept: Vec<Range<usize>> = Vec::new();
+        for indexer in indexers {
+            match indexer {
+                TensorIndexer::Select(s) => {
+                    if *s >= dim {
+                        return Err(out_of_range(*s));
+                    }
+                    kept.push(*s..*s + 1);
+                }
+                TensorIndexer::Narrow(left, right, step) => {
+                    let (start, stop) = narrow_bounds(left, right, dim);
+                    if stop > dim {
+                        return Err(out_of_range(stop.saturating_sub(1)));
+                    }
+                    if start >= stop {
+                        continue; // empty
+                    }
+                    if step.get() == 1 {
+                        kept.push(start..stop);
+                    } else {
+                        kept.extend((start..stop).step_by(step.get()).map(|n| n..n + 1));
+                    }
+                }
+            }
+        }
+        if kept.windows(2).any(|w| w[0].end > w[1].start) {
+            return Err(InvalidSlice::UnorderedRanges { dim_index: i });
+        }
+        // touching ranges are one: fewer copies, and a whole dimension stays whole
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(kept.len());
+        for r in kept {
+            match merged.last_mut() {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => merged.push(r),
+            }
+        }
+        if !matches!(indexers.as_slice(), [TensorIndexer::Select(_)]) {
+            result_shape.push(merged.iter().map(|r| r.len()).sum());
+        }
+        ranges.push(merged);
+    }
+    if ranges.iter().any(|d| d.is_empty()) {
+        return Ok(Region {
+            read: 0..0,
+            shape: result_shape,
+            gather: None,
+        });
+    }
+
+    let whole = |d: usize| ranges[d].len() == 1 && ranges[d][0] == (0..shape[d]);
+    // (size, ranges) from the outermost dimension in; full trailing dimensions fold into the element
+    let mut elem_bits = dtype.bitsize();
+    let mut innermost_partial = shape.len();
+    while innermost_partial > 0 && whole(innermost_partial - 1) {
+        innermost_partial -= 1;
+        elem_bits *= shape[innermost_partial];
+    }
+    let mut dims: Vec<(usize, Vec<Range<usize>>)> = (0..innermost_partial)
+        .map(|d| (shape[d], ranges[d].clone()))
+        .collect();
+    // a dimension whose inner neighbour is kept whole takes it in: `[E, rows, cols[a..b]]` with every row kept
+    // becomes `[E * rows, cols[a..b]]`
+    let mut i = dims.len().saturating_sub(1);
+    while i > 0 {
+        if dims[i].1.len() == 1 && dims[i].1[0] == (0..dims[i].0) {
+            let (inner, _) = dims.remove(i);
+            let (size, rs) = &mut dims[i - 1];
+            *size *= inner;
+            for r in rs.iter_mut() {
+                *r = r.start * inner..r.end * inner;
+            }
+        }
+        i -= 1;
+    }
+    let byte = |bits: usize| -> Result<usize, InvalidSlice> {
+        if bits % 8 == 0 {
+            Ok(bits / 8)
+        } else {
+            Err(InvalidSlice::MisalignedSlice)
+        }
+    };
+    if dims.is_empty() {
+        return Ok(Region {
+            read: 0..byte(elem_bits)?,
+            shape: result_shape,
+            gather: None,
+        });
+    }
+
+    // strides in bits, source layout and compact result layout
+    let n = dims.len();
+    let mut stride = vec![elem_bits; n];
+    let mut compact = vec![elem_bits; n];
+    for d in (0..n - 1).rev() {
+        stride[d] = stride[d + 1] * dims[d + 1].0;
+        compact[d] = compact[d + 1] * dims[d + 1].1.iter().map(|r| r.len()).sum::<usize>();
+    }
+    // one contiguous run: the bytes read are the result
+    if n == 1 && dims[0].1.len() == 1 {
+        let r = &dims[0].1[0];
+        return Ok(Region {
+            read: byte(r.start * stride[0])?..byte(r.end * stride[0])?,
+            shape: result_shape,
+            gather: None,
+        });
+    }
+
+    let k = n - 1; // runs are along the innermost dimension
+    let h = k.checked_sub(1); // copies stride along the one outside it
+    let outer = h.unwrap_or(0); // dimensions outside that are enumerated
+    let mut combos = 1usize;
+    for (_, rs) in &dims[..outer] {
+        combos = combos.saturating_mul(rs.iter().map(|r| r.len()).sum());
+    }
+    let copies_needed = combos.saturating_mul(dims[k].1.len() * h.map_or(1, |h| dims[h].1.len()));
+    if copies_needed > MAX_REGION_COPIES {
+        return Err(InvalidSlice::TooFragmented {
+            copies: copies_needed,
+        });
+    }
+
+    // (source, destination) offsets in bits of every index combination of the enumerated dimensions
+    let mut bases = vec![(0usize, 0usize)];
+    for (d, (_, rs)) in dims[..outer].iter().enumerate() {
+        let mut next = Vec::with_capacity(bases.len() * rs.iter().map(|r| r.len()).sum::<usize>());
+        for &(src, dst) in &bases {
+            let mut at = 0;
+            for r in rs {
+                for idx in r.clone() {
+                    next.push((src + idx * stride[d], dst + at * compact[d]));
+                    at += 1;
+                }
+            }
+        }
+        bases = next;
+    }
+    // the runs of the copies' height dimension, each with where it lands in the result
+    let rows: Vec<(Range<usize>, usize)> = match h {
+        Some(h) => {
+            let mut at = 0;
+            dims[h]
+                .1
+                .iter()
+                .map(|r| {
+                    let landed = (r.clone(), at);
+                    at += r.len();
+                    landed
+                })
+                .collect()
+        }
+        None => vec![(0..1, 0)],
+    };
+    let mut copies = Vec::with_capacity(copies_needed);
+    for &(src_base, dst_base) in &bases {
+        for (row_range, row_at) in &rows {
+            let (src_row, dst_row) = match h {
+                Some(h) => (row_range.start * stride[h], row_at * compact[h]),
+                None => (0, 0),
+            };
+            let mut at = 0;
+            for r in &dims[k].1 {
+                copies.push(StridedCopy {
+                    src: byte(src_base + src_row + r.start * stride[k])?,
+                    dst: byte(dst_base + dst_row + at * compact[k])?,
+                    width: byte(r.len() * stride[k])?,
+                    height: row_range.len(),
+                    src_pitch: byte(h.map_or(0, |h| stride[h]))?,
+                    dst_pitch: byte(h.map_or(0, |h| compact[h]))?,
+                });
+                at += r.len();
+            }
+        }
+    }
+
+    let start = copies.iter().map(|c| c.src).min().unwrap_or(0);
+    let end = copies
+        .iter()
+        .map(|c| c.src + (c.height - 1) * c.src_pitch + c.width)
+        .max()
+        .unwrap_or(0);
+    for c in &mut copies {
+        c.src -= start;
+    }
+    let len = byte(compact[0] * dims[0].1.iter().map(|r| r.len()).sum::<usize>())?;
+    Ok(Region {
+        read: start..end,
+        shape: result_shape,
+        gather: Some(Gather { copies, len }),
+    })
+}
+
 impl<'data> Iterator for SliceIterator<'data> {
     type Item = &'data [u8];
 
@@ -438,6 +715,222 @@ impl<'data> Iterator for SliceIterator<'data> {
         // upfront.
         let (start, stop) = self.indices.pop()?;
         Some(&self.view.data()[start..stop])
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // one range per dimension
+mod region_tests {
+    use super::*;
+
+    /// The region applied to a buffer holding byte `i` at offset `i`, as a device gather would.
+    fn gathered(nbytes: usize, region: &Region) -> Vec<u8> {
+        let source: Vec<u8> = (0..nbytes).map(|i| i as u8).collect();
+        let read = &source[region.read.clone()];
+        match &region.gather {
+            None => read.to_vec(),
+            Some(g) => {
+                let mut out = vec![0u8; g.len];
+                for c in &g.copies {
+                    for row in 0..c.height {
+                        let (s, d) = (c.src + row * c.src_pitch, c.dst + row * c.dst_pitch);
+                        out[d..d + c.width].copy_from_slice(&read[s..s + c.width]);
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// The same region by brute force over element indices (1-byte elements).
+    fn expected(shape: &[usize], ranges: &[Vec<Range<usize>>]) -> Vec<u8> {
+        fn rec(
+            d: usize,
+            at: usize,
+            strides: &[usize],
+            ranges: &[Vec<Range<usize>>],
+            out: &mut Vec<u8>,
+        ) {
+            if d == strides.len() {
+                out.push(at as u8);
+                return;
+            }
+            for r in &ranges[d] {
+                for i in r.clone() {
+                    rec(d + 1, at + i * strides[d], strides, ranges, out);
+                }
+            }
+        }
+        let mut strides = vec![1; shape.len()];
+        for d in (0..shape.len().saturating_sub(1)).rev() {
+            strides[d] = strides[d + 1] * shape[d + 1];
+        }
+        let mut out = Vec::new();
+        rec(0, 0, &strides, ranges, &mut out);
+        out
+    }
+
+    fn indexers(ranges: &[Vec<Range<usize>>]) -> Vec<Vec<TensorIndexer>> {
+        ranges
+            .iter()
+            .map(|d| d.iter().map(|r| r.clone().into()).collect())
+            .collect()
+    }
+
+    fn check(shape: &[usize], ranges: Vec<Vec<Range<usize>>>) -> Region {
+        let region = slice_region(Dtype::U8, shape, &indexers(&ranges)).unwrap();
+        assert_eq!(
+            gathered(shape.iter().product(), &region),
+            expected(shape, &ranges),
+            "{shape:?} {ranges:?}"
+        );
+        let sizes: Vec<usize> = ranges
+            .iter()
+            .map(|d| d.iter().map(|r| r.len()).sum())
+            .collect();
+        assert_eq!(region.shape, sizes);
+        region
+    }
+
+    #[test]
+    fn whole_tensor_and_row_slices_need_no_gather() {
+        assert_eq!(check(&[6, 5], vec![vec![0..6], vec![0..5]]).gather, None);
+        let rows = check(&[6, 5], vec![vec![2..4], vec![0..5]]);
+        assert_eq!((rows.read, rows.gather), (10..20, None));
+        assert_eq!(
+            check(&[4, 3, 2], vec![vec![1..3], vec![0..3], vec![0..2]]).gather,
+            None
+        );
+        // dimensions left out are kept whole
+        let r = slice_region(Dtype::U8, &[6, 5], &[vec![(2..4).into()]]).unwrap();
+        assert_eq!((r.read, r.shape, r.gather), (10..20, vec![2, 5], None));
+    }
+
+    #[test]
+    fn a_column_slice_is_one_strided_copy() {
+        let r = check(&[6, 8], vec![vec![0..6], vec![2..5]]);
+        assert_eq!(r.read, 2..(5 * 8 + 5));
+        let g = r.gather.unwrap();
+        assert_eq!(g.copies.len(), 1);
+        assert_eq!(
+            (g.copies[0].height, g.copies[0].width, g.copies[0].src_pitch),
+            (6, 3, 8)
+        );
+    }
+
+    #[test]
+    fn full_middle_dims_merge_into_one_copy() {
+        let g = check(&[4, 3, 8], vec![vec![0..4], vec![0..3], vec![1..3]])
+            .gather
+            .unwrap();
+        assert_eq!((g.copies.len(), g.copies[0].height), (1, 12));
+    }
+
+    #[test]
+    fn interleaved_and_mixed_regions() {
+        check(&[8, 4], vec![vec![0..2, 4..6], vec![0..4]]);
+        check(&[8, 6], vec![vec![1..3, 5..8], vec![0..2, 4..6]]);
+        check(&[3, 4, 5], vec![vec![0..3], vec![1..3], vec![0..5]]);
+        check(&[3, 4, 5], vec![vec![1..2], vec![0..4], vec![2..4]]);
+        check(
+            &[3, 4, 5],
+            vec![vec![0..1, 2..3], vec![1..4], vec![0..2, 3..5]],
+        );
+        check(
+            &[2, 3, 4, 5],
+            vec![vec![0..2], vec![1..2], vec![0..4], vec![1..4]],
+        );
+        check(&[7], vec![vec![1..3, 4..6]]);
+        // touching ranges merge: a whole dimension stays whole
+        assert_eq!(
+            check(&[6, 5], vec![vec![0..2, 2..6], vec![0..5]]).gather,
+            None
+        );
+    }
+
+    #[test]
+    fn steps_and_selects() {
+        // a stepped slice keeps every step-th element
+        let step = TensorIndexer::Narrow(
+            Bound::Included(1),
+            Bound::Excluded(7),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let r = slice_region(Dtype::U8, &[3, 8], &[vec![(0..3).into()], vec![step]]).unwrap();
+        assert_eq!(r.shape, vec![3, 3]);
+        assert_eq!(
+            gathered(24, &r),
+            expected(&[3, 8], &[vec![0..3], vec![1..2, 3..4, 5..6]])
+        );
+        // a lone select drops its dimension; inside a list it keeps one element and the dimension
+        let r = slice_region(Dtype::U8, &[4, 5], &[vec![TensorIndexer::Select(2)]]).unwrap();
+        assert_eq!((r.read, r.shape), (10..15, vec![5]));
+        let r = slice_region(
+            Dtype::U8,
+            &[4, 5],
+            &[vec![TensorIndexer::Select(0), TensorIndexer::Select(3)]],
+        )
+        .unwrap();
+        assert_eq!(r.shape, vec![2, 5]);
+        assert_eq!(
+            gathered(20, &r),
+            expected(&[4, 5], &[vec![0..1, 3..4], vec![0..5]])
+        );
+    }
+
+    #[test]
+    fn empty_regions_read_nothing() {
+        let r = check(&[4, 4], vec![vec![1..1], vec![0..4]]);
+        assert_eq!((r.read, r.shape), (0..0, vec![0, 4]));
+    }
+
+    #[test]
+    fn invalid_regions_are_refused() {
+        let u8 = Dtype::U8;
+        assert_eq!(
+            slice_region(u8, &[4], &[vec![], vec![]]),
+            Err(InvalidSlice::TooManySlices)
+        );
+        assert!(matches!(
+            slice_region(u8, &[4, 5], &[vec![], vec![(0..6).into()]]),
+            Err(InvalidSlice::SliceOutOfRange { dim_index: 1, .. })
+        ));
+        assert!(matches!(
+            slice_region(u8, &[4], &[vec![TensorIndexer::Select(4)]]),
+            Err(InvalidSlice::SliceOutOfRange {
+                dim_index: 0,
+                asked: 4,
+                ..
+            })
+        ));
+        assert_eq!(
+            slice_region(u8, &[8], &[vec![(3..5).into(), (0..2).into()]]),
+            Err(InvalidSlice::UnorderedRanges { dim_index: 0 })
+        );
+        assert_eq!(
+            slice_region(u8, &[8], &[vec![(0..4).into(), (2..6).into()]]),
+            Err(InvalidSlice::UnorderedRanges { dim_index: 0 })
+        );
+        // 4-bit elements: two per byte
+        assert!(slice_region(
+            Dtype::F4,
+            &[4, 8],
+            &[vec![(0..4).into()], vec![(2..6).into()]]
+        )
+        .is_ok());
+        assert_eq!(
+            slice_region(
+                Dtype::F4,
+                &[4, 8],
+                &[vec![(0..4).into()], vec![(1..5).into()]]
+            ),
+            Err(InvalidSlice::MisalignedSlice)
+        );
+        let every_other: Vec<TensorIndexer> = (0..600).map(|i| (2 * i..2 * i + 1).into()).collect();
+        assert!(matches!(
+            slice_region(u8, &[1200, 1200], &[every_other.clone(), every_other]),
+            Err(InvalidSlice::TooFragmented { .. })
+        ));
     }
 }
 
@@ -457,7 +950,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 24);
@@ -483,7 +980,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 2);
@@ -509,7 +1010,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 1);
@@ -537,7 +1042,11 @@ mod tests {
 
         let mut iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.next(), Some(&data[0..24]));
@@ -726,7 +1235,11 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(4), NonZeroUsize::MIN),
+                    TensorIndexer::Narrow(
+                        Bound::Included(1),
+                        Bound::Excluded(4),
+                        NonZeroUsize::MIN
+                    ),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {
@@ -740,7 +1253,11 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(Bound::Included(3), Bound::Excluded(2), NonZeroUsize::MIN),
+                    TensorIndexer::Narrow(
+                        Bound::Included(3),
+                        Bound::Excluded(2),
+                        NonZeroUsize::MIN
+                    ),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {

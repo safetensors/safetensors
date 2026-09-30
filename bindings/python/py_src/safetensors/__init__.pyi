@@ -15,7 +15,9 @@
 import os
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-PrefetchPlan = Dict[str, Optional[slice]]
+PrefetchPlan = Dict[
+    str, Optional[Any]
+]  # an index as `get_slice` takes it, see `safe_open.prefetch`
 
 __version__: str
 
@@ -260,18 +262,26 @@ class safe_open:
         `threads` reader threads; all loaders in the process share one pinned staging pool.
 
         Args:
-            plan (`Dict[str, Optional[slice]]`, *optional*):
-                Which tensors to load: keys are tensor names, values `None` for
-                the whole tensor or a step-1 `slice` along its first dimension.
-                Tensors absent from the plan are not loaded by this loader.
-                `None` (the default) loads every tensor whole.
+            plan (`Dict[str, Optional[Any]]`, *optional*):
+                Which tensors to load, and which part of each: keys are tensor
+                names, values `None` for the whole tensor or any index `get_slice`
+                takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
+                dimension's entry can also be a list of ints and slices, kept in
+                order along that dimension (e.g. the two halves of a fused
+                projection). A tensor comes back as exactly that part, contiguous,
+                as indexing `get_slice` would give it. Only the part is copied to
+                the device; the rows around it are read from the file. Tensors
+                absent from the plan are not loaded by this loader. `None` (the
+                default) loads every tensor whole.
             device (`str` or `int`, *optional*):
                 The CUDA device to load to; defaults to the handle's `device`.
             threads (`int`, defaults to 8):
                 Reader threads for this loader.
 
-        Raises if a planned tensor has a dtype torch cannot represent (F6), if a
-        slice has a step other than 1, or if a sliced tensor is 0-d.
+        Raises if a planned tensor has a dtype torch cannot represent (F6), if an
+        index falls outside its dimension, if the entries of a dimension overlap or
+        are out of order, if there are more entries than dimensions, if a sub-byte
+        dtype is not cut on whole bytes, or if the part is too fragmented to copy.
         """
         pass
 
