@@ -1,5 +1,7 @@
 import importlib
 import os
+import platform
+import stat
 import tempfile
 import threading
 import unittest
@@ -127,6 +129,38 @@ class TestCase(unittest.TestCase):
         save_file_pt(tensors, Path(filename))
         load_file_pt(Path(filename))
         os.remove(Path(filename))
+
+    @unittest.skipIf(platform.system() == "Windows", "file modes are a unix concept")
+    def test_serialization_file_permissions_match_create(self):
+        # Regression test for #782: a saved file gets the mode a plain
+        # create gives it under the process umask, not the tempfile's 0o600.
+        data = np.zeros((2, 2), dtype=np.int32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reference = os.path.join(tmpdir, "reference")
+            open(reference, "wb").close()
+            filename = os.path.join(tmpdir, "out.safetensors")
+            save_file({"test": data}, filename)
+            self.assertEqual(
+                oct(stat.S_IMODE(os.stat(filename).st_mode)),
+                oct(stat.S_IMODE(os.stat(reference).st_mode)),
+            )
+
+    @unittest.skipIf(platform.system() == "Windows", "file modes are a unix concept")
+    def test_serialization_overwrite_permissions_match_create(self):
+        # An overwritten file is a new file and gets a new file's mode, not
+        # the old file's. 0o604 is a mode no common umask produces.
+        data = np.zeros((2, 2), dtype=np.int32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reference = os.path.join(tmpdir, "reference")
+            open(reference, "wb").close()
+            filename = os.path.join(tmpdir, "out.safetensors")
+            save_file({"test": data}, filename)
+            os.chmod(filename, 0o604)
+            save_file({"test": data}, filename)
+            self.assertEqual(
+                oct(stat.S_IMODE(os.stat(filename).st_mode)),
+                oct(stat.S_IMODE(os.stat(reference).st_mode)),
+            )
 
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
