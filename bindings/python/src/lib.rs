@@ -652,7 +652,7 @@ impl Version {
 }
 
 /// What one span is handed out as: its tensor's name and dtype, and the
-/// shape after row slicing.
+/// shape of its planned part.
 #[derive(Clone)]
 struct SpanMeta {
     name: String,
@@ -662,13 +662,12 @@ struct SpanMeta {
 
 /// The tensors of one file loading to a CUDA device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
-/// by iterating, as a zero-copy view of device memory. An allocation's memory is
-/// freed once every tensor in it has been taken and dropped; allocations with
-/// untaken tensors are held until the loader is closed.
+/// by iterating. Tensors never taken hold their device memory until the loader
+/// is closed.
 ///
-/// Tensors are ready on any stream when handed out. The free is fenced on the
-/// CUDA stream that was current at hand-out; a consumer that reads a tensor on
-/// another stream must synchronize it before dropping the last reference.
+/// Tensors are ready on any stream when handed out. A tensor used on a stream
+/// other than the one current when it was handed out must have that stream
+/// synchronized before its last reference is dropped.
 #[pyclass]
 pub struct PrefetchLoader {
     loader: Loader,
@@ -693,8 +692,9 @@ impl PrefetchLoader {
 
 #[pymethods]
 impl PrefetchLoader {
-    /// The names this loader hands out, in file order. (Not `keys`: a loader is
-    /// not a mapping, each tensor is taken once, and `dict(loader)` must iterate.)
+    // Not `keys`: a loader is not a mapping, each tensor is taken once, and
+    // `dict(loader)` must iterate.
+    /// The names this loader hands out, in file order.
     pub fn names(&self) -> Vec<String> {
         self.spans.iter().map(|span| span.name.clone()).collect()
     }
@@ -703,10 +703,10 @@ impl PrefetchLoader {
         self.spans.len()
     }
 
-    /// Takes `name`'s tensor, waiting if its bytes have not landed yet.
+    /// Takes `name`'s tensor, waiting until it is loaded.
     ///
     /// Each tensor can be taken once, by [`Self::take`] or by iterating the
-    /// loader; asking again raises. Rows planned as a slice come back as that slice.
+    /// loader; asking again raises.
     pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         let (buffer, meta) = self.take_buffer(py, name)?;
         match buffer {
@@ -716,8 +716,8 @@ impl PrefetchLoader {
         }
     }
 
-    /// `(name, tensor)` pairs as their bytes land, so the order is unspecified;
-    /// tensors already taken are skipped.
+    /// `(name, tensor)` pairs as they finish loading, so the order is
+    /// unspecified; tensors already taken are skipped.
     fn __iter__(slf: PyRef<'_, Self>) -> TensorStream {
         let iter = slf.loader.iter();
         let entries = slf.spans.clone();
@@ -1730,13 +1730,10 @@ impl safe_open {
     /// Start loading the file's tensors to a CUDA device in the background.
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
-    /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
-    /// readiness order, as zero-copy views of device memory. The handle itself
-    /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
-    /// started from one handle (for instance one per device). Requires
-    /// `framework="pt"`; works with either backend. Each loader runs `threads`
-    /// reader threads; all loaders in the process share one pinned staging
-    /// pool.
+    /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs.
+    /// The handle itself is unchanged: its header queries and [`Self::get_slice`]
+    /// keep working, and several loaders can be started from one handle (for
+    /// instance one per device). Requires `framework="pt"`.
     ///
     /// Args:
     ///     plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -1745,20 +1742,15 @@ impl safe_open {
     ///         takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
     ///         dimension's entry can also be a list of ints and slices, kept in
     ///         order along that dimension (e.g. the two halves of a fused
-    ///         projection). A tensor comes back as exactly that part, contiguous,
-    ///         as indexing `get_slice` would give it. Only the part is copied to
-    ///         the device; the rows around it are read from the file. Tensors
-    ///         absent from the plan are not loaded by this loader. `None` (the
-    ///         default) loads every tensor whole.
+    ///         projection). `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
     ///         The CUDA device to load to; defaults to the handle's `device`.
     ///     threads (`int`, defaults to 8):
     ///         Reader threads for this loader.
     ///
-    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if an
-    /// index falls outside its dimension, if the entries of a dimension overlap or
-    /// are out of order, if there are more entries than dimensions, if a sub-byte
-    /// dtype is not cut on whole bytes, or if the part is too fragmented to copy.
+    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if the
+    /// entries of a dimension overlap or are out of order, if a sub-byte dtype is
+    /// not cut on whole bytes, or if a part is too fragmented to load.
     ///
     /// Example:
     /// ```python

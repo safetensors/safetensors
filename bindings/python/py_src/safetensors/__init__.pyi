@@ -180,13 +180,12 @@ class PySafeSlice:
 class PrefetchLoader:
     """
     The tensors of one file loading to a CUDA device in the background, returned by
-    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating, as a
-    zero-copy view of device memory. An allocation's memory is freed once every tensor in it
-    has been taken and dropped; allocations with untaken tensors are held until `close`.
+    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating. Tensors
+    never taken hold their device memory until `close`.
 
-    Tensors are ready on any stream when handed out. The free is fenced on the CUDA stream that was
-    current at hand-out; a consumer that reads a tensor on another stream must synchronize it before
-    dropping the last reference.
+    Tensors are ready on any stream when handed out. A tensor used on a stream other than the one
+    current when it was handed out must have that stream synchronized before its last reference is
+    dropped.
     """
 
     def names(self) -> List[str]:
@@ -196,13 +195,12 @@ class PrefetchLoader:
         pass
     def take(self, name: str) -> Any:
         """
-        Takes `name`'s tensor, waiting if its bytes have not landed yet. Each tensor can be
-        taken once, by `take` or by iterating the loader; asking again raises. Rows planned
-        as a slice come back as that slice.
+        Takes `name`'s tensor, waiting until it is loaded. Each tensor can be taken once, by
+        `take` or by iterating the loader; asking again raises.
         """
         pass
     def __iter__(self) -> Iterator[Tuple[str, Any]]:
-        """`(name, tensor)` pairs as their bytes land (unspecified order); tensors already taken are skipped."""
+        """`(name, tensor)` pairs as they finish loading (unspecified order); tensors already taken are skipped."""
         pass
     def close(self) -> None:
         """Stops the background load and releases every tensor not taken yet; tensors already handed out keep their memory."""
@@ -255,11 +253,9 @@ class safe_open:
         Start loading the file's tensors to a CUDA device in the background.
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
-        iterating it as `(name, tensor)` pairs in readiness order, as zero-copy views of
-        device memory. The handle itself is unchanged: its header queries and `get_slice`
-        keep working, and several loaders can be started from one handle (for instance one
-        per device). Requires `framework="pt"`; works with either backend. Each loader runs
-        `threads` reader threads; all loaders in the process share one pinned staging pool.
+        iterating it as `(name, tensor)` pairs. The handle itself is unchanged: its header
+        queries and `get_slice` keep working, and several loaders can be started from one
+        handle (for instance one per device). Requires `framework="pt"`.
 
         Args:
             plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -268,20 +264,15 @@ class safe_open:
                 takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
                 dimension's entry can also be a list of ints and slices, kept in
                 order along that dimension (e.g. the two halves of a fused
-                projection). A tensor comes back as exactly that part, contiguous,
-                as indexing `get_slice` would give it. Only the part is copied to
-                the device; the rows around it are read from the file. Tensors
-                absent from the plan are not loaded by this loader. `None` (the
-                default) loads every tensor whole.
+                projection). `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
                 The CUDA device to load to; defaults to the handle's `device`.
             threads (`int`, defaults to 8):
                 Reader threads for this loader.
 
-        Raises if a planned tensor has a dtype torch cannot represent (F6), if an
-        index falls outside its dimension, if the entries of a dimension overlap or
-        are out of order, if there are more entries than dimensions, if a sub-byte
-        dtype is not cut on whole bytes, or if the part is too fragmented to copy.
+        Raises if a planned tensor has a dtype torch cannot represent (F6), if the
+        entries of a dimension overlap or are out of order, if a sub-byte dtype is
+        not cut on whole bytes, or if a part is too fragmented to load.
         """
         pass
 

@@ -13,7 +13,9 @@
 //! ```
 //!
 //! - spans [`LoadPlan::spans`]: a byte interval of the data section. The
-//!   delivery unit: `take` hands out one span as a device view.
+//!   delivery unit: `take` hands out one span as a device view. A region's span
+//!   runs from its first byte to its last: all of it is read, only the region is
+//!   copied to the device.
 //! - allocation file ranges ([`LoadPlan::allocation_file_ranges`]): the allocation unit, the byte
 //!   interval each device buffer [`Allocation`] covers. Contiguous spans are
 //!   concatenated into one allocation up to the first span end at or past
