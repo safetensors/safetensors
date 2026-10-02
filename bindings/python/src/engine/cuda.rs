@@ -39,6 +39,7 @@ cuda_fns! {
     cudaMallocAsync:             fn(*mut *mut c_void, usize, Stream) -> Err,
     cudaFreeAsync:               fn(*mut c_void, Stream) -> Err,
     cudaMemcpyAsync:             fn(*mut c_void, *const c_void, usize, c_int, Stream) -> Err,
+    cudaMemcpy2DAsync:           fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, Stream) -> Err,
     cudaStreamCreateWithFlags:   fn(*mut Stream, c_uint) -> Err,
     cudaStreamDestroy:           fn(Stream) -> Err,
     cudaStreamWaitEvent:         fn(Stream, Event, c_uint) -> Err,
@@ -140,6 +141,33 @@ impl CudaApi {
                 dst as *mut c_void,
                 src as *const c_void,
                 len,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                s,
+            )
+        })
+    }
+
+    /// `height` rows of `width` bytes from host memory at `src` (rows `src_pitch` apart) to device memory at
+    /// `dst` (rows `dst_pitch` apart).
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy2d_h2d_async(
+        &self,
+        dst: u64,
+        dst_pitch: usize,
+        src: *const u8,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+        s: Stream,
+    ) -> Result<(), CudaError> {
+        self.check(unsafe {
+            (self.f.cudaMemcpy2DAsync)(
+                dst as *mut c_void,
+                dst_pitch,
+                src as *const c_void,
+                src_pitch,
+                width,
+                height,
                 CUDA_MEMCPY_HOST_TO_DEVICE,
                 s,
             )
