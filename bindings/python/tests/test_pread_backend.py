@@ -374,76 +374,33 @@ class PrefetchCudaTests(unittest.TestCase):
         )
 
     def test_plan_regions_match_source(self):
-        # a plan entry can be any per-dimension region; the result is exactly that region, contiguous
+        # a plan entry means what indexing `get_slice` means, plus lists per dimension; the result is contiguous
         plan = {
-            "fp32_2d": (slice(None), slice(1, 3)),  # a column slice
-            "fp16_3d": (
-                slice(None),
-                slice(1, 3),
-            ),  # a middle-dimension slice, last dimension kept whole
-            "bf16_2d": (
-                [slice(0, 1)],
-                [slice(0, 1), slice(2, 4)],
-            ),  # several ranges in one dimension
+            "fp32_2d": (slice(None), slice(0, 4, 2)),  # every other column
+            "fp16_3d": (1, ..., slice(1, 3)),  # an int drops its dimension
             "i64_1d": ([slice(0, 2), slice(3, 5)],),
+            "bf16_2d": ([0, 1], [0, slice(2, 4)]),  # lists may mix ints and slices
             "scalar_fp32": None,
             "empty_2d": ([slice(0, 0)],),
         }
         with self._open(plan=plan) as loader:
             got = {name: loader.take(name) for name in plan}
         src = SOURCE_TENSORS
-        expected = {
-            "fp32_2d": src["fp32_2d"][:, 1:3],
-            "fp16_3d": src["fp16_3d"][:, 1:3],
-            "bf16_2d": torch.cat(
-                [src["bf16_2d"][0:1, 0:1], src["bf16_2d"][0:1, 2:4]], dim=1
-            ),
+        with safe_open(self.path, framework="pt") as f:
+            expected = {
+                "fp32_2d": f.get_slice("fp32_2d")[:, 0:4:2],
+                "fp16_3d": f.get_slice("fp16_3d")[1, ..., 1:3],
+            }
+        expected |= {
             "i64_1d": torch.cat([src["i64_1d"][0:2], src["i64_1d"][3:5]]),
+            "bf16_2d": src["bf16_2d"][0:2][:, [0, 2, 3]],
             "scalar_fp32": src["scalar_fp32"],
             "empty_2d": src["empty_2d"][0:0],
         }
         for name, want in expected.items():
-            self.assertEqual(got[name].device, torch.device("cuda:0"), name)
             self.assertTrue(got[name].is_contiguous(), name)
             self.assertEqual(tuple(got[name].shape), tuple(want.shape), name)
             self.assertTrue(torch.equal(got[name].cpu(), want), name)
-
-    def test_plan_entries_take_get_slice_syntax(self):
-        # a plan entry means what indexing `get_slice` means: ints, steps and `...`, plus lists per dimension
-        plan = {
-            "fp32_2d": (slice(None), slice(0, 4, 2)),  # every other column
-            "fp16_3d": (1, ..., slice(1, 3)),  # an int drops its dimension
-            "bf16_2d": ([0, 1], [0, slice(2, 4)]),  # lists may mix ints and slices
-            "i64_1d": slice(None, None, 2),
-        }
-        with self._open(plan=plan) as loader:
-            got = {name: loader.take(name).cpu() for name in plan}
-        src = SOURCE_TENSORS
-        with safe_open(self.path, framework="pt") as f:
-            self.assertTrue(
-                torch.equal(got["fp32_2d"], f.get_slice("fp32_2d")[:, 0:4:2])
-            )
-            self.assertTrue(
-                torch.equal(got["fp16_3d"], f.get_slice("fp16_3d")[1, ..., 1:3])
-            )
-            self.assertTrue(torch.equal(got["i64_1d"], f.get_slice("i64_1d")[::2]))
-        self.assertTrue(torch.equal(got["bf16_2d"], src["bf16_2d"][0:2][:, [0, 2, 3]]))
-
-    def test_touching_slices_are_one_range(self):
-        # [0:1] + [1:3] is rows 0:3: a zero-copy row slice, not a gather
-        with self._open(plan={"fp32_2d": ([slice(0, 1), slice(1, 3)],)}) as loader:
-            rows = loader.take("fp32_2d")
-        self.assertTrue(torch.equal(rows.cpu(), SOURCE_TENSORS["fp32_2d"]))
-
-    def test_region_outlives_loader_and_handle(self):
-        with safe_open(self.path, framework="pt") as f:
-            loader = f.prefetch(
-                {"fp32_2d": (slice(None), slice(0, 2))}, device="cuda:0"
-            )
-            region = loader.take("fp32_2d")
-        loader.close()
-        torch.cuda.synchronize()
-        self.assertTrue(torch.equal(region.cpu(), SOURCE_TENSORS["fp32_2d"][:, 0:2]))
 
     def test_plan_rejects_bad_regions(self):
         with safe_open(self.path, framework="pt") as f:

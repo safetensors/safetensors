@@ -490,8 +490,8 @@ pub const MAX_REGION_COPIES: usize = 1 << 16;
 ///
 /// `slices` holds one list of indexers per leading dimension (dimensions left out are kept whole). A list with
 /// several entries keeps all of them, in order, along that dimension; a single [`TensorIndexer::Select`] drops the
-/// dimension from the result, as it does when slicing. Full trailing dimensions fold into the element and a
-/// dimension whose inner neighbour is kept whole merges with it, so a column slice of any rank is one strided copy.
+/// dimension from the result, as it does when slicing. A dimension whose inner neighbour is kept whole merges
+/// with it, so a column slice of any rank is one strided copy.
 #[allow(clippy::single_range_in_vec_init)] // one range per dimension
 pub fn slice_region(
     dtype: Dtype,
@@ -556,7 +556,7 @@ pub fn slice_region(
         }
         ranges.push(merged);
     }
-    if ranges.iter().any(|d| d.is_empty()) {
+    if ranges.iter().any(|d| d.iter().all(|r| r.is_empty())) {
         return Ok(Region {
             read: 0..0,
             shape: result_shape,
@@ -564,21 +564,12 @@ pub fn slice_region(
         });
     }
 
-    let whole = |d: usize| ranges[d].len() == 1 && ranges[d][0] == (0..shape[d]);
-    // (size, ranges) from the outermost dimension in; full trailing dimensions fold into the element
-    let mut elem_bits = dtype.bitsize();
-    let mut innermost_partial = shape.len();
-    while innermost_partial > 0 && whole(innermost_partial - 1) {
-        innermost_partial -= 1;
-        elem_bits *= shape[innermost_partial];
-    }
-    let mut dims: Vec<(usize, Vec<Range<usize>>)> = (0..innermost_partial)
-        .map(|d| (shape[d], ranges[d].clone()))
-        .collect();
+    let elem_bits = dtype.bitsize();
+    // (size, ranges) from the outermost dimension in
+    let mut dims: Vec<(usize, Vec<Range<usize>>)> = shape.iter().copied().zip(ranges).collect();
     // a dimension whose inner neighbour is kept whole takes it in: `[E, rows, cols[a..b]]` with every row kept
     // becomes `[E * rows, cols[a..b]]`
-    let mut i = dims.len().saturating_sub(1);
-    while i > 0 {
+    for i in (1..dims.len()).rev() {
         if dims[i].1.len() == 1 && dims[i].1[0] == (0..dims[i].0) {
             let (inner, _) = dims.remove(i);
             let (size, rs) = &mut dims[i - 1];
@@ -587,7 +578,6 @@ pub fn slice_region(
                 *r = r.start * inner..r.end * inner;
             }
         }
-        i -= 1;
     }
     let byte = |bits: usize| -> Result<usize, InvalidSlice> {
         if bits % 8 == 0 {
@@ -596,6 +586,7 @@ pub fn slice_region(
             Err(InvalidSlice::MisalignedSlice)
         }
     };
+    // a 0-d tensor
     if dims.is_empty() {
         return Ok(Region {
             read: 0..byte(elem_bits)?,
@@ -882,6 +873,9 @@ mod region_tests {
     fn empty_regions_read_nothing() {
         let r = check(&[4, 4], vec![vec![1..1], vec![0..4]]);
         assert_eq!((r.read, r.shape), (0..0, vec![0, 4]));
+        // a zero-size dimension left whole empties the region too
+        let r = slice_region(Dtype::U8, &[5, 0], &[vec![(0..1).into(), (3..4).into()]]).unwrap();
+        assert_eq!((r.read, r.shape, r.gather), (0..0, vec![2, 0], None));
     }
 
     #[test]
@@ -950,11 +944,7 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(
-                Bound::Unbounded,
-                Bound::Unbounded,
-                NonZeroUsize::MIN,
-            )],
+            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 24);
@@ -980,11 +970,7 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(
-                Bound::Unbounded,
-                Bound::Unbounded,
-                NonZeroUsize::MIN,
-            )],
+            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 2);
@@ -1010,11 +996,7 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(
-                Bound::Unbounded,
-                Bound::Unbounded,
-                NonZeroUsize::MIN,
-            )],
+            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 1);
@@ -1042,11 +1024,7 @@ mod tests {
 
         let mut iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(
-                Bound::Unbounded,
-                Bound::Unbounded,
-                NonZeroUsize::MIN,
-            )],
+            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
         )
         .unwrap();
         assert_eq!(iterator.next(), Some(&data[0..24]));
@@ -1235,11 +1213,7 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(
-                        Bound::Included(1),
-                        Bound::Excluded(4),
-                        NonZeroUsize::MIN
-                    ),
+                    TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(4), NonZeroUsize::MIN),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {
@@ -1253,11 +1227,7 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(
-                        Bound::Included(3),
-                        Bound::Excluded(2),
-                        NonZeroUsize::MIN
-                    ),
+                    TensorIndexer::Narrow(Bound::Included(3), Bound::Excluded(2), NonZeroUsize::MIN),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {

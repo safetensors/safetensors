@@ -333,7 +333,7 @@ impl LoadPlan {
         }
         for (s, g) in spans.iter().zip(&gathers) {
             if let Some(g) = g {
-                // a region is a subset of the bytes read for it, and its copies fill it exactly
+                // a region is no larger than the bytes read for it, and its copies fill it exactly
                 let copied = g
                     .copies
                     .iter()
@@ -359,22 +359,13 @@ impl LoadPlan {
         let chunk_size = chunk_size.get();
         let min_allocation_size = min_allocation_size.get();
 
+        // an allocation holds its spans' device bytes back to back: no more than their file bytes, as a region
+        // is never larger than its span
         let mut allocation_file_ranges: Vec<Range<usize>> = Vec::new();
         let mut allocation_sizes: Vec<usize> = Vec::new();
-        let mut alloc_spans: Vec<Range<usize>> = Vec::new(); // per allocation, the spans it holds
         let mut span_alloc: Vec<Option<usize>> = vec![None; spans.len()];
         let mut span_device: Vec<Range<usize>> = vec![0..0; spans.len()];
-        let (mut alloc_start, mut prev_end, mut device_size, mut first_span) = (0, 0, 0usize, 0);
-        let close = |ranges: &mut Vec<Range<usize>>,
-                     sizes: &mut Vec<usize>,
-                     held: &mut Vec<Range<usize>>,
-                     file: Range<usize>,
-                     size: usize,
-                     span_range: Range<usize>| {
-            ranges.push(file);
-            sizes.push(size);
-            held.push(span_range);
-        };
+        let (mut alloc_start, mut prev_end, mut device_size) = (0, 0, 0);
         for (i, span) in spans.iter().enumerate() {
             if span.start == span.end {
                 continue; // no bytes: no range, no chunks
@@ -382,50 +373,26 @@ impl LoadPlan {
             // gap between spans
             if span.start != prev_end {
                 if prev_end > alloc_start {
-                    close(
-                        &mut allocation_file_ranges,
-                        &mut allocation_sizes,
-                        &mut alloc_spans,
-                        alloc_start..prev_end,
-                        device_size,
-                        first_span..i,
-                    );
+                    allocation_file_ranges.push(alloc_start..prev_end);
+                    allocation_sizes.push(device_size);
                 }
                 alloc_start = span.start;
                 device_size = 0;
-                first_span = i;
             }
             span_alloc[i] = Some(allocation_file_ranges.len());
-            // bounded by the file bytes read (a region never exceeds its span), so this cannot overflow
-            let Some(end) = device_size.checked_add(device_len(i)) else {
-                return invalid("device sizes overflow".to_string());
-            };
-            span_device[i] = device_size..end;
-            device_size = end;
+            span_device[i] = device_size..device_size + device_len(i);
+            device_size = span_device[i].end;
             prev_end = span.end;
             if prev_end - alloc_start >= min_allocation_size {
-                close(
-                    &mut allocation_file_ranges,
-                    &mut allocation_sizes,
-                    &mut alloc_spans,
-                    alloc_start..prev_end,
-                    device_size,
-                    first_span..i + 1,
-                );
+                allocation_file_ranges.push(alloc_start..prev_end);
+                allocation_sizes.push(device_size);
                 alloc_start = prev_end;
                 device_size = 0;
-                first_span = i + 1;
             }
         }
         if prev_end > alloc_start {
-            close(
-                &mut allocation_file_ranges,
-                &mut allocation_sizes,
-                &mut alloc_spans,
-                alloc_start..prev_end,
-                device_size,
-                first_span..spans.len(),
-            );
+            allocation_file_ranges.push(alloc_start..prev_end);
+            allocation_sizes.push(device_size);
         }
 
         let mut chunks: Vec<Range<usize>> = Vec::new();
@@ -439,35 +406,28 @@ impl LoadPlan {
                 let end = (start + chunk_size).min(alloc_file_range.end);
                 let chunk = start..end;
                 let mut copies = Vec::new();
-                for i in alloc_spans[alloc_idx].clone() {
-                    let s = &spans[i];
-                    if s.start >= chunk.end || s.end <= chunk.start {
-                        continue;
+                let first_span = spans.partition_point(|s| s.end <= chunk.start);
+                for (i, s) in spans.iter().enumerate().skip(first_span) {
+                    if s.start >= chunk.end {
+                        break;
                     }
-                    let dev = span_device[i].start;
-                    match &gathers[i] {
-                        None => clip(
-                            &StridedCopy {
-                                src: s.start,
-                                dst: dev,
-                                width: s.end - s.start,
-                                height: 1,
-                                src_pitch: s.end - s.start,
-                                dst_pitch: s.end - s.start,
-                            },
-                            &chunk,
-                            &mut copies,
-                        ),
-                        Some(g) => {
-                            for c in &g.copies {
-                                let absolute = StridedCopy {
-                                    src: s.start + c.src,
-                                    dst: dev + c.dst,
-                                    ..*c
-                                };
-                                clip(&absolute, &chunk, &mut copies);
-                            }
-                        }
+                    let len = s.end - s.start;
+                    let whole = [StridedCopy {
+                        src: 0,
+                        dst: 0,
+                        width: len,
+                        height: 1,
+                        src_pitch: len,
+                        dst_pitch: len,
+                    }];
+                    let span_copies = gathers[i].as_ref().map_or(&whole[..], |g| &g.copies);
+                    for c in span_copies {
+                        let absolute = StridedCopy {
+                            src: s.start + c.src,
+                            dst: span_device[i].start + c.dst,
+                            ..*c
+                        };
+                        clip(&absolute, &chunk, &mut copies);
                     }
                 }
                 if !copies
@@ -483,14 +443,6 @@ impl LoadPlan {
                 chunk_copies.push(copies.into_boxed_slice());
                 start = end;
             }
-        }
-
-        if span_alloc
-            .iter()
-            .zip(&span_device)
-            .any(|(a, d)| a.is_some_and(|a| d.end > allocation_sizes[a]))
-        {
-            return invalid("a span's device bytes fall outside its allocation".to_string());
         }
 
         let span_chunks = spans

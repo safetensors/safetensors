@@ -991,7 +991,7 @@ impl Open {
                 None => None,
                 Some(regions) => match regions.get(&name) {
                     None => continue,
-                    Some(indexers) => indexers.clone(),
+                    Some(indexers) => indexers.as_deref(),
                 },
             };
 
@@ -1013,7 +1013,7 @@ impl Open {
                 None => (Span { start, end }, info.shape.clone(), None),
                 Some(indexers) => {
                     let region =
-                        safetensors::slice::slice_region(info.dtype, &info.shape, &indexers)
+                        safetensors::slice::slice_region(info.dtype, &info.shape, indexers)
                             .map_err(|e| {
                                 SafetensorError::new_err(format!("cannot plan {name}: {e}"))
                             })?;
@@ -1053,8 +1053,7 @@ impl Open {
     }
 
     /// Validates a prefetch plan into `name -> indexers` (one list per leading dimension), `None` meaning the
-    /// whole tensor. A value is any index `get_slice` takes (an int, a slice, `...`, or a tuple of those), where a
-    /// dimension's entry in a tuple can also be a list of ints and slices, kept in order along that dimension.
+    /// whole tensor.
     fn parse_plan(
         &self,
         plan: &PyBound<'_, PyDict>,
@@ -1071,45 +1070,38 @@ impl Open {
                 regions.insert(name, None);
                 continue;
             }
-            let items: Vec<PyBound<'_, PyAny>> = match value.cast::<PyTuple>() {
-                Ok(tuple) if tuple.iter().any(|it| it.is_instance_of::<PyList>()) => {
-                    tuple.iter().collect()
+            let one = |dim: usize, it: &PyBound<'_, PyAny>| -> PyResult<TensorIndexer> {
+                if it.is_instance_of::<PyEllipsis>() {
+                    return Err(SafetensorError::new_err(format!(
+                        "cannot plan {name}: `...` cannot be combined with lists"
+                    )));
                 }
-                // no lists: exactly what `get_slice` takes
-                _ => {
-                    let indexers = parse_indexers(&value, &info.shape)?;
-                    regions.insert(
-                        name,
-                        Some(indexers.into_iter().map(|ix| vec![ix]).collect()),
-                    );
-                    continue;
-                }
+                Ok(parse_indexers(it, &info.shape[dim..=dim])?.remove(0))
             };
-            if items.len() > info.shape.len() {
-                return Err(SafetensorError::new_err(format!(
-                    "cannot plan {name}: {}",
-                    safetensors::slice::InvalidSlice::TooManySlices
-                )));
-            }
-            let mut per_dim = Vec::with_capacity(items.len());
-            for (dim, item) in items.iter().enumerate() {
-                let one = |it: &PyBound<'_, PyAny>| -> PyResult<TensorIndexer> {
-                    if it.is_instance_of::<PyEllipsis>() {
+            let region = match value.cast::<PyTuple>() {
+                Ok(tuple) if tuple.iter().any(|it| it.is_instance_of::<PyList>()) => {
+                    if tuple.len() > info.shape.len() {
                         return Err(SafetensorError::new_err(format!(
-                            "cannot plan {name}: `...` cannot be combined with lists"
+                            "cannot plan {name}: {}",
+                            safetensors::slice::InvalidSlice::TooManySlices
                         )));
                     }
-                    Ok(parse_indexers(it, &info.shape[dim..=dim])?.remove(0))
-                };
-                per_dim.push(match item.cast::<PyList>() {
-                    Ok(list) => list
+                    tuple
                         .iter()
-                        .map(|it| one(&it))
-                        .collect::<PyResult<Vec<_>>>()?,
-                    Err(_) => vec![one(item)?],
-                });
-            }
-            regions.insert(name, Some(per_dim));
+                        .enumerate()
+                        .map(|(dim, item)| match item.cast::<PyList>() {
+                            Ok(list) => list.iter().map(|it| one(dim, &it)).collect(),
+                            Err(_) => Ok(vec![one(dim, &item)?]),
+                        })
+                        .collect::<PyResult<Vec<_>>>()?
+                }
+                // no lists: exactly what `get_slice` takes
+                _ => parse_indexers(&value, &info.shape)?
+                    .into_iter()
+                    .map(|ix| vec![ix])
+                    .collect(),
+            };
+            regions.insert(name, Some(region));
         }
         Ok(regions)
     }
