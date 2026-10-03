@@ -343,6 +343,10 @@ pub fn slice_byte_ranges(
         return Err(InvalidSlice::TooManySlices);
     }
     let mut newshape = Vec::with_capacity(n_shape);
+    // A strided range with start == stop selects nothing. That must not be
+    // confused with "no slice was applied", which also leaves `indices` empty
+    // and means the whole tensor.
+    let mut spans_nothing = false;
 
     // Minimum span is the span of 1 item;
     let mut span = dtype.bitsize();
@@ -376,7 +380,9 @@ pub fn slice_byte_ranges(
             if !matches!(slice, TensorIndexer::Select(_)) {
                 newshape.push((stop - start).div_ceil(step));
             }
-            if indices.is_empty() {
+            if spans_nothing {
+                // An earlier dimension already selected no elements.
+            } else if indices.is_empty() {
                 if step == 1 && start == 0 && stop == dim {
                     // Full range, nothing sliced yet; just grow the span.
                 } else if step == 1 {
@@ -389,6 +395,8 @@ pub fn slice_byte_ranges(
                     }
                     let small_span = (stop * span) / 8 - offset;
                     indices.push((offset, offset + small_span));
+                } else if start == stop {
+                    spans_nothing = true;
                 } else {
                     // Strided innermost dim: each kept element is its own run.
                     for n in (start..stop).step_by(step) {
@@ -398,6 +406,9 @@ pub fn slice_byte_ranges(
                         indices.push(((n * span) / 8, ((n + 1) * span) / 8));
                     }
                 }
+            } else if start == stop {
+                spans_nothing = true;
+                indices.clear();
             } else {
                 let capacity = (stop - start).div_ceil(step) * indices.len();
                 let mut newindices = Vec::with_capacity(capacity);
@@ -415,7 +426,9 @@ pub fn slice_byte_ranges(
         }
         span *= dim;
     }
-    if indices.is_empty() {
+    if spans_nothing {
+        indices.clear();
+    } else if indices.is_empty() {
         // Empty `slices` (or all unbounded full-range slices): no slicing
         // happened, the whole tensor is the result. `span` ended as
         // bitsize * product(shape).
@@ -667,6 +680,41 @@ mod tests {
         assert_eq!(iterator.next(), Some(&data[4..12]));
         assert_eq!(iterator.next(), Some(&data[16..24]));
         assert_eq!(iterator.next(), None);
+    }
+
+    #[test]
+    fn test_empty_strided_slice_has_no_bytes() {
+        // [0:0:2] selects nothing. It must not fall through to the whole tensor.
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let view = TensorView::new(Dtype::F32, vec![2, 3], &data).unwrap();
+        let step = NonZeroUsize::new(2).unwrap();
+        let iterator = SliceIterator::new(
+            &view,
+            &[TensorIndexer::Narrow(
+                Bound::Included(0),
+                Bound::Excluded(0),
+                step,
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0, 3]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.count(), 0);
+
+        // The empty range is on the outer dimension; the inner one is full.
+        let iterator = SliceIterator::new(
+            &view,
+            &[
+                TensorIndexer::Narrow(Bound::Included(0), Bound::Excluded(0), step),
+                TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(iterator.newshape(), vec![0, 3]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
     }
 
     #[test]
