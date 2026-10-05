@@ -8,7 +8,7 @@ mod engine;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
-use pyo3::exceptions::{PyException, PyFileNotFoundError};
+use pyo3::exceptions::{PyException, PyFileNotFoundError, PyPermissionError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
@@ -766,11 +766,26 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
+        let file = File::open(&filename).map_err(|e| match e.kind() {
+            // Passing (errno, strerror, filename) sets `.errno` and `.filename` on the
+            // exception. EACCES is 13 on Linux, macOS and the Windows CRT alike.
+            std::io::ErrorKind::PermissionDenied => PyPermissionError::new_err((
+                13,
+                "Permission denied",
+                filename.display().to_string(),
+            )),
+            std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
                 filename.display()
-            ))
+            )),
+            // Anything else defers to PyO3's own ErrorKind mapping so callers get the
+            // subclass `open()` would raise. Rebuilding the error keeps the path, which
+            // PyO3 drops when it stringifies the original.
+            _ => std::io::Error::new(
+                e.kind(),
+                format!("Unable to open {}: {e}", filename.display()),
+            )
+            .into(),
         })?;
         let file = Arc::new(file);
         let device = device.unwrap_or(Device::Cpu);
