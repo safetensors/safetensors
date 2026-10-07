@@ -392,3 +392,30 @@ class ReadmeTestCase(unittest.TestCase):
                 str(cm.exception),
                 "Error during slicing [:, :20] with shape [10, 5]: index 19 out of bounds for tensor dimension #1 of size 5",
             )
+
+    def test_numpy_zero_length_slice(self):
+        A = np.zeros((0, 3))
+        tensors = {
+            "a": A,
+        }
+        filename = f"./slice_zero_{threading.get_ident()}.safetensors"
+        save_file(tensors, filename)
+
+        # Now loading
+        with safe_open(filename, framework="np", device="cpu") as f:
+            slice_ = f.get_slice("a")
+            tensor = slice_[:]
+            self.assertEqual(list(tensor.shape), [0, 3])
+
+            tensor = slice_[0:]
+            self.assertEqual(list(tensor.shape), [0, 3])
+
+            tensor = slice_[0:0]
+            self.assertEqual(list(tensor.shape), [0, 3])
+
+            with self.assertRaises(SafetensorError) as cm:
+                tensor = slice_[0]
+            self.assertEqual(
+                str(cm.exception),
+                "Error during slicing [0] with shape [0, 3]: index 0 out of bounds for tensor dimension #0 of size 0",
+            )

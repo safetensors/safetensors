@@ -354,14 +354,14 @@ pub fn slice_byte_ranges(
             newshape.push(dim);
         } else {
             let slice = &slices[i];
-            let (start, stop, step) = match slice {
-                TensorIndexer::Select(s) => (*s, *s + 1, 1),
+            let (is_select, start, stop, step) = match slice {
+                TensorIndexer::Select(s) => (true, *s, *s + 1, 1),
                 TensorIndexer::Narrow(left, right, step) => {
                     let (start, stop) = narrow_bounds(left, right, dim);
-                    (start, stop, step.get())
+                    (false, start, stop, step.get())
                 }
             };
-            if start >= dim || stop > dim {
+            if (is_select && start >= dim) || (!is_select && (start > dim || stop > dim)) {
                 let asked = if start >= dim {
                     start
                 } else {
@@ -473,6 +473,26 @@ mod tests {
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 12);
         assert_eq!(iterator.newshape(), vec![1, 1, 3]);
+    }
+
+    #[test]
+    fn test_zero_dim_slice() {
+        let data: Vec<u8> = vec![];
+        let tensor = TensorView::new(Dtype::F32, vec![0, 3], &data).unwrap();
+
+        let iterator = SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+        )
+        .unwrap();
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.newshape(), vec![0, 3]);
+
+        assert!(SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Select(0)],
+        )
+        .is_err());
     }
 
     #[test]
