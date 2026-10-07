@@ -596,6 +596,26 @@ impl Serialize for Metadata {
     }
 }
 
+/// Checked byte size of a tensor from its shape and dtype.
+///
+/// The element and bit counts are computed in u64 so that a tensor whose bit
+/// count exceeds usize::MAX on 32-bit targets is still accepted as long as
+/// its byte size fits in usize.
+fn checked_byte_size(shape: &[usize], dtype: Dtype) -> Result<usize, SafeTensorError> {
+    let nelements: u64 = shape
+        .iter()
+        .copied()
+        .try_fold(1u64, |acc, d| acc.checked_mul(d as u64))
+        .ok_or(SafeTensorError::ValidationOverflow)?;
+    let nbits = nelements
+        .checked_mul(dtype.bitsize() as u64)
+        .ok_or(SafeTensorError::ValidationOverflow)?;
+    if nbits % 8 != 0 {
+        return Err(SafeTensorError::MisalignedSlice);
+    }
+    usize::try_from(nbits / 8).map_err(|_| SafeTensorError::ValidationOverflow)
+}
+
 impl Metadata {
     /// Creates a new metadata structure.
     /// May fail if there is incorrect data in the Tensor Info.
@@ -639,22 +659,7 @@ impl Metadata {
 
             start = e;
 
-            let nelements: usize = info
-                .shape
-                .iter()
-                .copied()
-                .try_fold(1usize, usize::checked_mul)
-                .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbits = nelements
-                .checked_mul(info.dtype.bitsize())
-                .ok_or(SafeTensorError::ValidationOverflow)?;
-
-            if nbits % 8 != 0 {
-                return Err(SafeTensorError::MisalignedSlice);
-            }
-            let size = nbits
-                .checked_div(8)
-                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let size = checked_byte_size(&info.shape, info.dtype)?;
 
             if e - s != size {
                 return Err(SafeTensorError::TensorInvalidInfo);
@@ -752,15 +757,7 @@ impl<'data> TensorView<'data> {
         shape: Vec<usize>,
         data: &'data [u8],
     ) -> Result<Self, SafeTensorError> {
-        let n_elements: usize = shape.iter().product();
-
-        let nbits = n_elements * dtype.bitsize();
-        if nbits % 8 != 0 {
-            return Err(SafeTensorError::MisalignedSlice);
-        }
-        let size = nbits
-            .checked_div(8)
-            .ok_or(SafeTensorError::ValidationOverflow)?;
+        let size = checked_byte_size(&shape, dtype)?;
 
         if data.len() != size {
             Err(SafeTensorError::InvalidTensorView(dtype, shape, data.len()))
@@ -1591,6 +1588,36 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+    }
+
+    #[test]
+    fn test_tensor_view_overflow_shapes() {
+        // The element count wraps to zero in unchecked usize arithmetic,
+        // which release builds previously accepted as an empty tensor.
+        let shape = vec![2, usize::MAX / 2 + 1];
+        match TensorView::new(Dtype::F32, shape, &[]) {
+            Err(SafeTensorError::ValidationOverflow) => {}
+            something => panic!("This should not be a valid view, got {something:?}"),
+        }
+        // The element count fits but the byte size is not addressable.
+        match TensorView::new(Dtype::F32, vec![usize::MAX], &[]) {
+            Err(SafeTensorError::ValidationOverflow) => {}
+            something => panic!("This should not be a valid view, got {something:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validation_large_tensor_bit_count() {
+        // 196_761_600 F32 elements is ~6.3e9 bits, which overflows a 32-bit
+        // usize, while the byte size (787_046_400) fits. Validation must
+        // accept this on 32-bit targets such as wasm32.
+        let info = TensorInfo {
+            dtype: Dtype::F32,
+            shape: vec![196_761_600],
+            data_offsets: (0, 787_046_400),
+        };
+        let metadata = Metadata::new(None, vec![("embed".to_string(), info)]).unwrap();
+        assert_eq!(metadata.data_len(), 787_046_400);
     }
 
     #[test]
