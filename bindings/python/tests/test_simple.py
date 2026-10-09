@@ -7,13 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
-from safetensors import SafetensorError, TensorSpec, safe_open, serialize
+from safetensors import SafetensorError, TensorSpec, deserialize, safe_open, serialize
 from safetensors.numpy import load, load_file, save, save_file
-from safetensors.torch import _find_shared_tensors
+from safetensors.torch import _find_shared_tensors, storage_ptr, storage_size
 from safetensors.torch import load_file as load_file_pt
 from safetensors.torch import save_file as save_file_pt
-from safetensors.torch import storage_ptr, storage_size
 
 
 def test_safetensor_error_module_is_importable():
@@ -176,6 +174,34 @@ class WindowsTestCase(unittest.TestCase):
 
 
 class ErrorsTestCase(unittest.TestCase):
+    def test_duplicate_header_keys(self):
+        tensor = '{"dtype":"U8","shape":[4],"data_offsets":[0,4]}'
+        for header, name in [
+            (f'{{"a":{tensor},"a":{tensor}}}', "a"),
+            (f'{{"a":{tensor},"\\u0061":{tensor}}}', "a"),
+            (f'{{"__metadata__":{{"k":"first","k":"last"}},"a":{tensor}}}', "k"),
+            (f'{{"__metadata__":{{"k":"first","\\u006b":"last"}},"a":{tensor}}}', "k"),
+        ]:
+            with self.subTest(header=header):
+                header_bytes = header.encode("utf-8")
+                serialized = (
+                    len(header_bytes).to_bytes(8, "little")
+                    + header_bytes
+                    + bytes([1, 2, 3, 4])
+                )
+                message = f"duplicate key `{name}`"
+                with self.assertRaisesRegex(SafetensorError, message):
+                    deserialize(serialized)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    filename = Path(directory) / "duplicate.safetensors"
+                    filename.write_bytes(serialized)
+                    with (
+                        self.assertRaisesRegex(SafetensorError, message),
+                        safe_open(filename, framework="np"),
+                    ):
+                        pass
+
     def test_file_not_found(self):
         with self.assertRaises(FileNotFoundError) as ctx:
             with safe_open("notafile", framework="pt"):
