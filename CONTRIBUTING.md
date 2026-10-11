@@ -174,7 +174,7 @@ pip install paddlepaddle
 
 ```bash
 # From the repo root
-cargo test                        # core library tests
+cargo test --manifest-path safetensors/Cargo.toml # core library tests
 cargo test --manifest-path safetensors/Cargo.toml --all-features
 ```
 
@@ -187,7 +187,7 @@ cd bindings/python
 pytest tests/
 
 # Run a specific test file
-pytest tests/test_torch_serialization.py
+pytest tests/test_pt_comparison.py
 
 # Run with verbose output
 pytest -v tests/
