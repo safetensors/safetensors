@@ -144,7 +144,7 @@ def _remove_duplicate_names(
 
 def save_model(
     model: torch.nn.Module,
-    filename: str,
+    filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
     force_contiguous: bool = True,
 ):
@@ -156,7 +156,7 @@ def save_model(
     Args:
         model (`torch.nn.Module`):
             The model to save on disk.
-        filename (`str`):
+        filename (`str`, or `os.PathLike`):
             The filename location to save the file
         metadata (`Dict[str, str]`, *optional*):
             Extra information to save along with the file.
