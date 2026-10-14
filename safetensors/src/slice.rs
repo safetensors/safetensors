@@ -420,10 +420,10 @@ pub fn slice_byte_ranges(
         // happened, the whole tensor is the result. `span` ended as
         // bitsize * product(shape).
         let total_bits = span;
-        if total_bits % 8 != 0 {
+        if total_bits % 8 != 0 && dtype != Dtype::U3 {
             return Err(InvalidSlice::MisalignedSlice);
         }
-        indices.push((0, total_bits / 8));
+        indices.push((0, total_bits.div_ceil(8)));
     }
     let newshape = newshape.into_iter().rev().collect();
     Ok((indices, newshape))

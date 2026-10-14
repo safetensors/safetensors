@@ -47,6 +47,8 @@ pub enum SafeTensorError {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// The unused low bits in the final byte of a packed tensor are not zero.
+    InvalidPadding,
 }
 
 #[cfg(feature = "std")]
@@ -87,7 +89,8 @@ impl Display for SafeTensorError {
             }
             MetadataIncompleteBuffer => write!(f, "incomplete metadata, file not fully covered"),
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
-            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
+            InvalidPadding => write!(f, "The unused bits in the final byte of a packed tensor must be zero."),
         }
     }
 }
@@ -292,7 +295,17 @@ pub fn serialize<
     buffer.extend(header_bytes);
 
     for tensor in tensors {
-        buffer.extend(tensor.data().as_ref());
+        let data = tensor.data();
+        let elements = tensor
+            .shape()
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        tensor
+            .dtype()
+            .validate_trailing_padding(elements, data.as_ref())?;
+        buffer.extend(data.as_ref());
     }
 
     Ok(buffer)
@@ -330,7 +343,17 @@ fn buffered_write_to_file<V: View>(
         f.write_all(header_bytes)?;
 
         for tensor in tensors {
-            f.write_all(tensor.data().as_ref())?;
+            let data = tensor.data();
+            let elements = tensor
+                .shape()
+                .iter()
+                .copied()
+                .try_fold(1usize, usize::checked_mul)
+                .ok_or(SafeTensorError::ValidationOverflow)?;
+            tensor
+                .dtype()
+                .validate_trailing_padding(elements, data.as_ref())?;
+            f.write_all(data.as_ref())?;
         }
 
         f.flush()?;
@@ -419,6 +442,19 @@ impl<'data> SafeTensors<'data> {
         let buffer_end = metadata.validate()?;
         if buffer_end + N_LEN + n != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
+        }
+        let data = &buffer[N_LEN + n..];
+        for info in &metadata.tensors {
+            let elements = info
+                .shape
+                .iter()
+                .copied()
+                .try_fold(1usize, usize::checked_mul)
+                .ok_or(SafeTensorError::ValidationOverflow)?;
+            info.dtype.validate_trailing_padding(
+                elements,
+                &data[info.data_offsets.0..info.data_offsets.1],
+            )?;
         }
 
         Ok((n, metadata))
@@ -645,16 +681,7 @@ impl Metadata {
                 .copied()
                 .try_fold(1usize, usize::checked_mul)
                 .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbits = nelements
-                .checked_mul(info.dtype.bitsize())
-                .ok_or(SafeTensorError::ValidationOverflow)?;
-
-            if nbits % 8 != 0 {
-                return Err(SafeTensorError::MisalignedSlice);
-            }
-            let size = nbits
-                .checked_div(8)
-                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let size = info.dtype.storage_bytes(nelements)?;
 
             if e - s != size {
                 return Err(SafeTensorError::TensorInvalidInfo);
@@ -754,17 +781,12 @@ impl<'data> TensorView<'data> {
     ) -> Result<Self, SafeTensorError> {
         let n_elements: usize = shape.iter().product();
 
-        let nbits = n_elements * dtype.bitsize();
-        if nbits % 8 != 0 {
-            return Err(SafeTensorError::MisalignedSlice);
-        }
-        let size = nbits
-            .checked_div(8)
-            .ok_or(SafeTensorError::ValidationOverflow)?;
+        let size = dtype.storage_bytes(n_elements)?;
 
         if data.len() != size {
             Err(SafeTensorError::InvalidTensorView(dtype, shape, data.len()))
         } else {
+            dtype.validate_trailing_padding(n_elements, data)?;
             Ok(Self { dtype, shape, data })
         }
     }
@@ -811,6 +833,8 @@ pub struct TensorInfo {
 pub enum Dtype {
     /// Boolan type
     BOOL,
+    /// Packed unsigned 3-bit integer.
+    U3,
     /// MXF4 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
     F4,
     /// MXF6 <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>_
@@ -866,6 +890,7 @@ impl Dtype {
     /// Gives out the size (in bits) of 1 element of this dtype.
     pub fn bitsize(&self) -> usize {
         match self {
+            Dtype::U3 => 3,
             Dtype::F4 => 4,
             Dtype::F6_E3M2 => 6,
             Dtype::F6_E2M3 => 6,
@@ -898,11 +923,43 @@ impl Dtype {
     pub fn size(&self) -> usize {
         self.bitsize() / 8
     }
+
+    fn storage_bytes(&self, elements: usize) -> Result<usize, SafeTensorError> {
+        let bits = elements
+            .checked_mul(self.bitsize())
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        if bits % 8 != 0 && *self != Dtype::U3 {
+            return Err(SafeTensorError::MisalignedSlice);
+        }
+        Ok(bits.div_ceil(8))
+    }
+
+    fn validate_trailing_padding(
+        &self,
+        elements: usize,
+        data: &[u8],
+    ) -> Result<(), SafeTensorError> {
+        if *self != Dtype::U3 || elements == 0 {
+            return Ok(());
+        }
+        let used_bits = elements
+            .checked_mul(self.bitsize())
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        let padding_bits = (8 - used_bits % 8) % 8;
+        if padding_bits != 0 {
+            let last = data.last().ok_or(SafeTensorError::TensorInvalidInfo)?;
+            if last & ((1u8 << padding_bits) - 1) != 0 {
+                return Err(SafeTensorError::InvalidPadding);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Display for Dtype {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match *self {
+            Dtype::U3 => "U3",
             Dtype::F4 => "F4",
             Dtype::F6_E2M3 => "F6_E2M3",
             Dtype::F6_E3M2 => "F6_E3M2",
@@ -945,6 +1002,7 @@ mod tests {
     fn arbitrary_dtype() -> impl Strategy<Value = Dtype> {
         prop_oneof![
             Just(Dtype::BOOL),
+            Just(Dtype::U3),
             Just(Dtype::F4),
             Just(Dtype::F6_E3M2),
             Just(Dtype::F6_E2M3),
@@ -1116,6 +1174,32 @@ mod tests {
         let shape = vec![1, 3];
         let attn_0 = TensorView::new(Dtype::F4, shape, &data);
         assert!(matches!(attn_0, Err(SafeTensorError::MisalignedSlice)));
+    }
+
+    #[test]
+    fn test_serialization_u3_with_zero_trailing_padding() {
+        // 9 values use 27 logical bits and 4 physical bytes. The five low
+        // bits in the final byte are padding.
+        let data: Vec<u8> = vec![0x29, 0xCB, 0xB8, 0xA0];
+        let shape = vec![9];
+        let tensor = TensorView::new(Dtype::U3, shape, &data).unwrap();
+        let metadata: HashMap<String, TensorView> =
+            [("symbols".to_string(), tensor)].into_iter().collect();
+
+        let out = serialize(&metadata, None).unwrap();
+        let parsed = SafeTensors::deserialize(&out).unwrap();
+        let restored = parsed.tensor("symbols").unwrap();
+        assert_eq!(restored.dtype(), Dtype::U3);
+        assert_eq!(restored.shape(), &[9]);
+        assert_eq!(restored.data(), data);
+        assert_eq!(restored.dtype().bitsize(), 3);
+    }
+
+    #[test]
+    fn test_serialization_u3_rejects_nonzero_trailing_padding() {
+        let data: Vec<u8> = vec![0xA1];
+        let tensor = TensorView::new(Dtype::U3, vec![1], &data);
+        assert!(matches!(tensor, Err(SafeTensorError::InvalidPadding)));
     }
 
     #[test]
