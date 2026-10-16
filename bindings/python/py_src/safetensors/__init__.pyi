@@ -220,10 +220,12 @@ class safe_open:
 
         framework (`str`):
             The framework you want you tensors in. Supported values:
-            `pt`, `tf`, `flax`, `numpy`.
+            `pt`, `tf`, `flax`, `numpy`, `mlx`, `paddle`.
 
         device (`str`, defaults to `"cpu"`):
-            The device on which you want the tensors.
+            The device on which you want the tensors. `mlx` supports `"mps"`
+            on Apple silicon (zero-copy with `mlx >= 0.32` via Metal DLPack,
+            falling back to the copying path otherwise).
 
         backend (`str`, *keyword-only*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (the default)
@@ -338,9 +340,10 @@ class safe_open:
 
         Equivalent to iterating `offset_keys()` and calling `get_tensor` on
         each, but specific `framework` + `device` combinations take an internal
-        fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
-        it bulk-allocates shared `MTLBuffer`s, fills them with parallel
-        `pread(2)`, and hands them to torch via DLPack with no extra copy.
+        fast path. On Apple-silicon MPS with PyTorch, or with MLX (>= 0.32),
+        and the `"pread"` backend, it bulk-allocates shared `MTLBuffer`s, fills
+        them with parallel `pread(2)`, and hands them to the framework via
+        DLPack with no extra copy.
 
         Returns:
             (`Dict[str, Tensor]`):

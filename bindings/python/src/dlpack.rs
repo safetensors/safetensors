@@ -205,6 +205,17 @@ pub(crate) fn torch_mps_compatible(dtype: Dtype) -> bool {
     dlpack_supported_native(dtype) || torch_view_target(dtype).is_some()
 }
 
+/// Whether MLX's `from_dlpack` can ingest this dtype from a Metal capsule.
+/// MLX's DLPack dtype set (see `dispatch_dlpack_dtype` in
+/// ml-explore/mlx `python/src/convert.cpp`) covers everything
+/// `dlpack_supported_native` lists except `F64`: MLX has no GPU float64, a
+/// `double` capsule is rejected with an itemsize mismatch, so those dtypes
+/// take the generic copy path instead.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn mlx_metal_compatible(dtype: Dtype) -> bool {
+    dlpack_supported_native(dtype) && dtype != Dtype::F64
+}
+
 #[allow(dead_code)]
 pub(crate) fn cpu_device() -> DLDevice {
     DLDevice {
