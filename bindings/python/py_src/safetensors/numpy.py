@@ -13,6 +13,11 @@ def _flatten(
     flattened = {}
     for k, v in tensor_dict.items():
         tensor = v
+        # serialize reads nbytes from data_ptr, which is only valid for a
+        # packed C-contiguous buffer. Fortran-order and sliced arrays are not.
+        if not tensor.flags.c_contiguous:
+            tensor = tensor.copy(order="C")
+            keep_alive_buffer.append(tensor)
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
             keep_alive_buffer.append(tensor)
