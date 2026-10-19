@@ -231,6 +231,11 @@ class safe_open:
             On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
             shared `MTLBuffer` (1x model memory, no page-cache duplication) and
             loads a full model several times faster than `"mmap"`.
+
+            With `framework="numpy"` and `"mmap"`, tensors are numpy views into
+            a copy-on-write memory map of the file, like `framework="pt"`:
+            writes to them never reach the file, but are seen by other arrays
+            from the same handle.
     """
     def __init__(
         self,
