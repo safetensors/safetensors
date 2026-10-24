@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import torch
 from safetensors import (
     TensorSpec,
+    _reject_metadata_tensor_name,
     deserialize,
     safe_open,
     serialize,
@@ -277,6 +278,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
+    _reject_metadata_tensor_name(tensors)
     keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
     serialized = serialize(
         _flatten_as_ptr(tensors, keep_references_alive), metadata=metadata
@@ -319,6 +321,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
+    _reject_metadata_tensor_name(tensors)
     keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
     serialize_file(
         _flatten_as_ptr(tensors, keep_references_alive), filename, metadata=metadata

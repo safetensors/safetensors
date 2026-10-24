@@ -118,6 +118,16 @@ class TestCase(unittest.TestCase):
         self.assertEqual(out1[8:].index(b"\x00") + 8, 104)
         self.assertEqual((out1[8:].index(b"\x00") + 8) % 8, 0)
 
+    def test_tensor_named_metadata_is_rejected(self):
+        with self.assertRaises(ValueError):
+            save({"__metadata__": np.zeros((2,), dtype=np.float32)})
+        with self.assertRaises(ValueError):
+            save_file_pt(
+                {"__metadata__": torch.zeros(2)},
+                "should_not_write_metadata_tensor.safetensors",
+            )
+        self.assertFalse(os.path.exists("should_not_write_metadata_tensor.safetensors"))
+
     def test_accept_path(self):
         tensors = {
             "a": torch.zeros((2, 2)),

@@ -7,6 +7,7 @@ import paddle
 
 from safetensors import (
     TensorSpec,
+    _reject_metadata_tensor_name,
     numpy,
     deserialize,
     safe_open,
@@ -42,6 +43,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
+    _reject_metadata_tensor_name(tensors)
     keep_references_alive = []
     serialized = serialize(_flatten(tensors, keep_references_alive), metadata=metadata)
     result = bytes(serialized)
@@ -79,6 +81,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
+    _reject_metadata_tensor_name(tensors)
     keep_references_alive = []
     serialize_file(
         _flatten(tensors, keep_references_alive), filename, metadata=metadata
