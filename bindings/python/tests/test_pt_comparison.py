@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from safetensors import safe_open
-from safetensors.torch import load, load_file, save, save_file
+from safetensors.torch import _getdtype, load, load_file, save, save_file
 
 
 try:
@@ -575,3 +575,9 @@ class SliceTestCase(unittest.TestCase):
         with safe_open(local, framework="pt") as f:
             metadata = f.metadata()
         self.assertEqual(metadata, {"Something": "more"})
+
+    def test_packed_float_dtypes_are_known(self):
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            self.assertIs(_getdtype("F4"), torch.float4_e2m1fn_x2)
+        if hasattr(torch, "float8_e8m0fnu"):
+            self.assertIs(_getdtype("F8_E8M0"), torch.float8_e8m0fnu)
