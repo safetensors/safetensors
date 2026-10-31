@@ -47,6 +47,9 @@ pub enum SafeTensorError {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// The tensor name `String` is reserved by the format (`__metadata__`) and cannot be used
+    /// for a tensor, the resulting header could not be read back
+    ReservedTensorName(String),
 }
 
 #[cfg(feature = "std")]
@@ -87,7 +90,8 @@ impl Display for SafeTensorError {
             }
             MetadataIncompleteBuffer => write!(f, "incomplete metadata, file not fully covered"),
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
-            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
+            ReservedTensorName(name) => write!(f, "tensor name `{name}` is reserved for the header metadata"),
         }
     }
 }
@@ -236,6 +240,9 @@ where
     let mut offset = 0;
 
     for (name, tensor) in data {
+        if name.as_ref() == "__metadata__" {
+            return Err(SafeTensorError::ReservedTensorName(name.to_string()));
+        }
         let n = tensor.data_len();
         let tensor_info = TensorInfo {
             dtype: tensor.dtype(),
@@ -1127,6 +1134,24 @@ mod tests {
             attn_0,
             Err(SafeTensorError::InvalidTensorView(Dtype::F4, _shape, _size))
         ));
+    }
+
+    #[test]
+    fn test_reserved_tensor_name() {
+        let data: Vec<u8> = vec![0u8; 4];
+        let view = TensorView::new(Dtype::F32, vec![1], &data).unwrap();
+        let tensors: HashMap<String, TensorView> =
+            [("__metadata__".to_string(), view)].into_iter().collect();
+
+        for data_info in [
+            None,
+            Some(HashMap::from([("k".to_string(), "v".to_string())])),
+        ] {
+            match serialize(&tensors, data_info) {
+                Err(SafeTensorError::ReservedTensorName(name)) => assert_eq!(name, "__metadata__"),
+                other => panic!("expected ReservedTensorName, got {other:?}"),
+            }
+        }
     }
 
     #[test]
