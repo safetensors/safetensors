@@ -74,6 +74,7 @@ use std::{
 };
 
 use crate::engine::cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream};
+use crate::engine::ExternalAllocator;
 
 #[derive(Debug)]
 pub enum LoaderError {
@@ -141,6 +142,8 @@ struct Allocation {
     /// streams consumers were on when a view was handed out (see
     /// [`CudaBuffer::consumed_on`]); the free waits for them as well
     consumer_streams: Mutex<Vec<u64>>,
+    /// `None`: CUDA's default mempool
+    allocator: Option<Arc<ExternalAllocator>>,
 }
 
 unsafe impl Send for Allocation {}
@@ -152,15 +155,40 @@ impl Allocation {
         device: i32,
         stream: Stream,
         bytes: usize,
+        allocator: Option<Arc<ExternalAllocator>>,
     ) -> Result<Arc<Self>, LoaderError> {
-        let ptr = api.with_device(device, |_| api.malloc_async(bytes, stream))?;
-        Ok(Arc::new(Self {
+        let Some(ext) = &allocator else {
+            let ptr = api.with_device(device, |_| api.malloc_async(bytes, stream))?;
+            return Ok(Arc::new(Self {
+                api,
+                device,
+                stream,
+                ptr,
+                consumer_streams: Mutex::new(Vec::new()),
+                allocator,
+            }));
+        };
+        // allocated on the free stream, where `drop` frees it: the block may still be
+        // in use by work that stream waits on, so the load stream waits on it too
+        let free = free_stream(api, device)?;
+        let ptr = (ext.alloc)(device, bytes, free as u64).map_err(LoaderError::WorkerFailed)?;
+        let alloc = Arc::new(Self {
             api,
             device,
             stream,
             ptr,
             consumer_streams: Mutex::new(Vec::new()),
-        }))
+            allocator,
+        });
+        api.with_device(device, |d| {
+            let e = d.event_create()?;
+            let res = api
+                .event_record(e, free)
+                .and_then(|()| api.stream_wait_event(stream, e));
+            let _ = api.event_destroy(e);
+            res
+        })?;
+        Ok(alloc)
     }
 }
 
@@ -183,11 +211,19 @@ impl Drop for Allocation {
                     let _ = self.api.event_destroy(e);
                 }
             }
-            self.api.free_async(self.ptr, free)
+            match &self.allocator {
+                Some(ext) => {
+                    (ext.free)(self.device, self.ptr, free as u64);
+                    Ok(())
+                }
+                None => self.api.free_async(self.ptr, free),
+            }
         });
         // no load in flight on this device: nothing will reuse the freed block, so hand it back
         // to the driver now instead of at the next `close` (e.g. `del model` after loading)
-        if CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) == 0 {
+        if self.allocator.is_none()
+            && CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) == 0
+        {
             trim_pool(self.api, self.device);
         }
     }
@@ -520,6 +556,8 @@ struct CudaSink {
     chunk_completion_events: Box<[AtomicU64]>,
     closed: AtomicBool,
     released: AtomicBool,
+    /// `None`: CUDA's default mempool, retained while any sink is live
+    allocator: Option<Arc<ExternalAllocator>>,
 }
 
 unsafe impl Send for CudaSink {}
@@ -531,10 +569,13 @@ impl CudaSink {
         pool: &'static SlabPool,
         plan: Arc<LoadPlan>,
         device: i32,
+        allocator: Option<Arc<ExternalAllocator>>,
     ) -> Result<Self, LoaderError> {
         let stream = device_stream(api, device)?;
-        CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
-        let _ = api.pool_set_release_threshold(device, u64::MAX);
+        if allocator.is_none() {
+            CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
+            let _ = api.pool_set_release_threshold(device, u64::MAX);
+        }
 
         Ok(Self {
             api,
@@ -557,6 +598,7 @@ impl CudaSink {
             chunk_completion_events: (0..plan.chunks.len()).map(|_| AtomicU64::new(0)).collect(),
             closed: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            allocator,
             plan,
         })
     }
@@ -570,7 +612,13 @@ impl CudaSink {
             return Err(LoaderError::Closed);
         }
         let bytes = &self.plan.allocation_file_ranges[alloc_idx];
-        let alloc = Allocation::new(self.api, self.device, self.stream, bytes.len())?;
+        let alloc = Allocation::new(
+            self.api,
+            self.device,
+            self.stream,
+            bytes.len(),
+            self.allocator.clone(),
+        )?;
         let ptr = alloc.ptr;
         *slot = Some(alloc);
         Ok(ptr)
@@ -677,7 +725,9 @@ impl CudaSink {
         for slot in self.allocations.iter() {
             *slot.lock().unwrap() = None;
         }
-        if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.allocator.is_none()
+            && CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1
+        {
             let _ = self.api.pool_set_release_threshold(self.device, 0);
             trim_pool(self.api, self.device);
             // a sink opened concurrently may have lost its retention to the reset above
@@ -774,6 +824,7 @@ impl Loader {
         device: i32,
         threads: usize,
         spans: Vec<Span>,
+        allocator: Option<Arc<ExternalAllocator>>,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
         if !(0..MAX_DEVICES as i32).contains(&device) {
@@ -801,7 +852,7 @@ impl Loader {
             file,
             error: OnceLock::new(),
             plan: plan.clone(),
-            sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
+            sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device, allocator)?),
             next_chunk: AtomicUsize::new(0),
         });
         let workers = (0..threads)

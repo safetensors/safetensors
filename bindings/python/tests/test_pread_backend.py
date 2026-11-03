@@ -242,6 +242,8 @@ class PrefetchCudaTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tempdir.name, "tiny.safetensors")
         save_file(SOURCE_TENSORS, self.path, metadata={"foo": "bar"})
+        # prefetch allocates through torch: start each test from an empty cache
+        torch.cuda.empty_cache()
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -369,17 +371,22 @@ class PrefetchCudaTests(unittest.TestCase):
             used, 300 * mib, f"{used / mib:.0f} MiB resident with both loaders open"
         )
 
-    def test_dropped_tensors_are_released_after_close(self):
-        # `del model` after loading: the memory must go back to the device without
-        # a sync or another load trimming the pool
+    def test_torch_accounts_prefetched_memory(self):
+        # torch's allocator sees the tensors, and `del` + `empty_cache` returns them
+        # to the device without another load having to run
         mib = 2**20
         path = os.path.join(self.tempdir.name, "drop.safetensors")
         save_file({"a": torch.zeros(64 * mib, dtype=torch.float32)}, path)
         torch.cuda.synchronize()
+        allocated_before = torch.cuda.memory_allocated(0)
         free_before, _ = torch.cuda.mem_get_info(0)
         with self._open(path) as loader:
             tensors = dict(loader)
+        held = torch.cuda.memory_allocated(0) - allocated_before
+        self.assertGreaterEqual(held, 256 * mib, f"torch sees {held / mib:.0f} MiB")
         del tensors
+        self.assertEqual(torch.cuda.memory_allocated(0), allocated_before)
+        torch.cuda.empty_cache()
         free_after, _ = torch.cuda.mem_get_info(0)
         leaked = free_before - free_after
         self.assertLess(leaked, 64 * mib, f"{leaked / mib:.0f} MiB still resident")

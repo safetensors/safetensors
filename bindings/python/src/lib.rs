@@ -678,6 +678,13 @@ pub struct PrefetchLoader {
     index_map: HashMap<String, usize>,
 }
 
+impl Drop for PrefetchLoader {
+    fn drop(&mut self) {
+        // workers take the GIL to allocate: join them without it
+        Python::attach(|py| py.detach(|| self.loader.close()));
+    }
+}
+
 impl PrefetchLoader {
     /// Takes the span loaded for `name`, once
     fn take_buffer(&self, py: Python<'_>, name: &str) -> PyResult<(DeviceBuffer, &SpanMeta)> {
@@ -1033,7 +1040,15 @@ impl Open {
         if rows_of.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        let allocator = Python::attach(torch_allocator)?;
+        let loader = Loader::load(
+            self.file.clone(),
+            self.offset,
+            device_idx,
+            threads,
+            spans,
+            Some(allocator),
+        )?;
         Ok(PrefetchLoader {
             loader,
             spans: metas,
@@ -1915,7 +1930,9 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, Span, TensorIter};
+use crate::engine::{
+    CudaBuffer, DeviceBuffer, ExternalAllocator, Loader, LoaderError, Span, TensorIter,
+};
 
 struct Disp(Vec<TensorIndexer>);
 
@@ -2289,6 +2306,36 @@ impl PySafeSlice {
             }),
         }
     }
+}
+
+/// Prefetch allocates through torch's caching allocator, so
+/// `torch.cuda.memory_allocated`, `memory_stats`, `empty_cache` and torch's OOM
+/// handling see the prefetched tensors like any other.
+fn torch_allocator(py: Python<'_>) -> PyResult<Arc<ExternalAllocator>> {
+    let cuda = get_module(py, &TORCH_MODULE)?.getattr(intern!(py, "cuda"))?;
+    let alloc = cuda
+        .getattr(intern!(py, "caching_allocator_alloc"))?
+        .unbind();
+    let delete = cuda
+        .getattr(intern!(py, "caching_allocator_delete"))?
+        .unbind();
+    Ok(Arc::new(ExternalAllocator {
+        alloc: Box::new(move |device, bytes, stream| {
+            Python::attach(|py| alloc.call1(py, (bytes, device, stream))?.extract::<u64>(py))
+                .map_err(|e| e.to_string())
+        }),
+        free: Box::new(move |_device, ptr, _stream| {
+            // the interpreter is gone at exit: nothing left to account the memory to
+            if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+                return;
+            }
+            Python::attach(|py| {
+                if let Err(e) = delete.call1(py, (ptr,)) {
+                    e.write_unraisable(py, None);
+                }
+            });
+        }),
+    }))
 }
 
 fn get_module<'a>(
