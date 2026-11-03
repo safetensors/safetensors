@@ -130,6 +130,32 @@ class TorchModelTestCase(unittest.TestCase):
         # Then add the size of the datapoint 4 bytes
         self.assertEqual(end - start, 8 * 3 + 2)
 
+    def test_end_ptr_transposed(self):
+        A = torch.zeros((4, 6))
+        T = A.T
+        start_a = A.data_ptr()
+        start_t = T.data_ptr()
+        self.assertEqual(start_a, start_t)
+        self.assertEqual(_end_ptr(A), _end_ptr(T))
+        self.assertEqual(_end_ptr(A) - start_a, 4 * 6 * 4)
+
+    def test_save_model_transposed_shared_weights(self):
+        class Autoencoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(6, 4, bias=False)
+                self.decoder = torch.nn.Linear(4, 6, bias=False)
+                self.decoder.weight = torch.nn.Parameter(self.encoder.weight.T)
+
+        model = Autoencoder()
+        save_model(model, "tmp_transposed.safetensors")
+
+        model2 = Autoencoder()
+        load_model(model2, "tmp_transposed.safetensors")
+
+        for k, v in model.state_dict().items():
+            torch.testing.assert_close(model2.state_dict()[k], v)
+
     def test_remove_duplicate_names(self):
         A = torch.zeros((3, 3))
         B = A[:1, :]
