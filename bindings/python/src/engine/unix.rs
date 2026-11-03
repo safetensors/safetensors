@@ -185,7 +185,26 @@ impl Drop for Allocation {
             }
             self.api.free_async(self.ptr, free)
         });
+        // no load in flight on this device: nothing will reuse the freed block, so hand it back
+        // to the driver now instead of at the next `close` (e.g. `del model` after loading)
+        if CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) == 0 {
+            trim_pool(self.api, self.device);
+        }
     }
+}
+
+/// Waits for the frees queued on the device's free stream, then releases the
+/// default mempool's unused memory. Best effort: errors are ignored.
+fn trim_pool(api: &CudaApi, device: i32) {
+    if let Ok(free) = free_stream(api, device) {
+        let _: Result<(), CudaError> = api.with_device(device, |d| {
+            let e = d.event_create()?;
+            let _ = api.event_record(e, free);
+            let _ = api.event_sync(e);
+            api.event_destroy(e)
+        });
+    }
+    let _ = api.pool_trim(device);
 }
 
 /// A byte interval `start..end` of the file's data section
@@ -659,17 +678,8 @@ impl CudaSink {
             *slot.lock().unwrap() = None;
         }
         if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Ok(free) = free_stream(self.api, self.device) {
-                // NOTE: `let _ =` is intentional, releasing retained memory is best effort
-                let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
-                    let e = d.event_create()?;
-                    let _ = self.api.event_record(e, free);
-                    let _ = self.api.event_sync(e);
-                    self.api.event_destroy(e)
-                });
-            }
             let _ = self.api.pool_set_release_threshold(self.device, 0);
-            let _ = self.api.pool_trim(self.device);
+            trim_pool(self.api, self.device);
             // a sink opened concurrently may have lost its retention to the reset above
             if CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) > 0 {
                 let _ = self.api.pool_set_release_threshold(self.device, u64::MAX);

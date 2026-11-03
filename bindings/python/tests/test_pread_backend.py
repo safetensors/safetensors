@@ -369,6 +369,21 @@ class PrefetchCudaTests(unittest.TestCase):
             used, 300 * mib, f"{used / mib:.0f} MiB resident with both loaders open"
         )
 
+    def test_dropped_tensors_are_released_after_close(self):
+        # `del model` after loading: the memory must go back to the device without
+        # a sync or another load trimming the pool
+        mib = 2**20
+        path = os.path.join(self.tempdir.name, "drop.safetensors")
+        save_file({"a": torch.zeros(64 * mib, dtype=torch.float32)}, path)
+        torch.cuda.synchronize()
+        free_before, _ = torch.cuda.mem_get_info(0)
+        with self._open(path) as loader:
+            tensors = dict(loader)
+        del tensors
+        free_after, _ = torch.cuda.mem_get_info(0)
+        leaked = free_before - free_after
+        self.assertLess(leaked, 64 * mib, f"{leaked / mib:.0f} MiB still resident")
+
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
             t = loader.take("fp32_2d")
