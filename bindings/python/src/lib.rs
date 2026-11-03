@@ -1047,7 +1047,7 @@ impl Open {
             device_idx,
             threads,
             spans,
-            Some(allocator),
+            allocator,
         )?;
         Ok(PrefetchLoader {
             loader,
@@ -2324,7 +2324,7 @@ fn torch_allocator(py: Python<'_>) -> PyResult<Arc<ExternalAllocator>> {
             Python::attach(|py| alloc.call1(py, (bytes, device, stream))?.extract::<u64>(py))
                 .map_err(|e| e.to_string())
         }),
-        free: Box::new(move |_device, ptr, _stream| {
+        free: Box::new(move |ptr| {
             // the interpreter is gone at exit: nothing left to account the memory to
             if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
                 return;
