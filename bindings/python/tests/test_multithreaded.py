@@ -46,6 +46,8 @@ def test_multithreaded_roundtripping_numpy():
                 loaded_tensors = load_file_np(path)
                 for name, tensor in tensors.items():
                     assert np.all(loaded_tensors[name] == tensor)
+                # The arrays map the file, which Windows can't delete while mapped.
+                del loaded_tensors
 
     tensors = {
         "1": np.random.randn(5, 25),
