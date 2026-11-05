@@ -38,6 +38,8 @@ static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static MLX_METAL_DLPACK: OnceLock<bool> = OnceLock::new();
 
 /// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 ///
@@ -774,9 +776,16 @@ impl Open {
         })?;
         let file = Arc::new(file);
         let device = device.unwrap_or(Device::Cpu);
+        // MLX reaches the Metal zero-copy path on Apple silicon, mirroring
+        // what Pytorch is allowed to do with `Device::Mps`.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mlx_mps = framework == Framework::Mlx && device == Device::Mps;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mlx_mps = false;
         if device != Device::Cpu
             && framework != Framework::Pytorch
             && framework != Framework::Paddle
+            && !mlx_mps
         {
             return Err(SafetensorError::new_err(format!(
                 "Device {device} is not supported for framework {framework}",
@@ -1152,9 +1161,8 @@ impl Open {
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
-            && self.framework == Framework::Pytorch
-            && dlpack::torch_mps_compatible(info.dtype)
-            && torch_supports_mps_dlpack()
+            && mps_dlpack_supported(&self.framework)
+            && mps_dtype_compatible(&self.framework, info.dtype)
         {
             return self.get_tensor_mps(name, info);
         }
@@ -1513,24 +1521,24 @@ impl Open {
 
     /// Returns every tensor in the file as a `{name: Tensor}` dict.
     ///
-    /// Default behavior is a sequential loop over `get_tensor`. Pytorch on
-    /// Apple-silicon MPS with the `pread` backend instead bulk-allocates
-    /// Shared `MTLBuffer`s, parallel-`pread`s into them, and hands them to
-    /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
-    /// The `mmap` backend uses the sequential loop, reading through the mmap.
+    /// Default behavior is a sequential loop over `get_tensor`. Pytorch and
+    /// MLX (>= 0.32) on Apple-silicon MPS with the `pread` backend instead
+    /// bulk-allocate Shared `MTLBuffer`s, parallel-`pread` into them, and
+    /// hand them to the framework via DLPack (1x model memory, the MTLBuffer
+    /// is the destination). The `mmap` backend uses the sequential loop,
+    /// reading through the mmap.
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         // The bulk parallel-pread path is gated on the `pread` backend so the
         // `backend` choice is honored: `mmap` falls through to the per-tensor
         // loop below, which reads through the mmap via `get_tensor_mps`.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
-            && self.framework == Framework::Pytorch
-            && torch_supports_mps_dlpack()
+            && mps_dlpack_supported(&self.framework)
             && self
                 .metadata
                 .tensors()
                 .values()
-                .all(|info| dlpack::torch_mps_compatible(info.dtype))
+                .all(|info| mps_dtype_compatible(&self.framework, info.dtype))
         {
             if let Storage::Pread(file) = self.storage.as_ref() {
                 return self.get_tensors_mps(file);
@@ -1688,10 +1696,12 @@ impl TensorStream {
 ///
 ///     framework (`str`):
 ///         The framework you want you tensors in. Supported values:
-///         `pt`, `tf`, `flax`, `numpy`.
+///         `pt`, `tf`, `flax`, `numpy`, `mlx`, `paddle`.
 ///
 ///     device (`str`, defaults to `"cpu"`):
-///         The device on which you want the tensors.
+///         The device on which you want the tensors. `mlx` supports `"mps"`
+///         on Apple silicon (zero-copy with `mlx >= 0.32` via Metal DLPack,
+///         falling back to the copying path otherwise).
 ///
 ///     backend (`str`, *keyword-only*, defaults to `"mmap"`):
 ///         Storage backend used to serve tensor bytes. `"mmap"` (the default)
@@ -2102,10 +2112,9 @@ impl PySafeSlice {
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
-            && self.framework == Framework::Pytorch
             && !matches!(self.storage.as_ref(), Storage::Paddle(_))
-            && dlpack::torch_mps_compatible(self.info.dtype)
-            && torch_supports_mps_dlpack()
+            && mps_dlpack_supported(&self.framework)
+            && mps_dtype_compatible(&self.framework, self.info.dtype)
         {
             return self.slice_mps(slices);
         }
@@ -2524,7 +2533,9 @@ fn cuda_tensor_from_buffer(
 ///
 /// For dtypes torch's DLPack doesn't accept natively (F4/F8 variants), the
 /// capsule's wire dtype is `uint8` and we `.view(target)` on the torch side:
-/// same bytes, correct dtype, no copy.
+/// same bytes, correct dtype, no copy. MLX has no such dtypes (the dispatch
+/// gates only let natively supported ones through), so its capsule carries
+/// the real dtype and logical shape as-is.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mps_tensor_from_buf(
     py: Python<'_>,
@@ -2533,18 +2544,29 @@ fn mps_tensor_from_buf(
     logical_shape: &[usize],
     buf: crate::metal::MTLBuffer,
 ) -> PyResult<Py<PyAny>> {
-    let storage_shape = torch_storage_shape(dtype, logical_shape)?;
-    let shape_i64: Vec<i64> = storage_shape.iter().map(|&n| n as i64).collect();
-
-    let view_target = if dlpack::dlpack_supported_native(dtype) {
-        None
-    } else {
-        dlpack::torch_view_target(dtype)
-    };
-    let dl_dtype = if view_target.is_some() {
-        dlpack::uint8_dlpack()
-    } else {
-        dlpack::dtype_to_dlpack(dtype)
+    let (shape_i64, dl_dtype, view_target) = match framework {
+        Framework::Pytorch => {
+            let storage_shape = torch_storage_shape(dtype, logical_shape)?;
+            let shape_i64: Vec<i64> = storage_shape.iter().map(|&n| n as i64).collect();
+            let view_target = if dlpack::dlpack_supported_native(dtype) {
+                None
+            } else {
+                dlpack::torch_view_target(dtype)
+            };
+            let dl_dtype = if view_target.is_some() {
+                dlpack::uint8_dlpack()
+            } else {
+                dlpack::dtype_to_dlpack(dtype)
+            };
+            (shape_i64, dl_dtype, view_target)
+        }
+        // Only natively supported dtypes reach here for MLX (see
+        // `dlpack::mlx_metal_compatible`), so no view-cast is needed.
+        _ => (
+            logical_shape.iter().map(|&n| n as i64).collect(),
+            dlpack::dtype_to_dlpack(dtype),
+            None,
+        ),
     };
 
     let device = dlpack::metal_device();
@@ -2595,18 +2617,65 @@ fn torch_supports_mps_dlpack() -> bool {
     })
 }
 
+/// Whether MLX's `from_dlpack` accepts a Metal-device capsule, added in
+/// mlx 0.32 (ml-explore/mlx#3531). We advertise support back to 0.0.9, so
+/// older mlx takes the generic numpy-buffer path instead: correct on every
+/// version, but it copies into MLX's own `MTLBuffer` on first GPU dispatch
+/// rather than aliasing ours.
+///
+/// The result is process-cached; first call imports mlx.core under the GIL.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mlx_supports_metal_dlpack() -> bool {
+    if let Some(&supported) = MLX_METAL_DLPACK.get() {
+        return supported;
+    }
+    *MLX_METAL_DLPACK.get_or_init(|| {
+        Python::attach(|py| {
+            let Ok(mx) = PyModule::import(py, intern!(py, "mlx.core")) else {
+                return false;
+            };
+            let Ok(version) = mx
+                .getattr(intern!(py, "__version__"))
+                .and_then(|v| v.extract::<String>())
+            else {
+                return false;
+            };
+            Version::from_string(&version)
+                .map(|v| v >= Version::new(0, 32, 0))
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Whether `framework`'s `from_dlpack` ingests Metal capsules at all
+/// (version gate; per-dtype compatibility is [`mps_dtype_compatible`]).
+/// Callers combine this with `Device::Mps` to select the zero-copy path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mps_dlpack_supported(framework: &Framework) -> bool {
+    match framework {
+        Framework::Pytorch => torch_supports_mps_dlpack(),
+        Framework::Mlx => mlx_supports_metal_dlpack(),
+        _ => false,
+    }
+}
+
+/// Whether `framework` can ingest `dtype` from a Metal capsule, natively or
+/// via a view-cast workaround (torch only).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mps_dtype_compatible(framework: &Framework, dtype: Dtype) -> bool {
+    match framework {
+        Framework::Pytorch => dlpack::torch_mps_compatible(dtype),
+        Framework::Mlx => dlpack::mlx_metal_compatible(dtype),
+        _ => false,
+    }
+}
+
 /// Framework-specific `from_dlpack` dispatch for a Metal-typed capsule.
 ///
-/// Today only Pytorch is wired. `Open::new`'s framework guard rejects
-/// non-Cpu device for all other frameworks, so this is the only reachable
-/// arm. The remaining frameworks return an explicit error to keep the
-/// surface honest if the upstream guard is ever widened:
+/// Pytorch and MLX are wired; `Open::new`'s framework guard rejects non-Cpu
+/// devices for the remaining frameworks, so they can only reach the explicit
+/// error below if that guard is ever widened:
 ///
-/// - **MLX**: no `from_dlpack` exists; `mx.array(capsule)` fails. The
-///   public Metal-zero-copy path tracked at ml-explore/mlx#2855 isn't
-///   shipped yet (needs allocator::Buffer wrapping + Deleter plumbing).
-///   The numpy-buffer-protocol path is *not* end-to-end zero-copy:
-///   MLX copies into its own MTLBuffer on first GPU dispatch.
 /// - **Numpy / Jax / Paddle / Flax**: not relevant for MPS; none have a
 ///   functioning MPS device path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2620,6 +2689,16 @@ fn ingest_dlpack_mps(
             let torch = get_module(py, &TORCH_MODULE)?;
             Ok(torch
                 .call_method1(intern!(py, "from_dlpack"), (capsule,))?
+                .into())
+        }
+        Framework::Mlx => {
+            let mx = PyModule::import(py, intern!(py, "mlx.core"))?;
+            // `copy=False` keeps the shared MTLBuffer aliased instead of
+            // letting MLX materialize its own (the dispatch gates upstream
+            // guarantee the dtype is zero-copy compatible).
+            let kwargs = [(intern!(py, "copy"), PyBool::new(py, false))].into_py_dict(py)?;
+            Ok(mx
+                .call_method("from_dlpack", (capsule,), Some(&kwargs))?
                 .into())
         }
         Framework::Tensorflow => Err(SafetensorError::new_err(
