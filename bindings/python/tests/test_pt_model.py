@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 
 import torch
@@ -38,6 +40,20 @@ class NonContiguousModel(torch.nn.Module):
         A = torch.zeros((100, 100))
         A = A.transpose(0, 1)
         self.a.weight = torch.nn.Parameter(A)
+
+
+class TiedTransposeModel(torch.nn.Module):
+    def __init__(self, narrow=False):
+        super().__init__()
+        self.encoder = torch.nn.Linear(6, 4, bias=False)
+        self.encoder.weight = torch.nn.Parameter(torch.arange(24.0).reshape(4, 6))
+        self.decoder = torch.nn.Linear(2 if narrow else 4, 6, bias=False)
+        self.decoder.weight = torch.nn.Parameter(
+            self.encoder.weight[: self.decoder.in_features].T
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x)[:, : self.decoder.in_features])
 
 
 class CopyModel(torch.nn.Module):
@@ -141,6 +157,28 @@ class TorchModelTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.assertEqual(_remove_duplicate_names({"B": B}), [])
 
+    def test_end_ptr_non_contiguous(self):
+        tensor = torch.arange(24.0).reshape(4, 6)
+        for view, end_offset in (
+            (tensor.T, 24),
+            (tensor[1:3].T, 18),
+            (tensor[::2, ::2].T, 17),
+        ):
+            with self.subTest(shape=view.shape, stride=view.stride()):
+                self.assertEqual(_end_ptr(view), tensor.data_ptr() + end_offset * 4)
+
+        scalar = torch.tensor(1.0)
+        self.assertEqual(_end_ptr(scalar), scalar.data_ptr() + 4)
+        empty = torch.empty((0, 3)).T
+        self.assertEqual(_end_ptr(empty), empty.data_ptr())
+
+    def test_find_shared_disjoint_transposes(self):
+        tensor = torch.arange(24.0).reshape(4, 6)
+        self.assertEqual(
+            _find_shared_tensors({"first": tensor[:2].T, "second": tensor[2:].T}),
+            [{"first"}, {"second"}],
+        )
+
     def test_failure(self):
         model = Model()
         with self.assertRaises(RuntimeError):
@@ -216,6 +254,34 @@ class TorchModelTestCase(unittest.TestCase):
         state_dict = model.state_dict()
         for k, v in model2.state_dict().items():
             torch.testing.assert_close(v, state_dict[k])
+
+    def test_workaround_shared_transpose(self):
+        for narrow in (False, True):
+            with self.subTest(narrow=narrow), tempfile.TemporaryDirectory() as tmpdir:
+                model = TiedTransposeModel(narrow=narrow)
+                inputs = torch.arange(12.0).reshape(2, 6)
+                expected = model(inputs)
+                expected_state = {
+                    name: value.clone() for name, value in model.state_dict().items()
+                }
+                filename = os.path.join(tmpdir, "model.safetensors")
+                save_model(model, filename)
+
+                model2 = TiedTransposeModel(narrow=narrow)
+                with torch.no_grad():
+                    model2.encoder.weight.zero_()
+                missing, unexpected = load_model(model2, filename)
+                self.assertFalse(missing)
+                self.assertFalse(unexpected)
+                torch.testing.assert_close(model2(inputs), expected)
+                for name, value in model2.state_dict().items():
+                    torch.testing.assert_close(value, expected_state[name])
+
+                with safe_open(filename, framework="pt") as f:
+                    kept = "encoder.weight" if narrow else "decoder.weight"
+                    removed = "decoder.weight" if narrow else "encoder.weight"
+                    self.assertEqual(list(f.keys()), [kept])
+                    self.assertEqual(f.metadata(), {removed: kept})
 
     def test_workaround_copy(self):
         model = CopyModel()
