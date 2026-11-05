@@ -373,6 +373,8 @@ pub fn slice_byte_ranges(
                     dim_size: dim,
                 });
             }
+            // Reversed bounds select nothing, as in Python.
+            let stop = stop.max(start);
             if !matches!(slice, TensorIndexer::Select(_)) {
                 newshape.push((stop - start).div_ceil(step));
             }
@@ -415,7 +417,9 @@ pub fn slice_byte_ranges(
         }
         span *= dim;
     }
-    if indices.is_empty() {
+    if newshape.contains(&0) {
+        indices.clear();
+    } else if indices.is_empty() {
         // Empty `slices` (or all unbounded full-range slices): no slicing
         // happened, the whole tensor is the result. `span` ended as
         // bitsize * product(shape).
@@ -667,6 +671,20 @@ mod tests {
         assert_eq!(iterator.next(), Some(&data[4..12]));
         assert_eq!(iterator.next(), Some(&data[16..24]));
         assert_eq!(iterator.next(), None);
+    }
+
+    #[test]
+    fn test_slice_empty() {
+        for (start, stop, step) in [(3, 1, 1), (3, 1, 2), (3, 3, 1), (3, 3, 2)] {
+            let slice = TensorIndexer::Narrow(
+                Bound::Included(start),
+                Bound::Excluded(stop),
+                NonZeroUsize::new(step).unwrap(),
+            );
+            let (ranges, shape) = slice_byte_ranges(Dtype::F32, &[8, 2], &[slice]).unwrap();
+            assert!(ranges.is_empty());
+            assert_eq!(shape, vec![0, 2]);
+        }
     }
 
     #[test]
