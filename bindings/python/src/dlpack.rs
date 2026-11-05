@@ -289,20 +289,27 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
     let capsule = capsule.inspect_err(|_| {
         unsafe { managed_tensor_deleter::<B>(managed) };
     })?;
-    // On failure the capsule drops with a null context and deletes the tensor.
-    let ctx = Arc::into_raw(deleted) as *mut c_void;
-    capsule
-        .set_context(ctx)
-        .inspect_err(|_| drop(unsafe { Arc::from_raw(ctx as *const AtomicBool) }))?;
+    // The capsule owns one reference to `deleted`, released in `capsule_destructor`.
+    let ctx = Arc::into_raw(deleted).cast_mut().cast::<c_void>();
+    if let Err(e) = capsule.set_context(ctx) {
+        // The capsule never took this reference; reclaim it. The capsule drops
+        // with a null context and deletes the tensor.
+        drop(unsafe { Arc::from_raw(ctx.cast::<AtomicBool>()) });
+        return Err(e);
+    }
     Ok(capsule.unbind())
 }
 
 unsafe extern "C" fn capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
     // torch only renames the capsule once `from_dlpack` succeeds; if it throws
     // after its storage took ownership, the tensor is already freed.
-    let ctx = unsafe { pyo3::ffi::PyCapsule_GetContext(capsule) } as *const AtomicBool;
-    if !ctx.is_null() && unsafe { Arc::from_raw(ctx) }.load(Ordering::Acquire) {
-        return;
+    let ctx = unsafe { pyo3::ffi::PyCapsule_GetContext(capsule) }.cast::<AtomicBool>();
+    if !ctx.is_null() {
+        // Take back the capsule's reference to the flag; it drops at the end of this block.
+        let deleted = unsafe { Arc::from_raw(ctx) };
+        if deleted.load(Ordering::Acquire) {
+            return;
+        }
     }
     let name_ptr = CAPSULE_NAME.as_ptr();
     if unsafe { pyo3::ffi::PyCapsule_IsValid(capsule, name_ptr) } == 0 {
