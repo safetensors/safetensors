@@ -350,8 +350,13 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
                 dim_idx += 1;
             }
         } else if let Ok(slice) = it.cast::<PySlice>() {
-            let start: Option<usize> = slice.getattr(intern!(py, "start"))?.extract()?;
-            let stop: Option<usize> = slice.getattr(intern!(py, "stop"))?.extract()?;
+            let dim = shape.get(dim_idx).copied().unwrap_or(0);
+            // Negative bounds count from the end and clamp at 0, like Python slices.
+            let resolve = |b: Option<isize>| {
+                b.map(|b| usize::try_from(b).unwrap_or_else(|_| dim.saturating_add_signed(b)))
+            };
+            let start = resolve(slice.getattr(intern!(py, "start"))?.extract()?);
+            let stop = resolve(slice.getattr(intern!(py, "stop"))?.extract()?);
             let step_raw: i64 = slice
                 .getattr(intern!(py, "step"))?
                 .extract::<Option<i64>>()?
