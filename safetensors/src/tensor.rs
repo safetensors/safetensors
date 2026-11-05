@@ -639,15 +639,15 @@ impl Metadata {
 
             start = e;
 
-            let nelements: usize = info
+            // Bound non-zero dims even when a zero dim makes the tensor empty:
+            // consumers still derive strides from them.
+            let nbits = info
                 .shape
                 .iter()
-                .copied()
-                .try_fold(1usize, usize::checked_mul)
+                .filter(|&&d| d != 0)
+                .try_fold(info.dtype.bitsize(), |acc, &d| acc.checked_mul(d))
                 .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbits = nelements
-                .checked_mul(info.dtype.bitsize())
-                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let nbits = if info.shape.contains(&0) { 0 } else { nbits };
 
             if nbits % 8 != 0 {
                 return Err(SafeTensorError::MisalignedSlice);
@@ -1591,6 +1591,15 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+        // Zero dim makes numel 0, but the other dims still overflow.
+        let header =
+            br#"{"test":{"dtype":"F32","shape":[0,4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        let mut serialized = (header.len() as u64).to_le_bytes().to_vec();
+        serialized.extend_from_slice(header);
+        assert!(matches!(
+            SafeTensors::deserialize(&serialized),
+            Err(SafeTensorError::ValidationOverflow)
+        ));
     }
 
     #[test]
