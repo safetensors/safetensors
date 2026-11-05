@@ -105,7 +105,8 @@ jobs:
         shell: bash
 
       - name: Install (jax, flax)
-        if: runner.os != 'Windows'
+        # flax pulls grpcio, which has no free-threaded wheel
+        if: runner.os != 'Windows' && matrix.version.arch != 'x64-freethreaded'
         # resolve jax together with the matrix numpy pin: ml_dtypes>=0.6 needs
         # numpy 2 and would otherwise upgrade it under a numpy-1 torch
         run:
@@ -144,7 +145,7 @@ jobs:
           pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
           # importing msgpack._cmsgpack re-enables the GIL, so force-disable
           # until msgpack declares support
-          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py
+          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py --ignore=tests/test_flax_comparison.py
 
   test_s390x_big_endian:
     runs-on: ubuntu-latest
