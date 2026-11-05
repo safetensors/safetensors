@@ -169,6 +169,9 @@ def save_model(
             could potentially change performance if the layout of the tensor
             was chosen specifically for that reason.
     """
+    if metadata is not None:
+        metadata = metadata.copy()
+
     state_dict = model.state_dict()
     to_removes = _remove_duplicate_names(state_dict)
 
