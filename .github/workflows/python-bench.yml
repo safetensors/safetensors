@@ -11,6 +11,8 @@ permissions:
   deployments: write
   # contents permission to update benchmark contents in gh-pages branch
   contents: write
+  # the action creates a review comment on same-repository pull requests
+  pull-requests: write
 
 jobs:
   benchmark:
@@ -58,6 +60,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # Push and deploy GitHub pages branch automatically
           auto-push: ${{ github.event.pull_request.head.repo.fork == false }}
-          comment-on-alert: true
+          # fork PRs get a read-only token: commenting there fails the job (see #905)
+          comment-on-alert: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.fork == false }}
           # Mention @rhysd in the commit comment
           alert-comment-cc-users: '@danieldk,@McPatate'
