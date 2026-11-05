@@ -1,0 +1,21 @@
+[package]
+name = "safetensors-cpp"
+version = "0.9.0-dev.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "C++ bindings for safetensors using CXX"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+cxx = "1.0"
+safetensors = { path = "../../safetensors" }
+serde = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

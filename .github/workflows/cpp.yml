@@ -1,0 +1,37 @@
+name: C++ bindings
+
+on:
+  pull_request:
+    paths:
+      - "bindings/cpp/**"
+      - "safetensors/**"
+      - ".github/workflows/cpp.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/cpp
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build
+      - name: Compile and run the C++ integration test
+        run: |
+          c++ -std=c++14 -Wall -Wextra -Werror -I target/cxxbridge tests/bridge.cpp \
+            target/debug/libsafetensors_cpp.a -ldl -lpthread -lm -o target/bridge_test
+          ./target/bridge_test
+      - name: Compile and run the C++ file example
+        run: |
+          c++ -std=c++14 -Wall -Wextra -Werror -I target/cxxbridge examples/round_trip.cpp \
+            target/debug/libsafetensors_cpp.a -ldl -lpthread -lm -o target/round_trip
+          ./target/round_trip target/example.safetensors
