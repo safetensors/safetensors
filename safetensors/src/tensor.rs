@@ -307,12 +307,92 @@ fn buffered_write_to_file<V: View>(
     total_size: usize,
 ) -> Result<(), SafeTensorError> {
     let path = path.as_ref();
-    // Write to a sibling tempfile then rename, so an existing `path` is never
-    // truncated under any mmap of it (e.g. tensors returned by `load_file`).
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    // Preferred path: write to a sibling tempfile then atomically rename it over
+    // `path`, so an existing `path` is never truncated under any mmap of it
+    // (e.g. tensors returned by `load_file`). See #762.
+    //
+    // Some filesystems do not implement `rename`/`chmod` and therefore cannot
+    // support the tempfile-then-persist strategy — notably FUSE / object-store
+    // mounts such as mountpoint-s3, where `persist` fails with ENOSYS (rename)
+    // or EPERM (chmod). When the tempfile path fails with such an
+    // "operation not supported" error we fall back to the pre-0.8.0 behavior of
+    // writing the destination in place, which those filesystems do support.
+    //
+    // We deliberately do NOT fall back on transient errors such as ENOSPC
+    // (disk full) or EIO: the in-place write truncates `path` up front, so
+    // falling back there would destroy an existing good file when the retry is
+    // doomed to fail anyway. See `is_unsupported_operation`.
+    //
+    // The in-place fallback reintroduces the #762 hazard (truncating a file the
+    // caller currently has mmap'd at `path`), but that scenario does not arise
+    // on the mounts that need this fallback, so failing over is strictly better
+    // than failing the save outright.
+    write_with_fallback(
+        || write_to_file_via_tempfile(path, n, header_bytes, tensors, total_size),
+        || write_to_file_in_place(path, n, header_bytes, tensors, total_size),
+    )
+}
 
-    temp.as_file().set_len(total_size as u64)?;
+/// Whether `err` indicates the filesystem does not support an operation the
+/// tempfile-then-rename write path relies on (`rename`/`chmod`), as opposed to
+/// a transient or space-related failure that an in-place retry can't fix.
+///
+/// mountpoint-s3 and similar FUSE / object-store mounts surface this as ENOSYS
+/// (errno 38, from `rename`) or EPERM (errno 1, from `chmod`); EOPNOTSUPP
+/// (errno 95) is included to cover related object-store mounts.
+#[cfg(feature = "std")]
+fn is_unsupported_operation(err: &SafeTensorError) -> bool {
+    let SafeTensorError::IoError(io_err) = err else {
+        return false;
+    };
+    // Cross-platform: ENOSYS maps to `Unsupported` and EPERM to
+    // `PermissionDenied`, which covers both errors mountpoint-s3 reports.
+    if matches!(
+        io_err.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    // Linux belt-and-suspenders for errnos whose `ErrorKind` mapping isn't
+    // guaranteed on our MSRV (1.80): ENOSYS (38), EPERM (1), EOPNOTSUPP (95).
+    // Gated to Linux because raw errno numbers are platform-specific.
+    #[cfg(target_os = "linux")]
+    {
+        if matches!(io_err.raw_os_error(), Some(38) | Some(1) | Some(95)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run `primary`; if it fails with an "operation not supported" error (see
+/// [`is_unsupported_operation`]), run `fallback` instead. Any other error from
+/// `primary` is returned as-is, so transient failures don't trigger a
+/// potentially destructive in-place retry.
+#[cfg(feature = "std")]
+fn write_with_fallback<P, F>(primary: P, fallback: F) -> Result<(), SafeTensorError>
+where
+    P: FnOnce() -> Result<(), SafeTensorError>,
+    F: FnOnce() -> Result<(), SafeTensorError>,
+{
+    match primary() {
+        Ok(()) => Ok(()),
+        Err(e) if is_unsupported_operation(&e) => fallback(),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the safetensors payload (header length, header, then tensor data) to an
+/// already-opened file. Shared by both the tempfile and in-place strategies.
+#[cfg(feature = "std")]
+fn write_payload_to_file<V: View>(
+    file: &std::fs::File,
+    n: u64,
+    header_bytes: &[u8],
+    tensors: &[V],
+    total_size: usize,
+) -> Result<(), SafeTensorError> {
+    file.set_len(total_size as u64)?;
 
     // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
     // This yields ~30% performance improvement.
@@ -320,25 +400,58 @@ fn buffered_write_to_file<V: View>(
     unsafe {
         use std::os::fd::AsRawFd;
 
-        libc::fcntl(temp.as_file().as_raw_fd(), libc::F_NOCACHE, 1);
+        libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
     }
 
-    {
-        let mut f = std::io::BufWriter::with_capacity(1024 * 1024, temp.as_file());
+    let mut f = std::io::BufWriter::with_capacity(1024 * 1024, file);
 
-        f.write_all(n.to_le_bytes().as_ref())?;
-        f.write_all(header_bytes)?;
+    f.write_all(n.to_le_bytes().as_ref())?;
+    f.write_all(header_bytes)?;
 
-        for tensor in tensors {
-            f.write_all(tensor.data().as_ref())?;
-        }
-
-        f.flush()?;
+    for tensor in tensors {
+        f.write_all(tensor.data().as_ref())?;
     }
+
+    f.flush()?;
+
+    Ok(())
+}
+
+/// Preferred write strategy: write to a sibling tempfile then rename it over
+/// `path`. Atomic and mmap-safe, but requires a filesystem that supports
+/// `rename`/`chmod`.
+#[cfg(feature = "std")]
+fn write_to_file_via_tempfile<V: View>(
+    path: &Path,
+    n: u64,
+    header_bytes: &[u8],
+    tensors: &[V],
+    total_size: usize,
+) -> Result<(), SafeTensorError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+
+    write_payload_to_file(temp.as_file(), n, header_bytes, tensors, total_size)?;
 
     temp.persist(path).map_err(|e| e.error)?;
 
     Ok(())
+}
+
+/// Fallback write strategy (pre-0.8.0 behavior): create/truncate `path` and
+/// write to it in place. Works on filesystems that do not support
+/// `rename`/`chmod` (e.g. mountpoint-s3), at the cost of the #762 mmap hazard.
+#[cfg(feature = "std")]
+fn write_to_file_in_place<V: View>(
+    path: &Path,
+    n: u64,
+    header_bytes: &[u8],
+    tensors: &[V],
+    total_size: usize,
+) -> Result<(), SafeTensorError> {
+    let file = std::fs::File::create(path)?;
+
+    write_payload_to_file(&file, n, header_bytes, tensors, total_size)
 }
 
 /// Serialize to a regular file the dictionnary of tensors.
@@ -1364,6 +1477,175 @@ mod tests {
         let reloaded = SafeTensors::deserialize(&raw).unwrap();
         assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
         std::fs::remove_file(&filename).unwrap();
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_is_unsupported_operation_predicate() {
+        use std::io::{Error, ErrorKind};
+
+        // Cross-platform: the `ErrorKind`s that ENOSYS/EPERM map to must always
+        // trigger the fallback.
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            let err = SafeTensorError::IoError(Error::new(kind, "x"));
+            assert!(is_unsupported_operation(&err), "{kind:?} should fall back");
+        }
+
+        // Non-I/O errors never fall back.
+        assert!(!is_unsupported_operation(&SafeTensorError::HeaderTooLarge));
+
+        // Raw errno numbers are platform-specific, so only assert them on Linux,
+        // where mountpoint-s3 reproduces the failure.
+        #[cfg(target_os = "linux")]
+        {
+            // ENOSYS (38), EPERM (1), EOPNOTSUPP (95) — the errnos mountpoint-s3
+            // surfaces — must trigger the fallback.
+            for errno in [38, 1, 95] {
+                let err = SafeTensorError::IoError(Error::from_raw_os_error(errno));
+                assert!(
+                    is_unsupported_operation(&err),
+                    "errno {errno} should trigger fallback"
+                );
+            }
+            // Transient / space errors must NOT trigger the (destructive)
+            // fallback: ENOSPC (28), EIO (5), EDQUOT (122).
+            for errno in [28, 5, 122] {
+                let err = SafeTensorError::IoError(Error::from_raw_os_error(errno));
+                assert!(
+                    !is_unsupported_operation(&err),
+                    "errno {errno} must NOT trigger fallback"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_write_with_fallback_uses_in_place_on_unsupported_error() {
+        // Regression test: on filesystems that do not implement `rename`/`chmod`
+        // (e.g. mountpoint-s3), the tempfile-then-persist write path introduced
+        // in 0.8.0 fails with ENOSYS/EPERM. The fallback wiring used by
+        // `buffered_write_to_file` must run the in-place writer and produce a
+        // valid file.
+        let filename = std::env::temp_dir().join(format!(
+            "safetensors_test_fallback_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&filename);
+
+        let bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let view = TensorView::new(Dtype::F32, vec![4], &bytes).unwrap();
+        let data: HashMap<String, TensorView> = [("w".to_string(), view)].into_iter().collect();
+
+        let (
+            PreparedData {
+                n,
+                header_bytes,
+                offset,
+                ..
+            },
+            tensors,
+        ) = prepare(&data, None).unwrap();
+        let total_size = N_LEN + header_bytes.len() + offset;
+
+        // Primary simulates the tempfile/rename path failing the way
+        // mountpoint-s3 does (ENOSYS -> `Unsupported`); fallback is the real
+        // in-place writer.
+        write_with_fallback(
+            || {
+                Err(SafeTensorError::IoError(std::io::Error::from(
+                    std::io::ErrorKind::Unsupported,
+                )))
+            },
+            || write_to_file_in_place(&filename, n, &header_bytes, &tensors, total_size),
+        )
+        .unwrap();
+
+        let raw = std::fs::read(&filename).unwrap();
+        let reloaded = SafeTensors::deserialize(&raw).unwrap();
+        assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
+        std::fs::remove_file(&filename).unwrap();
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_write_with_fallback_propagates_transient_error_without_fallback() {
+        // On a transient error (e.g. ENOSPC) we must NOT run the in-place
+        // fallback, since it would truncate an existing good file for a retry
+        // that is bound to fail. The primary error must propagate unchanged and
+        // the fallback must never run.
+        let mut fallback_ran = false;
+        let result = write_with_fallback(
+            || {
+                Err(SafeTensorError::IoError(
+                    std::io::Error::from_raw_os_error(28), // ENOSPC
+                ))
+            },
+            || {
+                fallback_ran = true;
+                Ok(())
+            },
+        );
+
+        assert!(!fallback_ran, "fallback must not run on a transient error");
+        match result {
+            Err(SafeTensorError::IoError(e)) => assert_eq!(e.raw_os_error(), Some(28)),
+            other => panic!("expected the original ENOSPC error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_both_write_strategies_produce_identical_valid_files() {
+        // Both the tempfile and in-place strategies must produce byte-identical,
+        // deserializable output, so failing over between them is transparent.
+        let bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let view = TensorView::new(Dtype::F32, vec![2, 3], &bytes).unwrap();
+        let data: HashMap<String, TensorView> = [("w".to_string(), view)].into_iter().collect();
+
+        let (
+            PreparedData {
+                n,
+                header_bytes,
+                offset,
+                ..
+            },
+            tensors,
+        ) = prepare(&data, None).unwrap();
+        let total_size = N_LEN + header_bytes.len() + offset;
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "safetensors_test_strategy_tmp_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let inplace_path = std::env::temp_dir().join(format!(
+            "safetensors_test_strategy_inplace_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_file(&inplace_path);
+
+        write_to_file_via_tempfile(&tmp_path, n, &header_bytes, &tensors, total_size).unwrap();
+        write_to_file_in_place(&inplace_path, n, &header_bytes, &tensors, total_size).unwrap();
+
+        let via_tempfile = std::fs::read(&tmp_path).unwrap();
+        let in_place = std::fs::read(&inplace_path).unwrap();
+        assert_eq!(via_tempfile, in_place);
+
+        let reloaded = SafeTensors::deserialize(&in_place).unwrap();
+        assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
+
+        std::fs::remove_file(&tmp_path).unwrap();
+        std::fs::remove_file(&inplace_path).unwrap();
     }
 
     #[test]
