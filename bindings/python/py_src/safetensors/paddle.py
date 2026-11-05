@@ -202,6 +202,7 @@ _TYPES = {
     "BOOL": paddle.bool,
     "F8_E4M3": paddle.float8_e4m3fn,
     "F8_E5M2": paddle.float8_e5m2,
+    "C64": paddle.complex64,
 }
 
 NPDTYPES = {
