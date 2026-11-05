@@ -314,14 +314,16 @@ pub type SlicedShape = Vec<usize>;
 /// Resolve a `(start, stop)` half-open element range from slice bounds,
 /// defaulting unbounded ends to `0` and `dim`.
 fn narrow_bounds(left: &Bound<usize>, right: &Bound<usize>, dim: usize) -> (usize, usize) {
+    // saturating_add avoids overflow on a usize::MAX bound; the saturated value
+    // is then rejected by the out-of-range check against `dim` in the caller.
     let start = match left {
         Bound::Unbounded => 0,
         Bound::Included(s) => *s,
-        Bound::Excluded(s) => *s + 1,
+        Bound::Excluded(s) => s.saturating_add(1),
     };
     let stop = match right {
         Bound::Unbounded => dim,
-        Bound::Included(s) => *s + 1,
+        Bound::Included(s) => s.saturating_add(1),
         Bound::Excluded(s) => *s,
     };
     (start, stop)
@@ -355,7 +357,9 @@ pub fn slice_byte_ranges(
         } else {
             let slice = &slices[i];
             let (start, stop, step) = match slice {
-                TensorIndexer::Select(s) => (*s, *s + 1, 1),
+                // saturating_add: a usize::MAX index saturates and is then
+                // caught by the out-of-range check below instead of overflowing.
+                TensorIndexer::Select(s) => (*s, s.saturating_add(1), 1),
                 TensorIndexer::Narrow(left, right, step) => {
                     let (start, stop) = narrow_bounds(left, right, dim);
                     (start, stop, step.get())
@@ -445,6 +449,40 @@ impl<'data> Iterator for SliceIterator<'data> {
 mod tests {
     use super::*;
     use crate::tensor::{Dtype, TensorView};
+
+    #[test]
+    fn test_slice_usize_max_index_out_of_range() {
+        // usize::MAX slice indices must return SliceOutOfRange rather than
+        // overflowing `*s + 1` in the bound resolution.
+        assert!(matches!(
+            slice_byte_ranges(Dtype::F32, &[10], &[TensorIndexer::Select(usize::MAX)]),
+            Err(InvalidSlice::SliceOutOfRange { .. })
+        ));
+        assert!(matches!(
+            slice_byte_ranges(
+                Dtype::F32,
+                &[10],
+                &[TensorIndexer::Narrow(
+                    Bound::Excluded(usize::MAX),
+                    Bound::Unbounded,
+                    NonZeroUsize::MIN
+                )]
+            ),
+            Err(InvalidSlice::SliceOutOfRange { .. })
+        ));
+        assert!(matches!(
+            slice_byte_ranges(
+                Dtype::F32,
+                &[10],
+                &[TensorIndexer::Narrow(
+                    Bound::Unbounded,
+                    Bound::Included(usize::MAX),
+                    NonZeroUsize::MIN
+                )]
+            ),
+            Err(InvalidSlice::SliceOutOfRange { .. })
+        ));
+    }
 
     #[test]
     fn test_helpers() {
