@@ -336,6 +336,28 @@ fn buffered_write_to_file<V: View>(
         f.flush()?;
     }
 
+    // `NamedTempFile` is always created with mode 0o600, which the rename
+    // below would otherwise hand over to `path` (#782). Restore the
+    // permissions a plain `File::create(path)` would have produced: the
+    // existing file's mode when overwriting, else 0o666 masked by the
+    // process umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.permissions(),
+            Err(_) => {
+                // Reading the process umask requires setting it; restore it
+                // right away.
+                let umask = unsafe { libc::umask(0) };
+                unsafe { libc::umask(umask) };
+                std::fs::Permissions::from_mode(0o666 & !u32::from(umask))
+            }
+        };
+        temp.as_file().set_permissions(permissions)?;
+    }
+
     temp.persist(path).map_err(|e| e.error)?;
 
     Ok(())
@@ -1363,6 +1385,43 @@ mod tests {
         let raw = std::fs::read(&filename).unwrap();
         let reloaded = SafeTensors::deserialize(&raw).unwrap();
         assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
+        std::fs::remove_file(&filename).unwrap();
+    }
+
+    #[cfg(all(feature = "std", unix))]
+    #[test]
+    fn test_serialize_to_file_permissions() {
+        // Regression test for #782: writing through a tempfile + rename (#764)
+        // left the destination with the tempfile's 0o600 mode instead of the
+        // umask-derived mode a plain `File::create` would have produced, so
+        // freshly saved models were no longer readable by other users.
+        use std::os::unix::fs::PermissionsExt;
+
+        let filename = std::env::temp_dir().join(format!(
+            "safetensors_test_782_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&filename);
+
+        let bytes: Vec<u8> = vec![0u8; 12];
+        let view = TensorView::new(Dtype::F32, vec![3], &bytes).unwrap();
+        let metadata: HashMap<String, TensorView> = [("w".to_string(), view)].into_iter().collect();
+
+        let old_mask = unsafe { libc::umask(0o022) };
+
+        // A new file gets the mode a plain `File::create` would have produced.
+        serialize_to_file(&metadata, None, &filename).unwrap();
+        let mode = std::fs::metadata(&filename).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+
+        // Overwriting keeps the permissions of the existing destination.
+        std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o640)).unwrap();
+        serialize_to_file(&metadata, None, &filename).unwrap();
+        let mode = std::fs::metadata(&filename).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        unsafe { libc::umask(old_mask) };
         std::fs::remove_file(&filename).unwrap();
     }
 
