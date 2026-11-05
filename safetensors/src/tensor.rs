@@ -310,6 +310,22 @@ fn buffered_write_to_file<V: View>(
     // Write to a sibling tempfile then rename, so an existing `path` is never
     // truncated under any mmap of it (e.g. tensors returned by `load_file`).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+
+    // Create the tempfile with the mode `File::create` uses, so the kernel
+    // applies the umask or the directory's default ACL exactly as it would
+    // for a plain create. tempfile's own default is 0o600, which the rename
+    // would hand over to `path` (#782); a chmod after creation cannot
+    // reproduce a default ACL, since it rewrites the ACL mask. An existing
+    // `path` is replaced by a new file, so it gets a new file's mode too.
+    #[cfg(unix)]
+    let temp = {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o666))
+            .tempfile_in(parent)?
+    };
+    #[cfg(not(unix))]
     let temp = tempfile::NamedTempFile::new_in(parent)?;
 
     temp.as_file().set_len(total_size as u64)?;
@@ -344,6 +360,11 @@ fn buffered_write_to_file<V: View>(
 /// Serialize to a regular file the dictionnary of tensors.
 /// Writing directly to file reduces the need to allocate the whole amount to
 /// memory.
+///
+/// The data is written to a temporary file next to `filename` and renamed
+/// into place, so a file already at `filename` is replaced by a new file
+/// rather than rewritten: it keeps being readable through any mapping of it,
+/// and the new file gets the permissions a newly created file gets.
 #[cfg(feature = "std")]
 pub fn serialize_to_file<S, V, I>(
     data: I,
@@ -1364,6 +1385,117 @@ mod tests {
         let reloaded = SafeTensors::deserialize(&raw).unwrap();
         assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
         std::fs::remove_file(&filename).unwrap();
+    }
+
+    /// Serializes a small tensor to `path`.
+    #[cfg(all(feature = "std", unix))]
+    fn serialize_test_tensor(path: &Path) {
+        let bytes: Vec<u8> = vec![0u8; 12];
+        let view = TensorView::new(Dtype::F32, vec![3], &bytes).unwrap();
+        let metadata: HashMap<String, TensorView> = [("w".to_string(), view)].into_iter().collect();
+        serialize_to_file(&metadata, None, path).unwrap();
+    }
+
+    #[cfg(all(feature = "std", unix))]
+    #[test]
+    fn test_serialize_to_file_permissions_match_create() {
+        // Regression test for #782: writing through a tempfile + rename (#764)
+        // left a new file with the tempfile's 0o600 mode instead of the mode
+        // `File::create` gives it under the process umask. Compared against
+        // `File::create` rather than a fixed mode, so the test holds under
+        // any umask without changing it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        std::fs::File::create(&reference).unwrap();
+        let filename = dir.path().join("out.safetensors");
+        serialize_test_tensor(&filename);
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            format!("{:o}", mode(&filename)),
+            format!("{:o}", mode(&reference))
+        );
+    }
+
+    #[cfg(all(feature = "std", unix))]
+    #[test]
+    fn test_serialize_to_file_overwrite_permissions_match_create() {
+        // The rename replaces an existing `path` with a new file, so the
+        // result has a new file's mode, not the old file's. 0o604 is a mode
+        // no common umask produces, so a copied mode would show.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        std::fs::File::create(&reference).unwrap();
+        let filename = dir.path().join("out.safetensors");
+        serialize_test_tensor(&filename);
+        std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o604)).unwrap();
+        serialize_test_tensor(&filename);
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            format!("{:o}", mode(&filename)),
+            format!("{:o}", mode(&reference))
+        );
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux"))]
+    #[test]
+    fn test_serialize_to_file_default_acl() {
+        // In a directory with a default ACL the kernel ignores the umask and
+        // derives a new file's ACL from the directory's. A file written by
+        // `serialize_to_file`, new or overwritten, must get the same ACL as
+        // one from `File::create`. Skipped when `setfacl` is missing or the
+        // filesystem does not support ACLs.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gid = std::fs::metadata(dir.path()).unwrap().gid();
+        let spec = format!("user::rwx,group::rwx,group:{gid}:rwx,other::---");
+        match Command::new("setfacl")
+            .arg("-d")
+            .arg("-m")
+            .arg(&spec)
+            .arg(dir.path())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!("skipping: cannot set a default ACL on {:?}", dir.path());
+                return;
+            }
+        }
+
+        let reference = dir.path().join("reference");
+        std::fs::File::create(&reference).unwrap();
+        let filename = dir.path().join("out.safetensors");
+        serialize_test_tensor(&filename);
+
+        let acl = |path: &Path| {
+            let output = Command::new("getfacl")
+                .arg("--omit-header")
+                .arg("--numeric")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let expected = acl(&reference);
+        assert!(
+            expected.contains(&format!("group:{gid}:")),
+            "default ACL not applied: {expected}"
+        );
+        assert_eq!(acl(&filename), expected);
+
+        // Overwriting gives the same ACL as a new file.
+        std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o640)).unwrap();
+        serialize_test_tensor(&filename);
+        assert_eq!(acl(&filename), expected);
     }
 
     #[test]
