@@ -205,6 +205,24 @@ class ReadmeTestCase(unittest.TestCase):
         loaded = load(out)
         self.assertTensorEqual(tensors, loaded, np.allclose)
 
+    def test_numpy_non_contiguous(self):
+        values = np.arange(12, dtype=np.float32).reshape(3, 4)
+        big_endian = np.arange(12, dtype=">f4").reshape(3, 4)
+        cases = {
+            "fortran": np.asfortranarray(values),
+            "strided": np.arange(24, dtype=np.float32).reshape(3, 8)[:, ::2],
+            "reversed": values[:, ::-1],
+            "broadcast": np.broadcast_to(values[0], (3, 4)),
+            "empty_fortran": np.zeros((0, 4), dtype=np.float32, order="F"),
+            "scalar": np.array(3.5, dtype=np.float32),
+            "big_endian_fortran": np.asfortranarray(big_endian),
+        }
+        for name, array in cases.items():
+            with self.subTest(name=name):
+                loaded = load(save({"x": array}))["x"]
+                self.assertEqual(loaded.shape, array.shape)
+                self.assertTrue(np.array_equal(loaded, np.array(array)))
+
     def test_numpy_bool(self):
         tensors = {"a": np.asarray(False)}
 
