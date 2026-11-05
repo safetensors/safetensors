@@ -60,6 +60,7 @@ impl Loader {
         _device: i32,
         _threads: usize,
         _spans: Vec<Span>,
+        _allocator: Arc<super::ExternalAllocator>,
     ) -> Result<Self, LoaderError> {
         Err(LoaderError)
     }
