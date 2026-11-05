@@ -27,7 +27,9 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
+          # 26.04's Docker blocks `socketcall`, so i686 containers have no
+          # network: https://github.com/actions/runner-images/issues/14790
+          - runner: ubuntu-24.04
             arch: x86
             target: i686-unknown-linux-gnu
           - runner: ubuntu-latest
