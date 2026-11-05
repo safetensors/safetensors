@@ -106,6 +106,22 @@ class TestCase(unittest.TestCase):
         self.assertEqual(out1[8:].index(b"\x00") + 8, 104)
         self.assertEqual((out1[8:].index(b"\x00") + 8) % 8, 0)
 
+    def test_serialization_rejects_reserved_metadata_tensor_name(self):
+        data = np.array([1, 2], dtype=np.int32)
+        message = "tensor name `__metadata__` is reserved for metadata"
+
+        with self.assertRaisesRegex(SafetensorError, message):
+            save({"__metadata__": data})
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "reserved-name.safetensors"
+            with self.assertRaisesRegex(SafetensorError, message):
+                save_file({"__metadata__": data}, filename)
+            self.assertFalse(filename.exists())
+
+        loaded = load(save({"__metadata___": data}))
+        np.testing.assert_array_equal(loaded["__metadata___"], data)
+
     def test_serialization_no_big_endian(self):
         # Big endian tensor
         data = np.zeros((2, 2), dtype=">i4")
