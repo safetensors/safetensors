@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import tempfile
 import threading
@@ -105,6 +106,19 @@ class TestCase(unittest.TestCase):
         )
         self.assertEqual(out1[8:].index(b"\x00") + 8, 104)
         self.assertEqual((out1[8:].index(b"\x00") + 8) % 8, 0)
+
+    def test_serialization_metadata_deterministic(self):
+        data = np.zeros((2, 2), dtype=np.int32)
+        metadata = {str(i): str(i) for i in range(16)}
+        out1 = save({"test1": data}, metadata=metadata)
+        # Metadata keys are sorted at serialization time, so identical
+        # content always produces byte-identical files.
+        for _ in range(10):
+            self.assertEqual(save({"test1": data}, metadata=metadata), out1)
+        n = int.from_bytes(out1[:8], "little")
+        header = json.loads(out1[8 : 8 + n])
+        keys = list(header["__metadata__"].keys())
+        self.assertEqual(keys, sorted(keys))
 
     def test_serialization_no_big_endian(self):
         # Big endian tensor
