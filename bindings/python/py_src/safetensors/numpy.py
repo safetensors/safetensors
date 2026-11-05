@@ -4,7 +4,14 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from safetensors import TensorSpec, deserialize, safe_open, serialize, serialize_file
+from safetensors import (
+    TensorSpec,
+    _reject_metadata_tensor_name,
+    deserialize,
+    safe_open,
+    serialize,
+    serialize_file,
+)
 
 
 def _flatten(
@@ -52,6 +59,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
+    _reject_metadata_tensor_name(tensor_dict)
     keep_alive_buffer = []  # to keep byteswapped tensors alive
     serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
     result = bytes(serialized)
@@ -89,6 +97,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
+    _reject_metadata_tensor_name(tensor_dict)
     keep_alive_buffer = []  # to keep byteswapped tensors alive
     serialize_file(
         _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
