@@ -1,4 +1,7 @@
+import json
+import mmap
 import os
+import struct
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -7,10 +10,494 @@ import torch
 from safetensors import (
     TensorSpec,
     deserialize,
-    safe_open,
+    safe_open as _safe_open,
     serialize,
     serialize_file,
 )
+
+
+# ---------------------------------------------------------------------------
+# Pluggable device-transfer hook registry
+# ---------------------------------------------------------------------------
+#
+# Third-party device packages (e.g. torch_spyre) can register a callable that
+# safetensors will invoke instead of the generic .to(device) path when a
+# tensor needs to be placed on that device.
+#
+# Registration contract
+# ~~~~~~~~~~~~~~~~~~~~~
+# Call _register_device_transfer_hook(device_type, hook) where:
+#
+#   device_type (str)
+#       The torch.device.type string, e.g. "spyre".
+#
+#   hook (callable)
+#       Signature: hook(cpu_tensor: torch.Tensor, name: str, device) -> torch.Tensor
+#
+#       Arguments:
+#         cpu_tensor  — the tensor freshly loaded from disk, on CPU.
+#                       On the zero-copy mmap path this is a memoryview-backed
+#                       torch.frombuffer view — no CPU heap allocation.
+#                       On the fallback path it is a fully materialised tensor.
+#         name        — the tensor's key in the safetensors file (e.g.
+#                       "model.layers.0.weight"). The hook may use this to
+#                       choose a layout (e.g. optimal stickification for
+#                       Linear weights vs. default layout for biases).
+#         device      — the original device argument passed to safe_open
+#                       (string or torch.device). Passed through so the hook
+#                       can honour a device index ("spyre:1").
+#
+#       Returns:
+#         A torch.Tensor on the target device.
+#
+# safetensors makes no assumptions about what the hook does internally.
+#
+
+_DEVICE_TRANSFER_HOOKS: "dict[str, callable]" = {}
+
+
+def _register_device_transfer_hook(device_type: str, hook: "callable") -> None:
+    """Register a transfer hook for a custom device type.
+
+    Args:
+        device_type: The ``torch.device.type`` string (e.g. ``"spyre"``).
+        hook: A callable with signature
+            ``(cpu_tensor, name, device) -> torch.Tensor``.
+            See module docstring above for the full contract.
+    """
+    if not callable(hook):
+        raise TypeError(f"hook must be callable, got {type(hook)!r}")
+    _DEVICE_TRANSFER_HOOKS[device_type] = hook
+
+
+def _device_type(device) -> str:
+    """Return the device type string from a str or torch.device."""
+    if isinstance(device, torch.device):
+        return device.type
+    if isinstance(device, int):
+        return "cuda"
+    # Handles "spyre", "spyre:0", "cuda:1", etc.
+    return str(device).split(":")[0]
+
+
+# ---------------------------------------------------------------------------
+# Zero-copy mmap loading helpers
+# ---------------------------------------------------------------------------
+#
+# Safetensors file format:
+#   [8 bytes]            header_size  (u64, little-endian)
+#   [header_size bytes]  JSON header  (UTF-8)
+#   [remaining bytes]    raw tensor data  (contiguous, row-major)
+#
+# The JSON header maps each tensor name to:
+#   {"dtype": str, "shape": [int, ...], "data_offsets": [start, end]}
+# where data_offsets are byte offsets relative to the data region start.
+#
+# We mmap the file, parse the header in Python, and build
+# torch.frombuffer views via memoryview slices — no CPU heap allocation.
+# memoryview slicing is zero-copy: it adjusts the buffer-protocol pointer
+# without allocating, so the returned tensors share memory with the OS
+# page cache backing the mmap.
+
+
+def _parse_safetensors_header(mm: mmap.mmap) -> Tuple[Dict[str, Any], int, Optional[Dict[str, str]]]:
+    """Parse the safetensors header from an open mmap.
+
+    Returns:
+        (tensor_info_dict, data_region_offset, metadata)
+
+        tensor_info_dict maps tensor names to their header entries
+        {"dtype", "shape", "data_offsets"}. The __metadata__ key is excluded.
+
+        data_region_offset is the byte offset where tensor data begins.
+
+        metadata is the __metadata__ dict from the header, or None if absent.
+    """
+    header_size = struct.unpack("<Q", mm[:8])[0]
+    header = json.loads(mm[8: 8 + header_size].decode("utf-8"))
+    data_offset = 8 + header_size
+    metadata = header.pop("__metadata__", None)
+    return header, data_offset, metadata
+
+
+def _mmap_tensor_view(
+    mm: mmap.mmap,
+    data_offset: int,
+    tensor_info: Dict[str, Any],
+) -> torch.Tensor:
+    """Return a zero-copy CPU tensor view over mmap'd safetensors bytes.
+
+    Uses memoryview slicing (not bytes slicing) so that no copy of the raw
+    data is made — the returned tensor's data pointer points directly into
+    the OS page cache backing the mmap.
+
+    The mmap must remain open while this view is alive.  The caller
+    (_CustomDeviceSafeTensorsFile) keeps it open until the DMA transfer
+    to the device completes.
+    """
+    dtype_str = tensor_info["dtype"]
+    shape = tensor_info["shape"]
+    start, end = tensor_info["data_offsets"]
+
+    torch_dtype = _getdtype(dtype_str)
+    if torch_dtype is None:
+        raise ValueError(f"Unsupported dtype for zero-copy path: {dtype_str!r}")
+
+    byte_start = data_offset + start
+    byte_end = data_offset + end
+
+    if byte_end == byte_start:
+        return torch.empty(shape, dtype=torch_dtype)
+
+    # memoryview slice: zero-copy, buffer-protocol pointer arithmetic.
+    # torch.frombuffer accepts any buffer-protocol object.
+    buf = memoryview(mm)[byte_start:byte_end]
+    return torch.frombuffer(buf, dtype=torch_dtype).reshape(shape)
+
+# ---------------------------------------------------------------------------
+# _CustomDeviceSafeTensorsFile  (and future custom-device files)
+# ---------------------------------------------------------------------------
+
+
+class _CustomDeviceSafeTensorsFile:
+    """Context-manager wrapper that adds hook-based device support to safe_open.
+
+    Used for any device type that has a registered transfer hook but is not
+    natively understood by the safetensors Rust core.
+
+    Loading strategy
+    ~~~~~~~~~~~~~~~~
+    **Zero-copy mmap (preferred):**
+        Opens the file with Python's mmap module, parses the safetensors
+        header directly in Python, and builds torch.frombuffer views over
+        the mmap'd bytes via memoryview slices — no intermediate CPU tensor
+        is allocated.  Each view is passed straight to the registered hook
+        (e.g. the Spyre DMA engine reads from the mmap address directly).
+
+    **Fallback (CPU materialisation):**
+        If mmap fails (network filesystem, permission error, unsupported
+        dtype) the file is opened via the Rust _safe_open path on CPU and
+        fully materialised tensors are handed to the hook.
+
+    This class is not part of the public API; use safe_open() instead.
+    """
+
+    def __init__(self, filename: str, framework: str, device, hook: "callable", backend: str = "mmap"):
+        self._device = device
+        self._hook = hook
+        self._framework = framework
+        self._backend = backend
+        self._filename = os.fspath(filename)
+
+        # Zero-copy mmap state
+        self._mm: Optional[mmap.mmap] = None
+        self._fp = None
+        self._header: Optional[Dict[str, Any]] = None
+        self._data_offset: int = 0
+        self._metadata: Optional[Dict[str, str]] = None
+
+        # Fallback Rust safe_open handle (also used lazily for get_slice)
+        self._inner = None
+
+        try:
+            self._fp = open(self._filename, "rb")
+            self._mm = mmap.mmap(
+                self._fp.fileno(), 0, access=mmap.ACCESS_COPY
+            )
+            self._header, self._data_offset, self._metadata = _parse_safetensors_header(
+                self._mm
+            )
+        except Exception:
+            self._cleanup_mmap()
+            self._inner = _safe_open(
+                self._filename,
+                framework=framework,
+                device="cpu",
+                backend=backend,
+            )
+
+    def _cleanup_mmap(self) -> None:
+        if self._mm is not None:
+            try:
+                self._mm.close()
+            except Exception:
+                pass
+            self._mm = None
+        if self._fp is not None:
+            try:
+                self._fp.close()
+            except Exception:
+                pass
+            self._fp = None
+        self._header = None
+
+    # -- context-manager protocol ------------------------------------------
+
+    def __enter__(self):
+        if self._inner is not None:
+            self._inner.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        result = None
+        if self._inner is not None:
+            result = self._inner.__exit__(exc_type, exc_val, exc_tb)
+        self._cleanup_mmap()
+        return result
+
+    # -- public interface (mirrors safetensors.safe_open) ------------------
+
+    def keys(self):
+        """Return the tensor names stored in the file."""
+        if self._header is not None:
+            return sorted(self._header.keys())
+        return self._inner.keys()
+
+    def offset_keys(self):
+        """Return tensor names with their byte offsets in the file.
+
+        Returns a list of tuples (name, offset) sorted by offset.
+        This matches the Rust safe_open API.
+        """
+        if self._header is not None:
+	    # Build list of (name, start_offset) tuples
+            offset_list = [
+                (name, info["data_offsets"][0])
+                for name, info in self._header.items()
+            ]
+            # Sort by offset (second element)
+            offset_list.sort(key=lambda x: x[1])
+            return offset_list
+        return self._inner.offset_keys()
+
+    def metadata(self):
+        """Return the user-defined metadata dict from the file header."""
+        if self._mm is not None:
+            return self._metadata
+        if self._inner is not None:
+            return self._inner.metadata()
+        return None
+
+    def get_slice(self, name: str):
+        """Return a lazy CPU slice object for name.
+
+        Slices are always served on CPU.  For slices we cannot call the hook
+        because the final shape is not known until materialisation, so
+        callers that need optimal device layout should use get_tensor().
+        """
+        if self._inner is None:
+            self._cleanup_mmap()
+            self._inner = _safe_open(
+                self._filename,
+                framework=self._framework,
+                device="cpu",
+                backend=self._backend,
+            )
+            self._inner.__enter__()
+        return self._inner.get_slice(name)
+
+    def get_tensor(self, name: str) -> "torch.Tensor":
+        """Load tensor name and transfer it to the target device via the hook.
+
+        Priority:
+          1. tensor hook + mmap path: pass frombuffer view to tensor hook
+          2. tensor hook + Rust fallback: fully materialised CPU tensor
+        """
+        if self._header is not None:
+            if name not in self._header:
+                raise KeyError(
+                    f"Tensor {name!r} not found in {self._filename!r}"
+                )
+            # Path 1: tensor hook — frombuffer view over mmap (no heap alloc)
+            if self._hook is not None:
+                try:
+                    view = _mmap_tensor_view(
+                        self._mm, self._data_offset, self._header[name]
+                    )
+                    return self._hook(view, name, self._device)
+                except (ValueError, RuntimeError):
+                    # ValueError: unsupported dtype for mmap path
+                    # RuntimeError: frombuffer rejects dtype (e.g. BF16) or
+                    #               reshape fails due to inconsistent byte length
+                    pass
+
+        # Path 2: Rust fallback — fully materialised CPU tensor
+        if self._inner is None:
+            self._cleanup_mmap()
+            self._inner = _safe_open(
+                self._filename,
+                framework=self._framework,
+                device="cpu",
+                backend=self._backend,
+            )
+            self._inner.__enter__()
+        cpu_tensor = self._inner.get_tensor(name)
+        if self._hook is not None:
+            return self._hook(cpu_tensor, name, self._device)
+        # Should never reach here (safe_open ensures at least one hook)
+        raise RuntimeError(f"No hook available to transfer tensor {name!r} to {self._device}")
+
+    def get_tensors(self) -> "Dict[str, torch.Tensor]":
+        """Load all tensors and return as a {name: tensor} dict."""
+        return {name: self.get_tensor(name) for name in self.keys()}
+
+
+# ---------------------------------------------------------------------------
+# Public safe_open replacement
+# ---------------------------------------------------------------------------
+
+
+def safe_open(filename, framework: str, device="cpu", *, backend: str = "mmap"):
+    """Open a safetensors file, with support for custom devices via hooks.
+
+    This is a drop-in replacement for :func:`safetensors.safe_open` that
+    adds support for device types not natively understood by the Rust core
+    (such as Spyre), provided a transfer hook has been registered via
+    :func:`_register_device_transfer_hook
+
+    For registered custom devices, tensors are loaded via the zero-copy mmap
+    path: the header is parsed in Python and each tensor is a
+    memoryview-backed torch.frombuffer view over the OS page cache — no
+    intermediate CPU heap allocation.  If mmap is unavailable (network
+    filesystem, etc.) the loader falls back to the Rust CPU path.
+
+    For all natively supported devices (cpu, cuda, cuda:N, mps, musa, npu)
+    the call is forwarded unchanged to the Rust implementation with zero
+    overhead.
+
+    Args:
+        filename (str | os.PathLike): Path to the .safetensors file.
+        framework (str): Tensor framework.  Must be "pt" for PyTorch.
+        device (str | torch.device, optional): Target device.  Defaults to
+            "cpu".  Custom device types are supported if a hook has been
+            registered for them (e.g. "spyre" after importing torch_spyre).
+        backend (str, optional): "mmap" (default) or "pread".
+
+    Raises:
+        RuntimeError: If *device* is a custom type with no registered hook.
+    """
+
+    if isinstance(device, int):
+        device = f"cuda:{device}"
+    dev_type = _device_type(device)
+    hook = _DEVICE_TRANSFER_HOOKS.get(dev_type)
+
+    if hook is not None:
+        return _CustomDeviceSafeTensorsFile(filename, framework, device, hook, backend)
+
+    _KNOWN_NATIVE_DEVICES = {"cpu", "cuda", "mps", "musa", "npu", "xpu", "xla", "mlu", "hpu"}
+    if dev_type not in _KNOWN_NATIVE_DEVICES:
+        raise RuntimeError(
+            f"safetensors: device type '{dev_type}' is not natively supported "
+            f"and no transfer hook has been registered for it. "
+            f"If you are using a third-party device package, make sure it is "
+            f"imported before calling safe_open (e.g. 'import torch_{dev_type}')."
+        )
+
+    return _safe_open(filename, framework=framework, device=device, backend=backend)
+
+def _resolve_parent(model, name):
+    """Resolve the parent module and attribute name for a dotted parameter/buffer name.
+
+    Args:
+        model: The root model
+        name: Dotted name like "layer.0.weight"
+
+    Returns:
+        (parent_module, attr_name) tuple
+
+    Raises:
+        AttributeError: If the parent module path doesn't exist
+    """
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2:
+        parent = model.get_submodule(parts[0])
+        attr_name = parts[1]
+    else:
+        parent = model
+        attr_name = parts[0]
+    return parent, attr_name
+
+
+def _assign_tensors_to_model(model, state_dict, strict=True):
+    """Assign tensors from state_dict directly to model parameters/buffers."""
+    missing_keys = []
+    unexpected_keys = list(state_dict.keys())
+
+    # Assign parameters
+    for name, param in model.named_parameters():
+        if name in state_dict:
+            ckpt_tensor = state_dict[name]
+
+            # Shape and dtype validation (Fix #4)
+            if ckpt_tensor.shape != param.shape:
+                raise RuntimeError(
+                    f"size mismatch for {name}: "
+                    f"copying a param with shape {ckpt_tensor.shape} from checkpoint, "
+                    f"the shape in current model is {param.shape}."
+                )
+            if ckpt_tensor.dtype != param.dtype:
+                raise RuntimeError(
+                    f"dtype mismatch for {name}: "
+                    f"checkpoint has {ckpt_tensor.dtype}, "
+                    f"model expects {param.dtype}."
+                )
+
+            try:
+                parent, attr_name = _resolve_parent(model, name)
+            except AttributeError:
+                missing_keys.append(name)
+                continue
+
+            # Move remove to after get_submodule succeeds (Fix #7)
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+
+            parent._parameters[attr_name] = torch.nn.Parameter(
+                ckpt_tensor, requires_grad=param.requires_grad
+            )
+        else:
+            missing_keys.append(name)
+
+    # Assign buffers
+    for name, buf in model.named_buffers():
+        if name in state_dict:
+            ckpt_tensor = state_dict[name]
+
+            # Shape and dtype validation (Fix #4)
+            if ckpt_tensor.shape != buf.shape:
+                raise RuntimeError(
+                    f"size mismatch for {name}: "
+                    f"copying a buffer with shape {ckpt_tensor.shape} from checkpoint, "
+                    f"the shape in current model is {buf.shape}."
+                )
+            if ckpt_tensor.dtype != buf.dtype:
+                raise RuntimeError(
+                    f"dtype mismatch for {name}: "
+                    f"checkpoint has {ckpt_tensor.dtype}, "
+                    f"model expects {buf.dtype}."
+                )
+
+            try:
+                parent, attr_name = _resolve_parent(model, name)
+            except AttributeError:
+                missing_keys.append(name)
+                continue
+
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+
+            parent._buffers[attr_name] = ckpt_tensor
+        else:
+            missing_keys.append(name)
+
+    if strict and (missing_keys or unexpected_keys):
+        raise RuntimeError(
+            f"Error(s) in loading state_dict: missing keys {missing_keys}, "
+            f"unexpected keys {unexpected_keys}"
+        )
+
+    return missing_keys, unexpected_keys
 
 
 def storage_ptr(tensor: torch.Tensor) -> int:
@@ -197,6 +684,7 @@ def load_model(
     strict: bool = True,
     device: Union[str, int] = "cpu",
     *,
+    assign: bool = False,
     backend: str = "mmap",
 ) -> Tuple[List[str], List[str]]:
     """
@@ -215,6 +703,11 @@ def load_model(
         device (`Union[str, int]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular torch device locations.
+        assign (`bool`, *optional*, defaults to `False`):
+            If True, assign tensors directly to parameters instead of copying
+            via load_state_dict(). This is required when loading to custom
+            devices with models that have meta device parameters, as copying
+            from a non-meta tensor to a meta tensor is a no-op.
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
             and `"pread"` uses `pread(2)` to read tensor bytes.
@@ -225,12 +718,21 @@ def load_model(
             `unexpected` are names that are on the file, but weren't used during
             the load.
     """
+
     state_dict = load_file(filename, device=device, backend=backend)
+    # For custom devices, load_state_dict's copy_() is a no-op on meta tensors.
+    # Automatically use assign path when a hook is registered for this device.
+    dev_type = _device_type(device) if not isinstance(device, int) else "cuda"
+    _assign = assign or (dev_type in _DEVICE_TRANSFER_HOOKS)
     model_state_dict = model.state_dict()
     to_removes = _remove_duplicate_names(
         model_state_dict, preferred_names=state_dict.keys()
     )
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if _assign:
+        missing, unexpected = _assign_tensors_to_model(model, state_dict, strict=False)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
     missing = set(missing)
     for to_remove_group in to_removes.values():
         for to_remove in to_remove_group:
