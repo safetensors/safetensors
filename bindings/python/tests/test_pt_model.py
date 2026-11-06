@@ -230,7 +230,6 @@ class TorchModelTestCase(unittest.TestCase):
         with safe_open("tmp_strided.safetensors", framework="pt") as f:
             self.assertEqual(f.metadata(), {"B": "A", "C": "A"})
 
-
     def test_workaround_non_contiguous(self):
         model = NonContiguousModel()
 
