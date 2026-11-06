@@ -117,6 +117,14 @@ class TorchModelTestCase(unittest.TestCase):
         # Then add the size of the datapoint 4 bytes
         self.assertEqual(end - start, 16 * 3 + 4)
 
+        # A 2D tensor with holes in its storage: ``view(-1)`` cannot be used,
+        # but the last element still has offset 8 in the backing storage.
+        B = torch.zeros((3, 3))
+        A = B[::2, :]
+        start = A.data_ptr()
+        end = _end_ptr(A)
+        self.assertEqual(end - start, 8 * 4 + 4)
+
         # FLOAT16
         A = torch.zeros((4,), dtype=torch.float16)
         start = A.data_ptr()
@@ -201,6 +209,26 @@ class TorchModelTestCase(unittest.TestCase):
         state_dict = model.state_dict()
         for k, v in model2.state_dict().items():
             torch.testing.assert_close(v, state_dict[k])
+
+    def test_workaround_shared_non_contiguous_2d(self):
+        # ``A[::2, :]`` is not contiguous but still shares its storage with
+        # ``A`` and ``A[:1, :]``. Overlap detection must not rely on
+        # ``Tensor.view(-1)``, which raises for such tensors.
+        A = torch.zeros((3, 3))
+        B = A[:1, :]
+        C = A[::2, :]
+
+        class StridedSharedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.A = torch.nn.Parameter(A)
+                self.B = torch.nn.Parameter(B)
+                self.C = torch.nn.Parameter(C)
+
+        model = StridedSharedModel()
+        save_model(model, "tmp_strided.safetensors")
+        with safe_open("tmp_strided.safetensors", framework="pt") as f:
+            self.assertEqual(f.metadata(), {"B": "A", "C": "A"})
 
     def test_workaround_non_contiguous(self):
         model = NonContiguousModel()

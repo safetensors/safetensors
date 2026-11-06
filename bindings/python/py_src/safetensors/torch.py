@@ -27,7 +27,13 @@ def storage_ptr(tensor: torch.Tensor) -> int:
 
 def _end_ptr(tensor: torch.Tensor) -> int:
     if tensor.nelement():
-        stop = tensor.view(-1)[-1].data_ptr() + _SIZE[tensor.dtype]
+        # Do not rely on ``view(-1)`` here: it raises for tensors whose storage
+        # is not contiguous (e.g. ``A[::2, :]``). The offset of the last element
+        # in row-major order is what matters for overlap detection.
+        last_element_offset = sum(
+            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        stop = tensor.data_ptr() + (last_element_offset + 1) * _SIZE[tensor.dtype]
     else:
         stop = tensor.data_ptr()
     return stop
