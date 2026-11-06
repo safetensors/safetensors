@@ -354,14 +354,14 @@ pub fn slice_byte_ranges(
             newshape.push(dim);
         } else {
             let slice = &slices[i];
-            let (start, stop, step) = match slice {
-                TensorIndexer::Select(s) => (*s, *s + 1, 1),
+            let (is_select, start, stop, step) = match slice {
+                TensorIndexer::Select(s) => (true, *s, *s + 1, 1),
                 TensorIndexer::Narrow(left, right, step) => {
                     let (start, stop) = narrow_bounds(left, right, dim);
-                    (start, stop, step.get())
+                    (false, start, stop, step.get())
                 }
             };
-            if start >= dim || stop > dim {
+            if (is_select && start >= dim) || (!is_select && (start > dim || stop > dim)) {
                 let asked = if start >= dim {
                     start
                 } else {
@@ -461,7 +461,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 24);
@@ -480,6 +484,38 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_dim_slice() {
+        let data: Vec<u8> = vec![];
+        let tensor = TensorView::new(Dtype::F32, vec![0, 3], &data).unwrap();
+
+        let iterator = SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.newshape(), vec![0, 3]);
+
+        let iterator = SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Narrow(
+                Bound::Included(0),
+                Bound::Excluded(0),
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.newshape(), vec![0, 3]);
+
+        assert!(SliceIterator::new(&tensor, &[TensorIndexer::Select(0)]).is_err());
+    }
+
+    #[test]
     fn test_fp4_simple() {
         let data: Vec<u8> = vec![0u8, 1u8];
 
@@ -487,7 +523,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 2);
@@ -513,7 +553,11 @@ mod tests {
 
         let iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.remaining_byte_len(), 1);
@@ -541,7 +585,11 @@ mod tests {
 
         let mut iterator = SliceIterator::new(
             &attn_0,
-            &[TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)],
+            &[TensorIndexer::Narrow(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                NonZeroUsize::MIN,
+            )],
         )
         .unwrap();
         assert_eq!(iterator.next(), Some(&data[0..24]));
@@ -744,7 +792,11 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(4), NonZeroUsize::MIN),
+                    TensorIndexer::Narrow(
+                        Bound::Included(1),
+                        Bound::Excluded(4),
+                        NonZeroUsize::MIN
+                    ),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {
@@ -758,11 +810,15 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(Bound::Included(3), Bound::Excluded(2), NonZeroUsize::MIN),
+                    TensorIndexer::Narrow(
+                        Bound::Included(4),
+                        Bound::Excluded(2),
+                        NonZeroUsize::MIN
+                    ),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {
-                asked: 3,
+                asked: 4,
                 dim_index: 1,
                 dim_size: 3,
             })
@@ -778,5 +834,77 @@ mod tests {
             ),
             Err(InvalidSlice::TooManySlices)
         );
+    }
+
+    #[test]
+    fn test_multidimensional_empty_outer_slice() {
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let tensor = TensorView::new(Dtype::F32, vec![2, 3], &data).unwrap();
+
+        // Slicing [0:0, 1:2] on shape [2, 3]: outer dim empty, inner dim non-empty
+        let mut iterator = SliceIterator::new(
+            &tensor,
+            &[
+                TensorIndexer::Narrow(Bound::Included(0), Bound::Excluded(0), NonZeroUsize::MIN),
+                TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(2), NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(iterator.newshape(), vec![0, 1]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.next(), None);
+    }
+
+    #[test]
+    fn test_boundary_empty_slice_1d() {
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let tensor = TensorView::new(Dtype::F32, vec![3], &data).unwrap();
+
+        // Slicing [3:3] on dim = 3
+        let iterator = SliceIterator::new(
+            &tensor,
+            &[TensorIndexer::Narrow(
+                Bound::Included(3),
+                Bound::Excluded(3),
+                NonZeroUsize::MIN,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(iterator.newshape(), vec![0]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+    }
+
+    #[test]
+    fn test_multidimensional_both_empty_slices() {
+        let data: Vec<u8> = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let tensor = TensorView::new(Dtype::F32, vec![2, 3], &data).unwrap();
+
+        // Slicing [0:0, 3:3] on shape [2, 3]
+        let mut iterator = SliceIterator::new(
+            &tensor,
+            &[
+                TensorIndexer::Narrow(Bound::Included(0), Bound::Excluded(0), NonZeroUsize::MIN),
+                TensorIndexer::Narrow(Bound::Included(3), Bound::Excluded(3), NonZeroUsize::MIN),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(iterator.newshape(), vec![0, 0]);
+        assert_eq!(iterator.remaining_byte_len(), 0);
+        assert_eq!(iterator.next(), None);
     }
 }

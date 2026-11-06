@@ -392,3 +392,54 @@ class ReadmeTestCase(unittest.TestCase):
                 str(cm.exception),
                 "Error during slicing [:, :20] with shape [10, 5]: index 19 out of bounds for tensor dimension #1 of size 5",
             )
+
+    def test_numpy_zero_length_slice(self):
+        A = np.zeros((0, 3))
+        tensors = {
+            "a": A,
+        }
+        filename = f"./slice_zero_{threading.get_ident()}.safetensors"
+        save_file(tensors, filename)
+
+        try:
+            # Now loading
+            with safe_open(filename, framework="np", device="cpu") as f:
+                slice_ = f.get_slice("a")
+                tensor = slice_[:]
+                self.assertEqual(list(tensor.shape), [0, 3])
+
+                tensor = slice_[0:]
+                self.assertEqual(list(tensor.shape), [0, 3])
+
+                tensor = slice_[0:0]
+                self.assertEqual(list(tensor.shape), [0, 3])
+
+                with self.assertRaises(SafetensorError) as cm:
+                    tensor = slice_[0]
+                self.assertEqual(
+                    str(cm.exception),
+                    "Error during slicing [0] with shape [0, 3]: index 0 out of bounds for tensor dimension #0 of size 0",
+                )
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
+
+    def test_numpy_non_empty_tensor_empty_slice(self):
+        B = np.arange(6, dtype=np.float32).reshape((2, 3))
+        tensors = {
+            "b": B,
+        }
+        filename = f"./slice_non_empty_{threading.get_ident()}.safetensors"
+        save_file(tensors, filename)
+
+        try:
+            with safe_open(filename, framework="np", device="cpu") as f:
+                slice_ = f.get_slice("b")
+                tensor = slice_[0:0, 1:2]
+                self.assertEqual(list(tensor.shape), [0, 1])
+                self.assertEqual(tensor.nbytes, 0)
+                self.assertEqual(tensor.size, 0)
+                np.testing.assert_array_equal(tensor, B[0:0, 1:2])
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
