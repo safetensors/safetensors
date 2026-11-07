@@ -177,6 +177,8 @@ def _view2np(safeview) -> Dict[str, np.ndarray]:
     for k, v in safeview:
         dtype = _getdtype(v["dtype"])
         arr = np.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])
+        if sys.byteorder == "big":
+            arr = arr.byteswap(inplace=False)
         result[k] = arr
     return result
 

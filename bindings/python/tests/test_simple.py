@@ -62,6 +62,18 @@ class TestCase(unittest.TestCase):
         self.assertEqual(list(out.keys()), ["test"])
         np.testing.assert_array_equal(out["test"], np.zeros((2, 2), dtype=np.int32))
 
+    def test_deserialization_non_zero(self):
+        serialized = save({"test": np.arange(4, dtype=np.int32).reshape(2, 2)})
+        self.assertEqual(
+            serialized[-16:],
+            b"\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00",
+        )
+
+        out = load(serialized)
+        np.testing.assert_array_equal(
+            out["test"], np.arange(4, dtype=np.int32).reshape(2, 2)
+        )
+
     def test_deserialization_metadata(self):
         serialized = (
             b'f\x00\x00\x00\x00\x00\x00\x00{"__metadata__":{"framework":"pt"},"test1":{"dtype":"I32","shape":[2,2],"data_offsets":[0,16]}}'
