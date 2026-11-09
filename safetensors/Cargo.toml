@@ -28,7 +28,7 @@ serde = { version = "1.0", default-features = false, features = [
 ] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.17", features = ["serde"] }
-tempfile = { version = "3", optional = true }
+tempfile = { version = "3.10", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
