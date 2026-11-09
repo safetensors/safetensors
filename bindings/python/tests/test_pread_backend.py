@@ -572,7 +572,7 @@ class PrefetchCudaTests(unittest.TestCase):
 
     def test_misaligned_offsets(self):
         # save_file keeps tensors aligned; hand-build a file where an F32 tensor
-        # sits at byte offset 3 to exercise the realignment path.
+        # sits at byte offset 3: it still lands in its own aligned allocation.
         bad_path = os.path.join(self.tempdir.name, "misaligned.safetensors")
         header = (
             b'{"u8":{"dtype":"U8","shape":[3],"data_offsets":[0,3]},'
