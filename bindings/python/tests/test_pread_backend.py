@@ -353,6 +353,19 @@ class PrefetchCudaTests(unittest.TestCase):
         torch.cuda.empty_cache()
         self.assertEqual(torch.cuda.memory_reserved(0), reserved)
 
+    def test_one_device_allocation_per_load(self):
+        # 16 tensors over 10 MiB would be 16 cudaMallocs; the warm-up makes it one
+        mib = 2**20
+        path = os.path.join(self.tempdir.name, "many.safetensors")
+        save_file({f"t{i}": torch.zeros(4 * mib) for i in range(16)}, path)
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_stats(0)["segment.all.allocated"]
+        with self._open(path) as loader:
+            held = dict(loader)
+            segments = torch.cuda.memory_stats(0)["segment.all.allocated"] - before
+        self.assertEqual(len(held), 16)
+        self.assertLessEqual(segments, 1)
+
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
             t = loader.take("fp32_2d")

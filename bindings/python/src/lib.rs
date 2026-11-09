@@ -1028,6 +1028,17 @@ impl Open {
             .getattr(intern!(py, "_C"))?
             .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (device_idx,))?
             .extract()?;
+        // one cudaMalloc for the whole load: torch caches the block once dropped and
+        // splits it for the tensors below (those up to 1 MiB come from its small pool)
+        let warm: usize = spans
+            .iter()
+            .map(|s| s.end - s.start)
+            .filter(|&n| n > 1 << 20)
+            .map(|n| n.next_multiple_of(512))
+            .sum();
+        if warm > 0 {
+            torch_empty_cuda(py, torch, Dtype::U8, &[warm], device_idx)?;
+        }
         let mut dsts = Vec::with_capacity(spans.len());
         for (span, meta) in spans.iter().zip(&metas) {
             let storage_shape = torch_storage_shape(meta.dtype, &meta.shape)?;
