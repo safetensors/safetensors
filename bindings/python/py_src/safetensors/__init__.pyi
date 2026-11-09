@@ -179,12 +179,10 @@ class PrefetchLoader:
     """
     The tensors of one file loading to a CUDA device in the background, returned by
     `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating, as a
-    zero-copy view of device memory. An allocation's memory is freed once every tensor in it
-    has been taken and dropped; allocations with untaken tensors are held until `close`.
+    tensor torch allocated on the CUDA stream current at `prefetch`, so torch accounts for it and
+    frees it when dropped; tensors not taken are released at `close`.
 
-    Tensors are ready on any stream when handed out. The free is fenced on the CUDA stream that was
-    current at hand-out; a consumer that reads a tensor on another stream must synchronize it before
-    dropping the last reference.
+    Tensors are ready on any stream when handed out.
     """
 
     def names(self) -> List[str]:
@@ -253,8 +251,8 @@ class safe_open:
         Start loading the file's tensors to a CUDA device in the background.
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
-        iterating it as `(name, tensor)` pairs in readiness order, as zero-copy views of
-        device memory. The handle itself is unchanged: its header queries and `get_slice`
+        iterating it as `(name, tensor)` pairs in readiness order, as tensors torch allocates
+        at the call. The handle itself is unchanged: its header queries and `get_slice`
         keep working, and several loaders can be started from one handle (for instance one
         per device). Requires `framework="pt"`; works with either backend. Each loader runs
         `threads` reader threads; all loaders in the process share one pinned staging pool.

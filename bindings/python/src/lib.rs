@@ -662,33 +662,18 @@ struct SpanMeta {
 
 /// The tensors of one file loading to a CUDA device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
-/// by iterating, as a zero-copy view of device memory. An allocation's memory is
-/// freed once every tensor in it has been taken and dropped; allocations with
-/// untaken tensors are held until the loader is closed.
+/// by iterating. Tensors are allocated by torch on the CUDA stream current at
+/// `prefetch`, so torch accounts for them and frees each one when dropped;
+/// tensors not taken are released at `close`.
 ///
-/// Tensors are ready on any stream when handed out. The free is fenced on the
-/// CUDA stream that was current at hand-out; a consumer that reads a tensor on
-/// another stream must synchronize it before dropping the last reference.
+/// Tensors are ready on any stream when handed out.
 #[pyclass]
 pub struct PrefetchLoader {
-    loader: Loader,
+    loader: Loader<Py<PyAny>>,
     /// per span, aligned with the spans given to `loader`
-    spans: Vec<SpanMeta>,
+    names: Vec<String>,
     /// tensor name -> span index
     index_map: HashMap<String, usize>,
-}
-
-impl PrefetchLoader {
-    /// Takes the span loaded for `name`, once
-    fn take_buffer(&self, py: Python<'_>, name: &str) -> PyResult<(DeviceBuffer, &SpanMeta)> {
-        let &idx = self.index_map.get(name).ok_or_else(|| {
-            SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
-        })?;
-        let buffer = py
-            .detach(|| self.loader.take_tensor(idx))
-            .map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))?;
-        Ok((buffer, &self.spans[idx]))
-    }
 }
 
 #[pymethods]
@@ -696,11 +681,11 @@ impl PrefetchLoader {
     /// The names this loader hands out, in file order. (Not `keys`: a loader is
     /// not a mapping, each tensor is taken once, and `dict(loader)` must iterate.)
     pub fn names(&self) -> Vec<String> {
-        self.spans.iter().map(|span| span.name.clone()).collect()
+        self.names.clone()
     }
 
     fn __len__(&self) -> usize {
-        self.spans.len()
+        self.names.len()
     }
 
     /// Takes `name`'s tensor, waiting if its bytes have not landed yet.
@@ -708,22 +693,21 @@ impl PrefetchLoader {
     /// Each tensor can be taken once, by [`Self::take`] or by iterating the
     /// loader; asking again raises. Rows planned as a slice come back as that slice.
     pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let (buffer, meta) = self.take_buffer(py, name)?;
-        match buffer {
-            DeviceBuffer::Cuda(buffer) => {
-                cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)
-            }
-        }
+        let &idx = self.index_map.get(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
+        })?;
+        py.detach(|| self.loader.take_tensor(idx))
+            .map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))
     }
 
     /// `(name, tensor)` pairs as their bytes land, so the order is unspecified;
     /// tensors already taken are skipped.
     fn __iter__(slf: PyRef<'_, Self>) -> TensorStream {
         let iter = slf.loader.iter();
-        let entries = slf.spans.clone();
+        let names = slf.names.clone();
         TensorStream {
             iter,
-            entries,
+            names,
             _keepalive: Some(Py::from(slf).into_any()),
         }
     }
@@ -731,7 +715,9 @@ impl PrefetchLoader {
     /// Stops the background load and releases every tensor not taken yet.
     /// Tensors already handed out keep their memory.
     pub fn close(&mut self, py: Python<'_>) {
-        py.detach(|| self.loader.close());
+        // dropped attached, so torch frees them now
+        let untaken = py.detach(|| self.loader.close());
+        drop(untaken);
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -958,6 +944,7 @@ impl Open {
     /// Start loading tensors to the device in the background; see `safe_open.prefetch`.
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
@@ -1033,10 +1020,43 @@ impl Open {
         if rows_of.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+
+        // torch allocates every tensor up front, on its current stream: its
+        // allocator accounts for them and reuses their memory once dropped
+        let torch = get_module(py, &TORCH_MODULE)?;
+        let stream: u64 = torch
+            .getattr(intern!(py, "_C"))?
+            .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (device_idx,))?
+            .extract()?;
+        let mut dsts = Vec::with_capacity(spans.len());
+        for (span, meta) in spans.iter().zip(&metas) {
+            let storage_shape = torch_storage_shape(meta.dtype, &meta.shape)?;
+            let tensor = torch_empty_cuda(py, torch, meta.dtype, &storage_shape, device_idx)?;
+            let tensor = tensor.bind(py);
+            let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
+            if nbytes != span.end - span.start {
+                return Err(SafetensorError::new_err(format!(
+                    "{}: torch allocated {nbytes} bytes for {} bytes of data",
+                    meta.name,
+                    span.end - span.start
+                )));
+            }
+            let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+            dsts.push((ptr, tensor.clone().unbind()));
+        }
+
+        let loader = Loader::load(
+            self.file.clone(),
+            self.offset,
+            device_idx,
+            threads,
+            spans,
+            dsts,
+            stream,
+        )?;
         Ok(PrefetchLoader {
             loader,
-            spans: metas,
+            names: metas.into_iter().map(|m| m.name).collect(),
             index_map,
         })
     }
@@ -1651,9 +1671,9 @@ impl From<LoaderError> for PyErr {
 /// order, each tensor delivered once.
 #[pyclass]
 pub struct TensorStream {
-    iter: TensorIter,
+    iter: TensorIter<Py<PyAny>>,
     /// per span, aligned with the loader's spans
-    entries: Vec<SpanMeta>,
+    names: Vec<String>,
     _keepalive: Option<Py<PyAny>>,
 }
 
@@ -1667,15 +1687,7 @@ impl TensorStream {
         match py.detach(|| self.iter.next()) {
             None => Ok(None),
             Some(Err(e)) => Err(e.into()),
-            Some(Ok((idx, buffer))) => {
-                let meta = &mut self.entries[idx];
-                let tensor = match buffer {
-                    DeviceBuffer::Cuda(buffer) => {
-                        cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)?
-                    }
-                };
-                Ok(Some((std::mem::take(&mut meta.name), tensor)))
-            }
+            Some(Ok((idx, tensor))) => Ok(Some((std::mem::take(&mut self.names[idx]), tensor))),
         }
     }
 }
@@ -1733,7 +1745,7 @@ impl safe_open {
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
-    /// readiness order, as zero-copy views of device memory. The handle itself
+    /// readiness order, as tensors torch allocates at the call. The handle itself
     /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
     /// started from one handle (for instance one per device). Requires
     /// `framework="pt"`; works with either backend. Each loader runs `threads`
@@ -1766,11 +1778,12 @@ impl safe_open {
     #[pyo3(signature = (plan=None, *, device=None, threads=8))]
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads)
     }
 
     /// Return the special non tensor information in the header
@@ -1915,7 +1928,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, Span, TensorIter};
+use crate::engine::{Loader, LoaderError, Span, TensorIter};
 
 struct Disp(Vec<TensorIndexer>);
 
@@ -2459,64 +2472,6 @@ fn torch_empty_cuda(
         .unbind())
 }
 
-fn cuda_tensor_from_buffer(
-    py: Python<'_>,
-    dtype: Dtype,
-    logical_shape: &[usize],
-    buffer: CudaBuffer,
-) -> PyResult<Py<PyAny>> {
-    let torch = get_module(py, &TORCH_MODULE)?;
-    let storage_shape = torch_storage_shape(dtype, logical_shape)?;
-
-    if buffer.len() == 0 {
-        return torch_empty_cuda(py, torch, dtype, &storage_shape, buffer.device());
-    }
-
-    let stream: u64 = torch
-        .getattr(intern!(py, "_C"))?
-        .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (buffer.device(),))?
-        .extract()?;
-    buffer.consumed_on(stream);
-    let device = dlpack::cuda_device(buffer.device());
-    // Tensors are views at their packed file offset inside a shared allocation,
-    // which may be misaligned for the element type: stage through a flat uint8
-    // view and let torch's aligned clone fix it
-    if buffer.ptr() % (dtype.bitsize() / 8).max(1) as u64 != 0 {
-        let nbytes = buffer.len() as i64;
-        let capsule = dlpack::to_capsule(py, buffer, vec![nbytes], dlpack::uint8_dlpack(), device)?;
-        let shape: Py<PyAny> = storage_shape.into_pyobject(py)?.into();
-        return Ok(torch
-            .call_method1(intern!(py, "from_dlpack"), (capsule,))?
-            .call_method0(intern!(py, "clone"))?
-            .call_method1(intern!(py, "view"), (get_pydtype(torch, dtype, false)?,))?
-            .call_method1(intern!(py, "reshape"), (shape,))?
-            .unbind());
-    }
-    let shape_i64 = storage_shape.iter().map(|&n| n as i64).collect();
-    let view_target = if dlpack::dlpack_supported_native(dtype) {
-        None
-    } else {
-        dlpack::torch_view_target(dtype)
-    };
-    let dl_dtype = if view_target.is_some() {
-        dlpack::uint8_dlpack()
-    } else {
-        dlpack::dtype_to_dlpack(dtype)
-    };
-
-    let capsule = dlpack::to_capsule(py, buffer, shape_i64, dl_dtype, device)?;
-    let tensor = torch.call_method1(intern!(py, "from_dlpack"), (capsule,))?;
-    match view_target {
-        Some(name) => {
-            let target = torch.getattr(name)?;
-            Ok(tensor
-                .call_method1(intern!(py, "view"), (target,))?
-                .unbind())
-        }
-        None => Ok(tensor.unbind()),
-    }
-}
-
 /// Hand a filled `MTLBuffer` to the framework as a tensor via DLPack.
 ///
 /// Zero-byte tensors arrive as a clamp-allocated buffer (`alloc_shared`); the
@@ -2905,11 +2860,12 @@ impl _safe_open_handle {
     #[pyo3(signature = (plan=None, *, device=None, threads=8))]
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads)
     }
 
     /// Return the special non tensor information in the header

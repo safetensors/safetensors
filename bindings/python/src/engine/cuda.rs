@@ -5,13 +5,11 @@ use std::{
 
 pub type Stream = *mut c_void;
 pub type Event = *mut c_void;
-pub type MemPool = *mut c_void;
 type Err = c_int;
 
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x2;
 const CUDA_STREAM_NON_BLOCKING: c_uint = 0x1;
-const CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD: c_int = 4;
 
 macro_rules! cuda_fns {
     ($( $name:ident : fn( $($arg:ty),*) -> Err),+ $(,)?) => {
@@ -49,10 +47,7 @@ cuda_fns! {
     cudaEventDestroy:            fn(Event) -> Err,
     cudaSetDevice:               fn(c_int) -> Err,
     cudaGetDevice:               fn(*mut c_int) -> Err,
-    cudaDeviceGetDefaultMemPool: fn(*mut MemPool, c_int) -> Err,
-    cudaMemPoolSetAttribute:     fn(MemPool, c_int, *mut c_void) -> Err,
     cudaMemGetInfo:              fn(*mut usize, *mut usize) -> Err,
-    cudaMemPoolTrimTo:           fn(MemPool, usize) -> Err,
 }
 
 type GetErrorString = unsafe extern "C" fn(Err) -> *const c_char;
@@ -118,12 +113,14 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaFreeHost)(ptr as *mut c_void) })
     }
 
+    #[cfg(test)]
     pub fn malloc_async(&self, len: usize, s: Stream) -> Result<u64, CudaError> {
         let mut ptr = std::ptr::null_mut();
         self.check(unsafe { (self.f.cudaMallocAsync)(&mut ptr, len, s) })?;
         Ok(ptr as u64)
     }
 
+    #[cfg(test)]
     pub fn free_async(&self, ptr: u64, s: Stream) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaFreeAsync)(ptr as *mut c_void, s) })
     }
@@ -230,25 +227,6 @@ impl CudaApi {
         let mut total = 0;
         self.check(unsafe { (self.f.cudaMemGetInfo)(&mut free, &mut total) })?;
         Ok((free, total))
-    }
-
-    pub fn pool_set_release_threshold(&self, device: i32, bytes: u64) -> Result<(), CudaError> {
-        let mut pool = std::ptr::null_mut();
-        self.check(unsafe { (self.f.cudaDeviceGetDefaultMemPool)(&mut pool, device) })?;
-        let mut v = bytes;
-        self.check(unsafe {
-            (self.f.cudaMemPoolSetAttribute)(
-                pool,
-                CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                &mut v as *mut u64 as *mut c_void,
-            )
-        })
-    }
-
-    pub fn pool_trim(&self, device: i32) -> Result<(), CudaError> {
-        let mut pool = std::ptr::null_mut();
-        self.check(unsafe { (self.f.cudaDeviceGetDefaultMemPool)(&mut pool, device) })?;
-        self.check(unsafe { (self.f.cudaMemPoolTrimTo)(pool, 0) })
     }
 }
 
@@ -429,12 +407,11 @@ mod test {
             api.free_async(dev, s).unwrap();
             api.event_record(e, s).unwrap();
             api.event_sync(e).unwrap();
-            api.pool_trim(0).unwrap();
 
             let (free1, _) = api.mem_get_info().unwrap();
             assert!(
                 free1 + (16 << 20) >= free0,
-                "pool retained memory after trim"
+                "device memory not released after free"
             );
 
             api.stream_wait_event(s, e).unwrap();
