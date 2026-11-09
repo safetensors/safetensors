@@ -182,6 +182,17 @@ class ErrorsTestCase(unittest.TestCase):
                 pass
         self.assertEqual(str(ctx.exception), "No such file or directory: notafile")
 
+    def test_reserved_tensor_name(self):
+        tensors = {"__metadata__": np.zeros((2,), dtype=np.float32)}
+        for metadata in (None, {"k": "v"}):
+            with self.assertRaises(SafetensorError) as ctx:
+                save(tensors, metadata=metadata)
+            self.assertIn("__metadata__", str(ctx.exception))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "reserved.safetensors")
+            with self.assertRaises(SafetensorError):
+                save_file_pt({"__metadata__": torch.zeros(2)}, filename)
+
 
 class ReadmeTestCase(unittest.TestCase):
     def assertTensorEqual(self, tensors1, tensors2, equality_fn):
