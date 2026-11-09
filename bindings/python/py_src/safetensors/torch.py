@@ -463,7 +463,7 @@ def _view2torch(safeview) -> Dict[str, torch.Tensor]:
         if len(v["data"]) == 0:
             # Workaround because frombuffer doesn't accept zero-size tensors
             assert any(x == 0 for x in v["shape"])
-            arr = torch.empty(v["shape"], dtype=dtype)
+            arr = torch.empty(v["shape"], dtype=dtype, device="cpu")
         else:
             arr = torch.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])
         if sys.byteorder == "big":

@@ -2720,6 +2720,9 @@ fn create_tensor<'a>(
             let shape: Py<PyAny> = shape.clone().into_pyobject(py)?.into();
             let args = (shape,);
             let kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+            if framework == &Framework::Pytorch {
+                kwargs.set_item(intern!(py, "device"), "cpu")?;
+            }
             module.call_method("zeros", args, Some(&kwargs))?
         } else {
             // let frombuffer = module.getattr(intern!(py, "frombuffer"))?;
