@@ -358,6 +358,18 @@ class ReadmeTestCase(unittest.TestCase):
             self.assertEqual(list(tensor.shape), [8])
             self.assertTrue(np.allclose(tensor, A[2:, -5]))
 
+            tensor = slice_[-2:]
+            self.assertEqual(list(tensor.shape), [2, 5])
+            self.assertTrue(np.allclose(tensor, A[-2:]))
+
+            tensor = slice_[:, 1:-1]
+            self.assertEqual(list(tensor.shape), [10, 3])
+            self.assertTrue(np.allclose(tensor, A[:, 1:-1]))
+
+            tensor = slice_[-20:]
+            self.assertEqual(list(tensor.shape), [10, 5])
+            self.assertTrue(np.allclose(tensor, A[-20:]))
+
             tensor = slice_[list()]
             self.assertEqual(list(tensor.shape), [0, 5])
             self.assertTrue(np.allclose(tensor, A[list()]))
