@@ -451,6 +451,12 @@ if hasattr(torch, "uint64"):  # Torch 2.3.0+
         }
     )
 
+# Packed FP4 and MX float8 are real torch dtypes. Without these names, `load` raises KeyError.
+if hasattr(torch, "float4_e2m1fn_x2"):
+    _TYPES["F4"] = torch.float4_e2m1fn_x2
+if hasattr(torch, "float8_e8m0fnu"):
+    _TYPES["F8_E8M0"] = torch.float8_e8m0fnu
+
 
 def _getdtype(dtype_str: str) -> torch.dtype:
     return _TYPES[dtype_str]
