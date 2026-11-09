@@ -110,7 +110,7 @@ def get_discard_names(
 
         class_ = getattr(transformers, architecture)
 
-        # Name for this varible depends on transformers version.
+        # Name for this variable depends on transformers version.
         discard_names = getattr(class_, "_tied_weights_keys", [])
 
     except Exception:
