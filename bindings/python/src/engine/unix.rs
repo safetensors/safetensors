@@ -20,10 +20,11 @@
 //!   [`MIN_ALLOCATION_SIZE`], or up to the end of the contiguous run if that
 //!   comes first: far fewer allocations than one per tensor, without hoarding
 //!   a whole file in a single buffer, which keeps device memory use balanced.
-//! - chunks ([`LoadPlan::chunks`]): slices of at most [`CHUNK_SIZE`] of one allocation.
-//!   The I/O unit: one `pread`, one slab, one `memcpy`, one event.
-//!   `LoadPlan::span_alloc` and `span_chunks` record, per span, the
-//!   `Allocation` it lives in and the chunks that carry its bytes.
+//! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`] of adjacent spans,
+//!   never across a gap. The I/O unit: one `pread`, one slab, one event, one
+//!   `memcpy` per span it carries. `LoadPlan::span_alloc`, `span_chunks` and
+//!   `chunk_spans` record, per span, the `Allocation` it lives in and the
+//!   chunks that carry its bytes, and per chunk, its spans.
 //!
 //! Data flow, per file:
 //!
@@ -33,9 +34,9 @@
 //!   lease = SlabPool::acquire()          a pinned host slab from the shared
 //!                                        pool; waits for its previous copy
 //!   pread(chunk c) -> lease              one read per chunk
-//!   memcpyAsync(lease -> device)         one copy per chunk into its Allocation,
-//!                                        on STREAMS[device]
-//!   chunk_completion_events[c] = event   recorded after the copy; 0 while
+//!   memcpyAsync(lease -> device)         one copy per span in the chunk, into
+//!                                        its Allocation, on STREAMS[device]
+//!   chunk_completion_events[c] = event   recorded after the copies; 0 while
 //!                                        the chunk is still pending
 //! consumer
 //!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
@@ -205,11 +206,11 @@ struct LoadPlan {
     span_chunks: Box<[Range<usize>]>,
     /// in file data section byte interval each [`Allocation`] covers
     allocation_file_ranges: Box<[Range<usize>]>,
-    /// in file data section byte interval of each chunk: at most [`CHUNK_SIZE`],
-    /// inside one allocation
+    /// data section byte interval of each chunk: at most [`CHUNK_SIZE`] of
+    /// adjacent spans, never across a gap
     chunks: Box<[Range<usize>]>,
-    /// per chunk, the [`Allocation`] it lands in
-    chunk_alloc: Box<[usize]>,
+    /// per chunk, the spans it carries bytes of
+    chunk_spans: Box<[Range<usize>]>,
     in_file_offset: usize,
 }
 
@@ -254,40 +255,39 @@ impl LoadPlan {
         }
 
         let mut chunks: Vec<Range<usize>> = Vec::new();
-        let mut chunk_alloc: Vec<usize> = Vec::new();
-        let mut first_chunk = Vec::with_capacity(allocation_file_ranges.len());
-        for (alloc_idx, alloc_file_range) in allocation_file_ranges.iter().enumerate() {
-            first_chunk.push(chunks.len());
-            let mut start = alloc_file_range.start;
-            while start < alloc_file_range.end {
-                let end = (start + chunk_size).min(alloc_file_range.end);
-                chunks.push(start..end);
-                chunk_alloc.push(alloc_idx);
-                start = end;
-            }
-        }
-
-        let span_chunks = spans
-            .iter()
-            .zip(&span_alloc)
-            .map(|(span, &alloc_idx)| match alloc_idx {
-                Some(a) => {
-                    let base = allocation_file_ranges[a].start;
-                    let first = first_chunk[a];
-                    first + (span.start - base) / chunk_size
-                        ..first + (span.end - 1 - base) / chunk_size + 1
+        let mut chunk_spans: Vec<Range<usize>> = Vec::new();
+        let mut span_chunks = vec![0..0; spans.len()];
+        for (i, span) in spans.iter().enumerate() {
+            let mut start = span.start;
+            let mut first = chunks.len();
+            while start < span.end {
+                let n = chunks.len();
+                match chunks.last_mut() {
+                    // the previous span's last chunk ends here and has room left
+                    Some(chunk) if chunk.end == start && chunk.len() < chunk_size => {
+                        chunk.end = (chunk.start + chunk_size).min(span.end);
+                        chunk_spans.last_mut().unwrap().end = i + 1;
+                        first = first.min(n - 1);
+                        start = chunk.end;
+                    }
+                    _ => {
+                        let end = (start + chunk_size).min(span.end);
+                        chunks.push(start..end);
+                        chunk_spans.push(i..i + 1);
+                        start = end;
+                    }
                 }
-                None => 0..0,
-            })
-            .collect();
+            }
+            span_chunks[i] = first..chunks.len();
+        }
 
         Self {
             spans: spans.into_boxed_slice(),
             span_alloc: span_alloc.into_boxed_slice(),
-            span_chunks,
+            span_chunks: span_chunks.into_boxed_slice(),
             allocation_file_ranges: allocation_file_ranges.into_boxed_slice(),
             chunks: chunks.into_boxed_slice(),
-            chunk_alloc: chunk_alloc.into_boxed_slice(),
+            chunk_spans: chunk_spans.into_boxed_slice(),
             in_file_offset,
         }
     }
@@ -563,22 +563,31 @@ impl CudaSink {
         read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         let chunk = self.plan.chunks[chunk_idx].clone();
-        let alloc_idx = self.plan.chunk_alloc[chunk_idx];
         let mut lease = self.pool.acquire(self.api)?;
         read(
             lease.mut_slice(chunk.len()),
             (self.plan.in_file_offset + chunk.start) as u64,
         )?;
 
-        let alloc_start = self.plan.allocation_file_ranges[alloc_idx].start;
-        let dst = self.allocation_ptr(alloc_idx)?;
+        let mut copies = Vec::new();
+        for s in self.plan.chunk_spans[chunk_idx].clone() {
+            let span = self.plan.spans[s];
+            let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
+            if let (Some(a), true) = (self.plan.span_alloc[s], start < end) {
+                let dst = self.allocation_ptr(a)?;
+                let at = start - self.plan.allocation_file_ranges[a].start;
+                copies.push((dst + at as u64, start - chunk.start, end - start));
+            }
+        }
         let e = self.api.with_device(self.device, |d| {
-            self.api.memcpy_h2d_async(
-                dst + (chunk.start - alloc_start) as u64,
-                lease.ptr(),
-                chunk.len(),
-                self.stream,
-            )?;
+            for &(dst, offset, len) in &copies {
+                self.api.memcpy_h2d_async(
+                    dst,
+                    lease.ptr().wrapping_add(offset),
+                    len,
+                    self.stream,
+                )?;
+            }
             lease.release(d, self.stream)?;
             let e = d.event_create()?;
             if let Err(err) = self.api.event_record(e, self.stream) {
@@ -981,31 +990,52 @@ mod tests {
                 );
             }
         }
-        // chunks: tile every allocation exactly, <= chunk_size, never crossing one
-        let mut c = 0;
-        for (i, r) in ranges.iter().enumerate() {
-            let mut cursor = r.start;
-            while cursor < r.end {
-                let chunk = &plan.chunks[c];
-                assert_eq!(plan.chunk_alloc[c], i);
+        // chunks: sorted, disjoint, <= chunk_size, cut only at gaps and full chunks
+        let covered = |at: usize| plan.spans.iter().any(|s| s.start <= at && at < s.end);
+        for w in plan.chunks.windows(2) {
+            assert!(
+                w[0].end <= w[1].start,
+                "chunks overlap or are unsorted: {w:?}"
+            );
+            if w[0].end == w[1].start {
                 assert_eq!(
-                    chunk.start, cursor,
-                    "chunk {c} does not continue allocation {i}"
+                    w[0].len(),
+                    chunk_size,
+                    "undersized cut without a gap: {w:?}"
                 );
-                assert!(chunk.len() <= chunk_size && chunk.end <= r.end);
-                cursor = chunk.end;
-                c += 1;
             }
         }
-        assert_eq!(c, plan.chunks.len(), "chunks outside every allocation");
-        assert_eq!(plan.chunks.len(), plan.chunk_alloc.len());
-        // a span's chunks == the chunks it intersects
-        for (s, chunks) in plan.spans.iter().zip(plan.span_chunks.iter()) {
-            for (c, chunk) in plan.chunks.iter().enumerate() {
+        for c in plan.chunks.iter() {
+            assert!(!c.is_empty() && c.len() <= chunk_size, "bad chunk {c:?}");
+            assert!(c.clone().all(covered), "chunk {c:?} reads a gap");
+        }
+        // span_chunks and chunk_spans == the chunks and spans that intersect
+        let meet = |s: &Span, c: &std::ops::Range<usize>| s.start < c.end && c.start < s.end;
+        for (i, s) in plan.spans.iter().enumerate() {
+            assert!(
+                (s.start..s.end).all(|at| plan.chunks.iter().any(|c| c.contains(&at))),
+                "span {s:?} not covered"
+            );
+            for (j, c) in plan.chunks.iter().enumerate() {
                 assert_eq!(
-                    chunks.contains(&c),
-                    s.start != s.end && s.start < chunk.end && chunk.start < s.end,
-                    "span {s:?} vs chunk {c} {chunk:?}"
+                    plan.span_chunks[i].contains(&j),
+                    meet(s, c),
+                    "span {s:?} vs chunk {c:?}"
+                );
+                if meet(s, c) {
+                    assert!(
+                        plan.chunk_spans[j].contains(&i),
+                        "chunk {c:?} misses span {s:?}"
+                    );
+                }
+            }
+        }
+        for (j, spans) in plan.chunk_spans.iter().enumerate() {
+            for i in spans.clone() {
+                let s = &plan.spans[i];
+                assert!(
+                    s.start == s.end || meet(s, &plan.chunks[j]),
+                    "chunk {j} lists span {s:?}"
                 );
             }
         }
@@ -1018,6 +1048,7 @@ mod tests {
             p.allocation_file_ranges,
             vec![0..12, 12..18].into_boxed_slice()
         );
+        assert_eq!(p.chunks[2], 10..15); // across the allocation cut at 12
     }
 
     #[test]
