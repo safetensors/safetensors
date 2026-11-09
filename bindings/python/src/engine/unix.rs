@@ -55,9 +55,7 @@
 //! [`Loader`] owns the worker threads; [`LoaderInner`] (file, plan, sink, chunk
 //! counter, first error) is shared with them and with [`TensorIter`]. Closing
 //! signals the workers, joins them, then releases the sink: an outstanding
-//! iterator yields `Err(Closed)` once and is exhausted. [`CUDA_ACTIVE_SINKS`]
-//! counts live sinks per device so the mempool keeps its memory while any
-//! file is loading and is trimmed when the last one releases.
+//! iterator yields `Err(Closed)` once and is exhausted.
 
 use std::{
     collections::VecDeque,
@@ -478,15 +476,6 @@ impl SlabPool {
     }
 }
 
-/// Used to track live [`CudaSink`]s
-/// We configure cuda's memory pool to retain allocated memory, meaning:
-/// - across `safe_open` calls, allocated memory blocks can be reused
-/// - we need to track when all active sinks are done to be able to release that retained memory
-///
-/// Once the active counter for a given device reaches 0, we call `cudaMemPoolTrimTo` releasing the
-/// unused additional retained memory
-static CUDA_ACTIVE_SINKS: [AtomicUsize; MAX_DEVICES] = [const { AtomicUsize::new(0) }; MAX_DEVICES];
-
 struct CudaSink {
     api: &'static CudaApi,
     device: i32,
@@ -514,8 +503,6 @@ impl CudaSink {
         device: i32,
     ) -> Result<Self, LoaderError> {
         let stream = device_stream(api, device)?;
-        CUDA_ACTIVE_SINKS[device as usize].fetch_add(1, Ordering::AcqRel);
-        let _ = api.pool_set_release_threshold(device, u64::MAX);
 
         Ok(Self {
             api,
@@ -666,23 +653,6 @@ impl CudaSink {
         }
         for slot in self.allocations.iter() {
             *slot.lock().unwrap() = None;
-        }
-        if CUDA_ACTIVE_SINKS[self.device as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Ok(free) = free_stream(self.api, self.device) {
-                // NOTE: `let _ =` is intentional, releasing retained memory is best effort
-                let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
-                    let e = d.event_create()?;
-                    let _ = self.api.event_record(e, free);
-                    let _ = self.api.event_sync(e);
-                    self.api.event_destroy(e)
-                });
-            }
-            let _ = self.api.pool_set_release_threshold(self.device, 0);
-            let _ = self.api.pool_trim(self.device);
-            // a sink opened concurrently may have lost its retention to the reset above
-            if CUDA_ACTIVE_SINKS[self.device as usize].load(Ordering::Acquire) > 0 {
-                let _ = self.api.pool_set_release_threshold(self.device, u64::MAX);
-            }
         }
     }
 
