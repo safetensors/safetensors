@@ -1305,14 +1305,15 @@ impl Open {
                     // Build the tensor as a view over the storage instead of
                     // going through `torch.asarray`.
                     //
-                    // `asarray` on an UntypedStorage slice goes through
-                    // numpy's buffer protocol, which walks the whole buffer
-                    // to convert it. The result still aliases the storage,
-                    // but the conversion costs time proportional to the
-                    // number of bytes, and it holds the GIL for the whole
-                    // time, so python threads cannot parallelize it. On a
-                    // 3.96 GiB shard of MiniMax-M3.1-Flash that was 1.48 s
-                    // at 2.67 GiB/s.
+                    // `asarray` on an UntypedStorage slice costs time
+                    // proportional to the number of bytes in the slice, and
+                    // it holds the GIL for the whole time, so python threads
+                    // cannot parallelize it. On a host that reads the
+                    // checkpoint over a network filesystem, describing a
+                    // 3.96 GiB shard of MiniMax-M3.1-Flash (1562 tensors)
+                    // took 1.48 s at 2.67 GiB/s. The result already aliases
+                    // the storage, so no bytes are copied - the cost is in
+                    // the conversion itself.
                     //
                     // `set_` aliases the storage directly, so the same shard
                     // is described in 0.010 s. The bytes are unchanged: the
