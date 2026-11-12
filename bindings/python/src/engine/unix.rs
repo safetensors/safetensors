@@ -22,8 +22,13 @@
 //! Data flow, per file:
 //!
 //! ```text
+//! Loader::load, allocating each span
+//!   provide(dsts, stream)                the next spans' destinations, in plan
+//!                                        order, and an event on `stream`
 //! worker threads
 //!   c = next_chunk.fetch_add(1)          next entry of LoadPlan::chunks
+//!   wait for c's spans to be provided,   condvar, then the events of the
+//!     then for their batches' events     batches that provided them
 //!   lease = SlabPool::acquire()          a pinned host slab from the shared
 //!                                        pool; waits for its previous copy
 //!   pread(chunk c) -> lease              one read per chunk
@@ -332,6 +337,12 @@ impl Sink {
             Self::Cuda(sink) => sink.fully_scheduled(span),
         }
     }
+
+    fn allocate(&self) -> Result<(), LoaderError> {
+        match self {
+            Self::Cuda(sink) => sink.allocate(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -432,9 +443,21 @@ struct CudaSink {
     stream: Stream,
     pool: &'static SlabPool,
     plan: Arc<LoadPlan>,
-    /// per span, its allocation until taken
+    /// per span, its allocation until taken; set by `provide`
     allocations: Box<[Mutex<Option<Arc<Allocation>>>]>,
     delivered: Box<[AtomicBool]>,
+    /// per span, the device address its bytes are copied to; set by `provide`
+    dsts: Box<[AtomicU64]>,
+    /// per span, the event of the batch that provided it, recorded on the
+    /// allocating stream: the destination is free to write once it completes
+    ready: Box<[AtomicU64]>,
+    /// the spans with a destination: a prefix of the plan
+    provided: AtomicUsize,
+    /// guards `provided` advancing and `released` turning on, so neither is missed
+    /// by a waiter on `provision`
+    provision_lock: Mutex<()>,
+    provision: Condvar,
+    batch_events: Mutex<Vec<Event>>,
     chunk_completion_events: Box<[AtomicU64]>,
     closed: AtomicBool,
     released: AtomicBool,
@@ -451,16 +474,20 @@ impl CudaSink {
         device: i32,
     ) -> Result<Self, LoaderError> {
         let stream = device_stream(api, device)?;
-
+        let n = plan.spans.len();
         Ok(Self {
             api,
             device,
             stream,
             pool,
-            allocations: (0..plan.spans.len()).map(|_| Mutex::new(None)).collect(),
-            delivered: (0..plan.spans.len())
-                .map(|_| AtomicBool::new(false))
-                .collect(),
+            allocations: (0..n).map(|_| Mutex::new(None)).collect(),
+            delivered: (0..n).map(|_| AtomicBool::new(false)).collect(),
+            dsts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            ready: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            provided: AtomicUsize::new(0),
+            provision_lock: Mutex::new(()),
+            provision: Condvar::new(),
+            batch_events: Mutex::new(Vec::new()),
             chunk_completion_events: (0..plan.chunks.len()).map(|_| AtomicU64::new(0)).collect(),
             closed: AtomicBool::new(false),
             released: AtomicBool::new(false),
@@ -468,19 +495,79 @@ impl CudaSink {
         })
     }
 
-    fn allocation_ptr(&self, span: usize) -> Result<u64, LoaderError> {
-        let mut slot = self.allocations[span].lock().unwrap();
-        if let Some(a) = &*slot {
-            return Ok(a.ptr);
+    /// Allocates every span on the load stream, providing them a chunk's worth at
+    /// a time so the workers start on the first ones.
+    fn allocate(&self) -> Result<(), LoaderError> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        for (i, &Span { start, end }) in self.plan.spans.iter().enumerate() {
+            if start < end {
+                let alloc = Allocation::new(self.api, self.device, self.stream, end - start)?;
+                batch.push((alloc.ptr, Some(alloc)));
+            } else {
+                batch.push((0, None));
+            }
+            bytes += end - start;
+            if bytes >= CHUNK_SIZE.get() || i + 1 == self.plan.spans.len() {
+                self.provide(std::mem::take(&mut batch), self.stream)?;
+                bytes = 0;
+            }
         }
-        if self.closed.load(Ordering::Acquire) {
+        Ok(())
+    }
+
+    /// Gives the next `dsts.len()` spans their destinations, allocated on
+    /// `alloc_stream`.
+    fn provide(
+        &self,
+        dsts: Vec<(u64, Option<Arc<Allocation>>)>,
+        alloc_stream: Stream,
+    ) -> Result<(), LoaderError> {
+        let _g = self.provision_lock.lock().unwrap();
+        if self.released.load(Ordering::Acquire) {
             return Err(LoaderError::Closed);
         }
-        let Span { start, end } = self.plan.spans[span];
-        let alloc = Allocation::new(self.api, self.device, self.stream, end - start)?;
-        let ptr = alloc.ptr;
-        *slot = Some(alloc);
-        Ok(ptr)
+        let first = self.provided.load(Ordering::Acquire);
+        assert!(
+            first + dsts.len() <= self.plan.spans.len(),
+            "more destinations than spans"
+        );
+        // workers wait for the work queued on the allocating stream before copying
+        let ready = self.api.with_device(self.device, |d| {
+            let e = d.event_create()?;
+            if let Err(err) = self.api.event_record(e, alloc_stream) {
+                let _ = self.api.event_destroy(e);
+                return Err(err);
+            }
+            Ok(e)
+        })?;
+        self.batch_events.lock().unwrap().push(ready);
+        let n = dsts.len();
+        for (i, (ptr, alloc)) in dsts.into_iter().enumerate() {
+            self.dsts[first + i].store(ptr, Ordering::Relaxed);
+            self.ready[first + i].store(ready as u64, Ordering::Relaxed);
+            *self.allocations[first + i].lock().unwrap() = alloc;
+        }
+        self.provided.store(first + n, Ordering::Release);
+        self.provision.notify_all();
+        Ok(())
+    }
+
+    /// Waits until the first `n` spans have a destination.
+    fn wait_provided(&self, n: usize) -> Result<(), LoaderError> {
+        if self.provided.load(Ordering::Acquire) >= n {
+            return Ok(());
+        }
+        let mut g = self.provision_lock.lock().unwrap();
+        loop {
+            if self.provided.load(Ordering::Acquire) >= n {
+                return Ok(());
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(LoaderError::Closed);
+            }
+            g = self.provision.wait(g).unwrap();
+        }
     }
 
     fn load_chunk(
@@ -489,6 +576,17 @@ impl CudaSink {
         read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         let chunk = self.plan.chunks[chunk_idx].clone();
+        let spans = self.plan.chunk_spans[chunk_idx].clone();
+        self.wait_provided(spans.end)?;
+        // host-side: a pending copy would hold its slab and stall other loaders
+        let mut last = 0;
+        for s in spans {
+            let e = self.ready[s].load(Ordering::Relaxed);
+            if e != last {
+                self.api.event_sync(e as Event)?;
+                last = e;
+            }
+        }
         let mut lease = self.pool.acquire(self.api)?;
         read(
             lease.mut_slice(chunk.len()),
@@ -500,7 +598,7 @@ impl CudaSink {
             let span = self.plan.spans[s];
             let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
             if start < end {
-                let dst = self.allocation_ptr(s)? + (start - span.start) as u64;
+                let dst = self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64;
                 copies.push((dst, start - chunk.start, end - start));
             }
         }
@@ -527,6 +625,8 @@ impl CudaSink {
     }
 
     fn wait_ready(&self, span: usize) -> Result<(), LoaderError> {
+        // a zero-size span has no chunk: it is ready once provided
+        self.wait_provided(span + 1)?;
         for chunk in self.plan.span_chunks[span].clone() {
             let mut i = 0;
             let e = loop {
@@ -574,9 +674,13 @@ impl CudaSink {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            let _g = self.provision_lock.lock().unwrap();
+            self.closed.store(true, Ordering::Release);
+            self.provision.notify_all();
+            if self.released.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
         for slot in self.allocations.iter() {
             *slot.lock().unwrap() = None;
@@ -584,19 +688,25 @@ impl CudaSink {
     }
 
     fn signal_stop(&self) {
+        let _g = self.provision_lock.lock().unwrap();
         self.closed.store(true, Ordering::Release);
+        self.provision.notify_all();
     }
 
     fn fully_scheduled(&self, span: usize) -> bool {
-        self.plan.span_chunks[span]
-            .clone()
-            .all(|c| self.chunk_completion_events[c].load(Ordering::Acquire) != 0)
+        self.provided.load(Ordering::Acquire) > span
+            && self.plan.span_chunks[span]
+                .clone()
+                .all(|c| self.chunk_completion_events[c].load(Ordering::Acquire) != 0)
     }
 }
 
 impl Drop for CudaSink {
     fn drop(&mut self) {
         self.close();
+        for e in self.batch_events.get_mut().unwrap().drain(..) {
+            let _ = self.api.event_destroy(e);
+        }
         for e in self.chunk_completion_events.iter() {
             let e = e.swap(0, Ordering::AcqRel);
             if e != 0 {
@@ -706,7 +816,9 @@ impl Loader {
                 })
             })
             .collect();
-        Ok(Self { inner, workers })
+        let loader = Self { inner, workers };
+        loader.inner.sink.allocate()?;
+        Ok(loader)
     }
 
     /// `idx` indexes [`Loader::spans`]
