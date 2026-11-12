@@ -91,7 +91,7 @@ impl<D> Loader<D> {
         Err(LoaderError)
     }
 
-    pub fn close(&mut self) -> Vec<D> {
+    pub fn close(&self) -> Vec<D> {
         Vec::new()
     }
 

@@ -937,6 +937,45 @@ class PrefetchAllocationTests(unittest.TestCase):
         self.assertEqual(_allocator_threads(), running)
         self.assertEqual(torch.cuda.memory_allocated(0), before)
 
+    def _race(self, call, close):
+        # runs `call` in a thread, and `close` here once the thread is inside it
+        started = threading.Event()
+
+        def run():
+            started.set()
+            return call()
+
+        with ThreadPoolExecutor(1) as pool:
+            fut = pool.submit(run)
+            started.wait()
+            time.sleep(0.1)
+            close()
+        return fut
+
+    def test_close_while_another_thread_takes(self):
+        # `t511` sits 32 GiB into a hole: no host loads that far in the 0.1 s before
+        # the close, so the take can't succeed (only ~1 GiB ahead is allocated)
+        path = os.path.join(self.tempdir.name, "slow.safetensors")
+        _write_u8(path, [64 * MIB] * 512, fill=False)
+        closers = {
+            "close": lambda loader: loader.close(),
+            "__exit__": lambda loader: loader.__exit__(None, None, None),
+        }
+        for name, close in closers.items():
+            with self.subTest(closer=name):
+                gc.collect()
+                before = torch.cuda.memory_allocated(0)
+                loader = safe_open(path, framework="pt").prefetch(
+                    device="cuda:0", threads=1
+                )
+                fut = self._race(lambda: loader.take("t511"), lambda: close(loader))
+                with self.assertRaisesRegex(SafetensorError, "closed"):
+                    fut.result()
+                loader.close()
+                loader.__exit__(None, None, None)
+                del fut
+                self.assertEqual(torch.cuda.memory_allocated(0), before)
+
 
 if __name__ == "__main__":
     unittest.main()
