@@ -271,11 +271,12 @@ class safe_open:
             threads (`int`, defaults to 8):
                 Reader threads for this loader.
 
-        Raises if a planned tensor has a dtype torch cannot represent (F6), if a
-        slice has a step other than 1, if a sliced tensor is 0-d, or if torch can't
-        allocate the first 1 GiB. A later allocation failure ends the load: `take`
-        and iteration raise, and the tensors not taken are released at once; after
-        any other failure they are released at `close`.
+        Raises if a planned tensor has a dtype the installed torch cannot represent
+        (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
+        than 1, if a sliced tensor is 0-d, or if torch can't allocate the first 1 GiB.
+        A later allocation failure ends the load: `take` and iteration raise, and the
+        tensors not taken are released at once; after any other failure they are
+        released at `close`.
         """
         pass
 
