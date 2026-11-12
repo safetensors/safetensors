@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 
 import torch
@@ -214,21 +216,34 @@ class TorchModelTestCase(unittest.TestCase):
         # ``A[::2, :]`` is not contiguous but still shares its storage with
         # ``A`` and ``A[:1, :]``. Overlap detection must not rely on
         # ``Tensor.view(-1)``, which raises for such tensors.
-        A = torch.zeros((3, 3))
-        B = A[:1, :]
-        C = A[::2, :]
-
         class StridedSharedModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self, fill):
                 super().__init__()
+                A = torch.arange(9, dtype=torch.float32).reshape(3, 3) * fill
                 self.A = torch.nn.Parameter(A)
-                self.B = torch.nn.Parameter(B)
-                self.C = torch.nn.Parameter(C)
+                self.B = torch.nn.Parameter(A[:1, :])
+                self.C = torch.nn.Parameter(A[::2, :])
 
-        model = StridedSharedModel()
-        save_model(model, "tmp_strided.safetensors")
-        with safe_open("tmp_strided.safetensors", framework="pt") as f:
-            self.assertEqual(f.metadata(), {"B": "A", "C": "A"})
+        model = StridedSharedModel(1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "tmp_strided.safetensors")
+            save_model(model, filename)
+            with safe_open(filename, framework="pt") as f:
+                self.assertEqual(f.metadata(), {"B": "A", "C": "A"})
+
+            model2 = StridedSharedModel(0.0)
+            load_model(model2, filename)
+            for k, v in model.state_dict().items():
+                torch.testing.assert_close(model2.state_dict()[k], v)
+
+    def test_find_shared_nested_slices(self):
+        # A slice nested in an enclosing tensor must not shrink the covered
+        # interval: ``c`` still overlaps ``a`` after the nested ``b``.
+        a = torch.zeros((10,))
+        b = a[2:4]
+        c = a[6:8]
+        shared = _find_shared_tensors({"a": a, "b": b, "c": c})
+        self.assertEqual(shared, [{"a", "b", "c"}])
 
     def test_workaround_non_contiguous(self):
         model = NonContiguousModel()

@@ -74,7 +74,7 @@ def _filter_shared_not_shared(
                 filtered_tensors.append({name})
             else:
                 filtered_tensors[-1].add(name)
-            last_stop = stop
+            last_stop = max(last_stop, stop)
 
     return filtered_tensors
 
