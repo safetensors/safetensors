@@ -10,11 +10,14 @@ import os
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from safetensors.torch import load_file as load_file_pt
 from safetensors.torch import load_model, save_file, save_model
 
@@ -444,6 +447,27 @@ class PrefetchCudaTests(unittest.TestCase):
         f.__exit__(None, None, None)
         with self.assertRaisesRegex(Exception, "closed"):
             f.prefetch(device="cuda:0")
+
+    def test_handle_exit_while_another_thread_reads(self):
+        # the read in flight finishes on its own reference; the next call finds the handle closed
+        size = 256 * 2**20
+        path = os.path.join(self.tempdir.name, "big.safetensors")
+        save_file({"t": torch.zeros(size, dtype=torch.uint8)}, path)
+        f = safe_open(path, framework="pt", device="cuda:0", backend="pread")
+        started = threading.Event()
+
+        def read():
+            started.set()
+            return f.get_tensor("t")
+
+        with ThreadPoolExecutor(1) as pool:
+            fut = pool.submit(read)
+            started.wait()
+            time.sleep(0.01)
+            f.__exit__(None, None, None)
+        self.assertEqual(fut.result().numel(), size)
+        with self.assertRaisesRegex(SafetensorError, "closed"):
+            f.get_tensor("t")
 
     def test_threads(self):
         # readers are capped at one per chunk: tiny files spawn few, absurd requests spawn none extra

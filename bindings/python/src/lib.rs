@@ -26,8 +26,7 @@ use std::fs::File;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -1699,19 +1698,18 @@ impl TensorStream {
 ///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
 ///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
 ///         loads a full model several times faster than `"mmap"`.
-#[pyclass]
+#[pyclass(frozen)]
 #[allow(non_camel_case_types)]
 struct safe_open {
-    inner: Option<Open>,
+    /// `None` once closed. Each call works on its own reference, so closing never
+    /// waits for one: the file closes when the last call returns.
+    inner: Mutex<Option<Arc<Open>>>,
 }
 
 impl safe_open {
-    fn inner(&self) -> PyResult<&Open> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
-        Ok(inner)
+    fn inner(&self) -> PyResult<Arc<Open>> {
+        let inner = self.inner.lock().unwrap().clone();
+        inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
 
@@ -1725,8 +1723,10 @@ impl safe_open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend)?);
-        Ok(Self { inner })
+        let open = Open::new(filename, framework, device, backend)?;
+        Ok(Self {
+            inner: Mutex::new(Some(Arc::new(open))),
+        })
     }
 
     /// Start loading the file's tensors to a CUDA device in the background.
@@ -1882,8 +1882,9 @@ impl safe_open {
     }
 
     /// Exits the context manager
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
-        self.inner = None;
+    pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
+        // dropped once the lock is released
+        let _open = self.inner.lock().unwrap().take();
     }
 }
 
@@ -2865,19 +2866,18 @@ pyo3::create_exception!(
     "Custom Python Exception for Safetensor errors."
 );
 
-#[pyclass]
+#[pyclass(frozen)]
 #[allow(non_camel_case_types)]
 struct _safe_open_handle {
-    inner: Option<Open>,
+    /// `None` once closed. Each call works on its own reference, so closing never
+    /// waits for one: the file closes when the last call returns.
+    inner: Mutex<Option<Arc<Open>>>,
 }
 
 impl _safe_open_handle {
-    fn inner(&self) -> PyResult<&Open> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
-        Ok(inner)
+    fn inner(&self) -> PyResult<Arc<Open>> {
+        let inner = self.inner.lock().unwrap().clone();
+        inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
 
@@ -2897,8 +2897,10 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend)?);
-        Ok(Self { inner })
+        let open = Open::new(filename, framework, device, backend)?;
+        Ok(Self {
+            inner: Mutex::new(Some(Arc::new(open))),
+        })
     }
 
     /// See [`safe_open::prefetch`].
@@ -3007,8 +3009,9 @@ impl _safe_open_handle {
     }
 
     /// Exits the context manager
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
-        self.inner = None;
+    pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
+        // dropped once the lock is released
+        let _open = self.inner.lock().unwrap().take();
     }
 }
 
