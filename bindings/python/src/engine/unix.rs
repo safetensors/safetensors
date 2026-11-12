@@ -808,19 +808,17 @@ impl<D: Send + 'static> Loader<D> {
             schedule: Condvar::new(),
             workers: Mutex::new(Vec::with_capacity(threads)),
         });
-        let workers = (0..threads)
-            .map(|_| {
-                std::thread::spawn({
-                    let inner = inner.clone();
-                    move || {
-                        let _ = cuda_api.set_device(device);
-                        worker(inner)
-                    }
-                })
-            })
-            .collect();
-        *inner.workers.lock().unwrap() = workers;
-        Ok(Self { inner })
+        let loader = Self { inner };
+        for _ in 0..threads {
+            let inner = loader.inner.clone();
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let _ = cuda_api.set_device(device);
+                worker(inner)
+            });
+            // on failure, dropping the loader stops and joins the workers already started
+            loader.inner.workers.lock().unwrap().push(spawned?);
+        }
+        Ok(loader)
     }
 }
 
