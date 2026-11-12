@@ -1,9 +1,4 @@
 //! DLPack v0 producer + Python capsule wrapping.
-// The producer only serves Metal buffers; the dtype helpers are used everywhere.
-#![cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
 
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
