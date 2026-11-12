@@ -15,8 +15,8 @@
 //!   its destination. The delivery unit: `take` hands out the span's owner.
 //! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`] of adjacent spans,
 //!   never across a gap. The I/O unit: one `pread`, one slab, one event, one
-//!   `memcpy` per span it carries. `span_chunks` and `chunk_spans` map one to
-//!   the other.
+//!   `memcpy` per run of spans whose destinations are adjacent. `span_chunks`
+//!   and `chunk_spans` map one to the other.
 //!
 //! Data flow, per file:
 //!
@@ -31,8 +31,8 @@
 //!   lease = SlabPool::acquire()          a pinned host slab from the shared
 //!                                        pool; waits for its previous copy
 //!   pread(chunk c) -> lease              one read per chunk
-//!   memcpyAsync(lease -> destinations)   one copy per span in the chunk,
-//!                                        on STREAMS[device]
+//!   memcpyAsync(lease -> destinations)   one copy per run of adjacent
+//!                                        destinations, on STREAMS[device]
 //!   chunk_completion_events[c] = event   recorded after the copies; 0 while
 //!                                        the chunk is still pending
 //! consumer
@@ -495,17 +495,38 @@ impl<D> CudaSink<D> {
         )?;
 
         let e = self.api.with_device(self.device, |d| {
+            let copy = |(dst, at, len, _): (u64, usize, usize, u64)| {
+                let src = lease.ptr().wrapping_add(at - chunk.start);
+                self.api.memcpy_h2d_async(dst, src, len, self.stream)
+            };
+            // one copy per run of pieces adjacent in the file and on the device,
+            // within one allocation: (device address, data section offset, length,
+            // end of the allocation, looked up once the run grows)
+            let mut run: Option<(u64, usize, usize, u64)> = None;
             for s in self.plan.chunk_spans[chunk_idx].clone() {
                 let span = self.plan.spans[s];
                 let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
-                if start < end {
-                    self.api.memcpy_h2d_async(
-                        self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64,
-                        lease.ptr().wrapping_add(start - chunk.start),
-                        end - start,
-                        self.stream,
-                    )?;
+                if start >= end {
+                    continue;
                 }
+                let dst = self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64;
+                if let Some((d0, at, len, limit)) = run.as_mut() {
+                    if *at + *len == start && *d0 + *len as u64 == dst {
+                        if *limit == 0 {
+                            *limit = self.api.allocation_end(*d0).unwrap_or(dst);
+                        }
+                        if dst + (end - start) as u64 <= *limit {
+                            *len += end - start;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(run) = run.replace((dst, start, end - start, 0)) {
+                    copy(run)?;
+                }
+            }
+            if let Some(run) = run {
+                copy(run)?;
             }
             lease.release(d, self.stream)?;
             let e = d.event_create()?;

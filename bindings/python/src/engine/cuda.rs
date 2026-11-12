@@ -67,6 +67,7 @@ impl std::fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 type PrimaryCtxGetState = unsafe extern "C" fn(c_int, *mut c_uint, *mut c_int) -> c_int;
+type MemGetAddressRange = unsafe extern "C" fn(*mut c_ulonglong, *mut usize, c_ulonglong) -> c_int;
 // cudaGetDriverEntryPointByVersion (CUDA >= 12.5; the only form left in 13) and
 // cudaGetDriverEntryPoint (11.3 .. 12.x): resolve a driver symbol through the runtime
 type EntryPointByVersion =
@@ -82,6 +83,8 @@ pub struct CudaApi {
     /// context, so that selecting it creates nothing. Required: a runtime that
     /// cannot provide it (< 11.3) is not attached.
     primary_ctx_active: PrimaryCtxGetState,
+    /// The driver's `cuMemGetAddressRange`, if the runtime provides it.
+    mem_range: Option<MemGetAddressRange>,
 }
 
 // SAFETY: immutable fn pointers + CUDA runtime API is thread safe
@@ -190,6 +193,13 @@ impl CudaApi {
     #[cfg(test)]
     pub fn stream_wait_event(&self, s: Stream, e: Event) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaStreamWaitEvent)(s, e, 0) })
+    }
+
+    /// End of the device allocation holding `ptr`, `None` when the driver can't tell.
+    pub fn allocation_end(&self, ptr: u64) -> Option<u64> {
+        let (mut base, mut size) = (0, 0);
+        let found = unsafe { (self.mem_range?)(&mut base, &mut size, ptr) } == 0;
+        found.then_some(base + size as u64)
     }
 
     pub fn set_device(&self, d: i32) -> Result<(), CudaError> {
@@ -346,10 +356,13 @@ pub fn api() -> Option<&'static CudaApi> {
         if primary.is_null() {
             return None;
         }
+        let mem_range = driver_symbol("cuMemGetAddressRange");
         CudaApi {
             f,
             err_str: std::mem::transmute::<*mut c_void, GetErrorString>(p),
             primary_ctx_active: std::mem::transmute::<*mut c_void, PrimaryCtxGetState>(primary),
+            mem_range: (!mem_range.is_null())
+                .then(|| std::mem::transmute::<*mut c_void, MemGetAddressRange>(mem_range)),
         }
     };
     let _ = API.set(api);

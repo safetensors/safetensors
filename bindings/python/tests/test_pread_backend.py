@@ -899,6 +899,51 @@ class PrefetchAllocationTests(unittest.TestCase):
                     self._check(sd)
                     del sd
 
+    def test_adjacent_destinations_land(self):
+        # torch packs small tensors in 512-byte blocks: 512-multiples sit back to back,
+        # odd sizes leave holes; with zero sizes, plan gaps, odd row slices, large-pool
+        # tensors, and spans across chunks and batches in between
+        path = os.path.join(self.tempdir.name, "adjacent.safetensors")
+        sizes = [
+            n
+            for k in range(3000)
+            for n in (512 * (k % 4 + 1), 1 + k % 700, 0 if k % 13 == 0 else 1024)
+            + ((5 * MIB + 512, 3 * MIB) if k % 500 == 0 else ())
+        ]
+        _write_u8(path, sizes)
+        plan = {f"t{i}": None for i in range(len(sizes)) if i % 10 != 7}
+        plan.update(
+            {
+                f"t{i}": slice(3, sizes[i] - 1)
+                for i in range(5, len(sizes), 101)
+                if sizes[i] > 4
+            }
+        )
+        for threads in (1, 8):
+            with self.subTest(threads=threads):
+                gc.collect()
+                torch.cuda.empty_cache()
+                # 0xFF in torch's cache, small and large pools alike
+                dirty = [
+                    torch.full((n,), 255, dtype=torch.uint8, device="cuda:0")
+                    for n in [MIB] * 64 + [GIB]
+                ]
+                del dirty
+                with (
+                    safe_open(path, framework="pt") as f,
+                    f.prefetch(plan, device="cuda:0", threads=threads) as loader,
+                ):
+                    sd = dict(loader)
+                torch.cuda.synchronize()
+                self.assertEqual(set(sd), set(plan))
+                for name, rows in plan.items():
+                    i = int(name[1:])
+                    expected = _pattern(i, sizes[i])[rows or slice(None)]
+                    self.assertTrue(
+                        torch.equal(sd[name], expected), f"{name} ({sizes[i]} bytes)"
+                    )
+                del sd
+
     def test_allocator_thread_uses_the_callers_stream(self):
         # every block holding a tensor comes from the stream current at prefetch,
         # including the background ones; hand-out on that stream records nothing
