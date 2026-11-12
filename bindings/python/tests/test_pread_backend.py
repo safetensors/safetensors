@@ -66,6 +66,15 @@ def _write_u8(path, sizes, fill=True):
         fh.truncate(8 + len(raw) + offset)
 
 
+def _allocator_threads():
+    # prefetch's allocator threads, by the 15 bytes of their name Linux keeps
+    count = 0
+    for tid in os.listdir("/proc/self/task"):
+        with open(f"/proc/self/task/{tid}/comm") as fh:
+            count += fh.read().startswith("safetensors-pre")
+    return count
+
+
 def _tensors_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     # torch.equal is not implemented for sub-byte / fp8 dtypes on some builds,
     # so reinterpret the underlying storage as uint8 and compare bytes.
@@ -644,6 +653,24 @@ class PrefetchCudaTests(unittest.TestCase):
         torch.cuda.synchronize()
         self._assert_matches_source(sd)
 
+    def test_tensors_own_their_storage(self):
+        # one storage per tensor, none a view of a shared block: save_file takes them
+        with self._open() as loader:
+            sd = dict(loader)
+        for name, tensor in sd.items():
+            self.assertEqual(tensor.untyped_storage().nbytes(), tensor.nbytes, name)
+        out = os.path.join(self.tempdir.name, "resaved.safetensors")
+        save_file(sd, out)
+        self._assert_matches_source(load_file_pt(out, device="cuda:0"))
+
+    def test_take_from_threads(self):
+        # how transformers calls it: takes from a thread pool
+        with self._open() as loader:
+            names = loader.names()
+            with ThreadPoolExecutor(4) as pool:
+                sd = dict(zip(names, pool.map(loader.take, names)))
+        self._assert_matches_source(sd)
+
     def test_close_mid_stream(self):
         loader = self._open()
         stream = iter(loader)
@@ -878,6 +905,20 @@ class PrefetchAllocationTests(unittest.TestCase):
         self.assertIsInstance(again.exception.__cause__, torch.OutOfMemoryError)
         loader.close()
         self.assertEqual(torch.cuda.memory_allocated(0), held)
+
+    def test_dropped_loader_releases_its_tensors(self):
+        # dropped mid-load without `close`: the allocator thread stops and every
+        # tensor not taken goes
+        path = os.path.join(self.tempdir.name, "dropped.safetensors")
+        _write_u8(path, [64 * MIB] * 64, fill=False)
+        gc.collect()
+        before, running = torch.cuda.memory_allocated(0), _allocator_threads()
+        loader = safe_open(path, framework="pt").prefetch(device="cuda:0", threads=1)
+        self.assertLess(torch.cuda.memory_allocated(0) - before, 4 * GIB)
+        del loader
+        gc.collect()
+        self.assertEqual(_allocator_threads(), running)
+        self.assertEqual(torch.cuda.memory_allocated(0), before)
 
 
 if __name__ == "__main__":
