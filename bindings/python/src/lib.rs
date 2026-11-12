@@ -693,6 +693,31 @@ const ALLOC_AHEAD: usize = 1 << 30;
 
 const ALLOCATOR_THREAD: &str = "safetensors-prefetch-alloc";
 
+/// Largest block warmed in torch's cache ahead of the tensors that split it: one
+/// cudaMalloc for all of them, and a tensor kept alive pins no more than this.
+const WARM_PIECE: usize = 256 << 20;
+
+/// The largest cached block torch still splits for smaller requests on `device`:
+/// [`WARM_PIECE`], less when `max_split_size` is set, 0 when torch reports none.
+/// Call once torch's CUDA is initialised: the stats are empty before.
+/// The sizes here and in [`Allocation::new`] mirror torch's caching allocator.
+fn warm_piece(torch: &PyBound<'_, PyModule>, device: i32) -> usize {
+    let max_split = || -> PyResult<i64> {
+        let py = torch.py();
+        torch
+            .getattr(intern!(py, "cuda"))?
+            .call_method1(intern!(py, "memory_stats_as_nested_dict"), (device,))?
+            .get_item(intern!(py, "max_split_size"))?
+            .extract()
+    };
+    match max_split() {
+        Ok(n) if n < 0 => WARM_PIECE, // unlimited
+        // blocks of max_split_size or more are never split, and torch rounds segments up to 2 MiB
+        Ok(n) => WARM_PIECE.min((n as usize).saturating_sub(2 << 20)),
+        Err(_) => 0,
+    }
+}
+
 /// The CUDA stream current on `device` in this thread, with its raw handle.
 fn current_stream<'py>(py: Python<'py>, device: i32) -> PyResult<(PyBound<'py, PyAny>, u64)> {
     let stream = get_module(py, &TORCH_MODULE)?
@@ -722,22 +747,54 @@ struct Allocation {
     sizes: Vec<usize>,
     /// per span, the planned bytes before it; one more entry for the total
     before: Vec<usize>,
+    /// per span, the warm-up block allocated and dropped before it, 0 for none
+    warm: Vec<usize>,
+    /// off after the first warm-up that fails
+    warming: bool,
     next: usize,
     device: i32,
 }
 
 impl Allocation {
-    fn new(metas: Vec<SpanMeta>, sizes: Vec<usize>, device: i32) -> Self {
+    fn new(metas: Vec<SpanMeta>, sizes: Vec<usize>, piece: usize, device: i32) -> Self {
         let before = std::iter::once(0)
             .chain(sizes.iter().scan(0, |sum, &n| {
                 *sum += n;
                 Some(*sum)
             }))
             .collect();
+        // a piece is a run of tensors over 1 MiB (smaller ones come from torch's small
+        // pool and don't end a run) whose rounded sizes sum to at most `piece`
+        let split = |n: usize| n > 1 << 20;
+        let mut warm = vec![0; sizes.len()];
+        let mut warmed = 0; // tensors before `warmed` have their block
+        for i in 0..sizes.len() {
+            if piece == 0 || i < warmed || !split(sizes[i]) {
+                continue;
+            }
+            let (mut bytes, mut count, mut end) = (0, 0, i);
+            for (j, &n) in sizes.iter().enumerate().skip(i) {
+                if split(n) {
+                    let n = n.next_multiple_of(512);
+                    if bytes + n > piece {
+                        break;
+                    }
+                    bytes += n;
+                    count += 1;
+                }
+                end = j + 1;
+            }
+            warmed = end.max(i + 1);
+            if count > 1 {
+                warm[i] = bytes;
+            }
+        }
         Self {
             metas,
             sizes,
             before,
+            warm,
+            warming: true,
             next: 0,
             device,
         }
@@ -762,6 +819,21 @@ impl Allocation {
         while !self.done() && self.before[self.next] < target {
             let i = self.next;
             let (meta, size) = (&self.metas[i], self.sizes[i]);
+            if self.warming && self.warm[i] > 0 {
+                // best effort: the tensors may still fit without it. Not past the free
+                // memory: torch would flush the caller's cache to retry
+                let free = || -> PyResult<usize> {
+                    let cuda = torch.getattr(intern!(py, "cuda"))?;
+                    cuda.call_method1(intern!(py, "mem_get_info"), (self.device,))?
+                        .get_item(0)?
+                        .extract()
+                };
+                if free().is_ok_and(|free| free >= self.warm[i]) {
+                    self.warming =
+                        torch_empty_cuda(py, torch, Dtype::U8, &[self.warm[i]], self.device)
+                            .is_ok();
+                }
+            }
             let tensor = (|| -> PyResult<(u64, Py<PyAny>)> {
                 let tensor =
                     torch_empty_cuda(py, torch, meta.dtype, &meta.storage_shape, self.device)?;
@@ -1332,7 +1404,8 @@ impl Open {
         let mut loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
         let started = (|| -> PyResult<_> {
             let (stream, stream_raw) = current_stream(py, device_idx)?;
-            let mut alloc = Allocation::new(metas, sizes, device_idx);
+            let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
+            let mut alloc = Allocation::new(metas, sizes, piece, device_idx);
             let first = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
             let feed = loader.feed();
             feed.provide(first, stream_raw)
