@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 
 import torch
@@ -7,6 +9,7 @@ from safetensors import safe_open
 from safetensors.torch import (
     _end_ptr,
     _find_shared_tensors,
+    _is_canonical_dense_stride,
     _is_complete,
     _remove_duplicate_names,
     load_model,
@@ -68,6 +71,109 @@ class TorchModelTestCase(unittest.TestCase):
 
         D = torch.zeros((2, 2), device=torch.device("meta"))
         self.assertTrue(_is_complete(D))
+
+    def test_is_complete_canonical_dense_layouts(self):
+        # Direct predicate validation on canonical vs non-canonical strides
+        self.assertTrue(_is_canonical_dense_stride((3, 3), (3, 1)))
+        self.assertFalse(_is_canonical_dense_stride((2, 2), (2, 0)))
+        self.assertFalse(_is_canonical_dense_stride((2,), (2, 1)))
+
+        # 1. Ordinary contiguous tensor is complete
+        # Shape (3, 3) with standard strides (3, 1) covers elements 0..8
+        A = torch.zeros((3, 3))
+        self.assertTrue(_is_complete(A))
+
+        # 2. Transposed dense tensor is complete
+        # Shape (4, 3) with strides (1, 4) bijectively covers elements 0..11
+        A_t = torch.zeros((3, 4)).t()
+        self.assertTrue(_is_complete(A_t))
+
+        # 3. Permuted dense tensor is complete
+        # Shape (4, 2, 3) with strides (1, 12, 4) bijectively covers elements 0..23
+        A_p = torch.zeros((2, 3, 4)).permute(2, 0, 1)
+        self.assertTrue(_is_complete(A_p))
+
+        # 4. Expanded zero-stride view is incomplete (bugfix: prevents silent omission)
+        # raw[::2] has 2 elements; expand(2, 2) has stride (2, 0), touching only offsets 0 and 2
+        raw4 = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        A_exp = raw4[::2].unsqueeze(1).expand(2, 2)
+        self.assertFalse(_is_complete(A_exp))
+
+        # 5. Overlapping positive-stride as_strided view is incomplete
+        # Coordinates (0, 1) and (1, 0) both evaluate to offset 1; offset 3 is omitted
+        raw5 = torch.arange(4, dtype=torch.float32)
+        A_pos = torch.as_strided(raw5, (2, 2), (1, 1))
+        self.assertFalse(_is_complete(A_pos))
+
+        # 6. Gapped view is incomplete
+        # Shape (2, 4) with strides (8, 1) leaves rows 1 and 3 omitted from 16-element buffer
+        base6 = torch.zeros((4, 4))
+        A_gap = base6[::2, :]
+        self.assertFalse(_is_complete(A_gap))
+
+        # 7. Nonzero storage offset view is incomplete
+        # Offset 1 on 10-element buffer omits index 0
+        base7 = torch.arange(10, dtype=torch.float32)
+        A_off = base7[1:]
+        self.assertFalse(_is_complete(A_off))
+
+        # 8. Empty view backed by nonempty storage is incomplete
+        # nelement == 0 but storage_size == 40 bytes; cannot own the nonempty storage
+        base8 = torch.arange(10, dtype=torch.float32)
+        A_empty_slice = base8[:0]
+        self.assertFalse(_is_complete(A_empty_slice))
+
+        # 9. Scalar tensor is complete
+        # 0-D scalar with shape () and stride () addresses offset 0
+        A_scalar = torch.tensor(42.0)
+        self.assertTrue(_is_complete(A_scalar))
+
+        # 10. Singleton dimensions preserve correct dense classification
+        # Shape (2, 1, 3) with arbitrary stride on singleton dim 1 bijectively spans 6 elements
+        A_single = torch.zeros((2, 1, 3))
+        self.assertTrue(_is_complete(A_single))
+
+        # 11. Storage bounds are respected
+        # Sub-matrix (2, 2) on 3x4 buffer covers only 4 elements of 12
+        base11 = torch.zeros((3, 4))
+        A_sub = base11[:2, :2]
+        self.assertFalse(_is_complete(A_sub))
+
+        # 12. Meta device tensor preserves supported behavior without storage access
+        A_meta = torch.zeros((2, 2), device=torch.device("meta"))
+        self.assertTrue(_is_complete(A_meta))
+
+    def test_save_model_rejects_expanded_zero_stride_checkpoint_omission(self):
+        # Demonstrates that an expanded zero-stride view cannot claim storage completeness
+        # and cause valid sibling parameters to be silently omitted from the checkpoint.
+        class ExpandedSharedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                raw = torch.tensor([10.0, 20.0, 30.0, 40.0], dtype=torch.float32)
+                self.expand_view = torch.nn.Parameter(raw[0:1].expand(4))
+                self.slice_mid = torch.nn.Parameter(raw[1:2])
+
+        model = ExpandedSharedModel()
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "model_expanded.safetensors")
+            with self.assertRaises(RuntimeError) as ctx:
+                save_model(model, filename)
+            self.assertIn("None is covering the entire storage", str(ctx.exception))
+
+        # Also assert that when a dense base tensor is present alongside an expanded view,
+        # the base tensor is correctly selected as keep_name even if the expanded tensor
+        # sorts alphabetically earlier.
+        class ExpandedWithBaseModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                raw = torch.tensor([10.0, 20.0, 30.0, 40.0], dtype=torch.float32)
+                self.a_expanded = torch.nn.Parameter(raw[0:1].expand(4))
+                self.b_base = torch.nn.Parameter(raw)
+
+        model_with_base = ExpandedWithBaseModel()
+        to_removes = _remove_duplicate_names(model_with_base.state_dict())
+        self.assertIn("b_base", to_removes)
+        self.assertEqual(to_removes["b_base"], ["a_expanded"])
 
     def test_find_shared_tensors(self):
         A = torch.zeros((3, 3))
