@@ -94,6 +94,11 @@ The design is rather simple.
 We're going to look for all shared tensors, then looking for all tensors
 covering the entire buffer (there can be multiple such tensors).
 That gives us multiple names which can be saved, we simply choose the first one
+A tensor counts as covering the buffer only when each of its dimensions either
+has size 1 or a non-zero stride: a zero-stride (expanded) view repeats storage
+rather than covering it, so matching the full element count alone is not enough.
+The full-storage alias is used as the saved name; if no tensor covers the whole
+buffer the save is still refused.
 
 During `load_model`, we are loading a bit like `load_state_dict` does, except
 we're looking into the model itself, to check for shared buffers, and ignoring
