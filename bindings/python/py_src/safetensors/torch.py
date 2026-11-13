@@ -95,9 +95,15 @@ def _find_shared_tensors(state_dict: Dict[str, torch.Tensor]) -> List[Set[str]]:
 
 
 def _is_complete(tensor: torch.Tensor) -> bool:
-    return tensor.data_ptr() == storage_ptr(tensor) and tensor.nelement() * _SIZE[
-        tensor.dtype
-    ] == storage_size(tensor)
+    return (
+        tensor.data_ptr() == storage_ptr(tensor)
+        and tensor.nelement() * _SIZE[tensor.dtype] == storage_size(tensor)
+        # Expanded dimensions repeat storage rather than covering it.
+        and all(
+            size <= 1 or stride != 0
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+    )
 
 
 def _remove_duplicate_names(

@@ -236,6 +236,26 @@ class TorchModelTestCase(unittest.TestCase):
             for k, v in model.state_dict().items():
                 torch.testing.assert_close(model2.state_dict()[k], v)
 
+    def test_workaround_expanded_view_keeps_complete_storage(self):
+        class ExpandedModel(torch.nn.Module):
+            def __init__(self, fill):
+                super().__init__()
+                raw = torch.arange(4, dtype=torch.float32) * fill
+                self.raw = torch.nn.Parameter(raw)
+                self.expanded = torch.nn.Parameter(raw[::2, None].expand(2, 2))
+                self.middle = torch.nn.Parameter(raw[1:2])
+
+        model = ExpandedModel(1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "expanded.safetensors")
+            save_model(model, filename)
+            with safe_open(filename, framework="pt") as f:
+                self.assertEqual(list(f.keys()), ["raw"])
+            restored = ExpandedModel(0.0)
+            load_model(restored, filename)
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(restored.state_dict()[name], value)
+
     def test_find_shared_nested_slices(self):
         # A slice nested in an enclosing tensor must not shrink the covered
         # interval: ``c`` still overlaps ``a`` after the nested ``b``.
