@@ -88,10 +88,35 @@ def _find_shared_tensors(state_dict: Dict[str, torch.Tensor]) -> List[Set[str]]:
     return tensors
 
 
+def _is_canonical_dense_stride(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> bool:
+    if len(shape) != len(stride):
+        return False
+    if any(st < 0 for st in stride):
+        return False
+    if 0 in shape:
+        return True
+    pairs = [(s, st) for s, st in zip(shape, stride) if s > 1]
+    if not pairs:
+        return True
+    if any(st <= 0 for _, st in pairs):
+        return False
+    pairs.sort(key=lambda x: x[1])
+    if pairs[0][1] != 1:
+        return False
+    expected_stride = 1
+    for i in range(len(pairs) - 1):
+        expected_stride *= pairs[i][0]
+        if pairs[i + 1][1] != expected_stride:
+            return False
+    return True
+
+
 def _is_complete(tensor: torch.Tensor) -> bool:
-    return tensor.data_ptr() == storage_ptr(tensor) and tensor.nelement() * _SIZE[
-        tensor.dtype
-    ] == storage_size(tensor)
+    return (
+        tensor.data_ptr() == storage_ptr(tensor)
+        and tensor.nelement() * _SIZE[tensor.dtype] == storage_size(tensor)
+        and _is_canonical_dense_stride(tensor.shape, tensor.stride())
+    )
 
 
 def _remove_duplicate_names(
