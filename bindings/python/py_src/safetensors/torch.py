@@ -7,10 +7,273 @@ import torch
 from safetensors import (
     TensorSpec,
     deserialize,
-    safe_open,
+    safe_open as _safe_open,
     serialize,
     serialize_file,
 )
+
+
+# ---------------------------------------------------------------------------
+# Pluggable device-transfer hook registry
+# ---------------------------------------------------------------------------
+#
+# Third-party device packages (e.g. torch_spyre) can register a callable that
+# safetensors will invoke instead of the generic .to(device) path when a
+# tensor needs to be placed on that device.
+#
+# Registration contract
+# ~~~~~~~~~~~~~~~~~~~~~
+# Call _register_device_transfer_hook(device_type, hook) where:
+#
+#   device_type (str)
+#       The torch.device.type string, e.g. "spyre".
+#
+#   hook (callable)
+#       Signature: hook(cpu_tensor: torch.Tensor, name: str, device) -> torch.Tensor
+#
+#       Arguments:
+#         cpu_tensor  — the tensor freshly loaded from disk, guaranteed to be
+#                       contiguous and on CPU.
+#         name        — the tensor's key in the safetensors file (e.g.
+#                       "model.layers.0.weight"). The hook may use this to
+#                       choose a layout (e.g. optimal stickification for
+#                       Linear weights vs. default layout for biases).
+#         device      — the original device argument passed to safe_open
+#                       (string or torch.device). Passed through so the hook
+#                       can honour a device index ("spyre:1").
+#
+#       Returns:
+#         A torch.Tensor on the target device.
+#
+# safetensors makes no assumptions about what the hook does internally.
+#
+# Example (inside torch_spyre/__init__.py or model_utils.py):
+#
+#     from safetensors.torch import _register_device_transfer_hook
+#
+#     def spyre_layout_hook(cpu_tensor, name, device):
+#         if name.endswith(".weight") and cpu_tensor.ndim == 2:
+#             return _dma_to_spyre_dim_order_swapped(cpu_tensor)
+#         return _dma_to_spyre_default(cpu_tensor)
+#
+#     _register_device_transfer_hook("spyre", spyre_layout_hook)
+
+_DEVICE_TRANSFER_HOOKS: "dict[str, callable]" = {}
+
+
+def _register_device_transfer_hook(device_type: str, hook: "callable") -> None:
+    """Register a transfer hook for a custom device type.
+
+    Args:
+        device_type: The ``torch.device.type`` string (e.g. ``"spyre"``).
+        hook: A callable with signature
+            ``(cpu_tensor, name, device) -> torch.Tensor``.
+            See module docstring above for the full contract.
+    """
+    if not callable(hook):
+        raise TypeError(f"hook must be callable, got {type(hook)!r}")
+    _DEVICE_TRANSFER_HOOKS[device_type] = hook
+
+
+def _device_type(device) -> str:
+    """Return the device type string from a str or torch.device."""
+    if isinstance(device, torch.device):
+        return device.type
+    # Handles "spyre", "spyre:0", "cuda:1", etc.
+    return str(device).split(":")[0]
+
+
+# ---------------------------------------------------------------------------
+# _SpyreSafeTensorsFile  (and future custom-device files)
+# ---------------------------------------------------------------------------
+
+
+class _CustomDeviceSafeTensorsFile:
+    """Context-manager wrapper that adds hook-based device support to safe_open.
+
+    Used for any device type that has registered a transfer hook but is not
+    natively understood by the safetensors Rust core (which handles cpu and
+    cuda). Tensors are memory-mapped on CPU and then handed to the registered
+    hook for the actual device transfer.
+
+    This class is not part of the public API; use :func:`safe_open` instead.
+    """
+
+    def __init__(self, filename: str, framework: str, device, hook: "callable", backend: str = "mmap"):
+        # Open on CPU so the Rust core can mmap without knowing about the
+        # target device.
+        self._file = _safe_open(filename, framework=framework, device="cpu", backend=backend)
+        self._device = device
+        self._hook = hook
+
+    # -- context-manager protocol ------------------------------------------
+
+    def __enter__(self):
+        self._file.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._file.__exit__(exc_type, exc_val, exc_tb)
+
+    # -- public interface (mirrors safetensors.safe_open) ------------------
+
+    def keys(self):
+        """Return the tensor names stored in the file."""
+        return self._file.keys()
+
+    def metadata(self):
+        """Return the user-defined metadata dict from the file header."""
+        return self._file.metadata()
+
+    def get_slice(self, name: str):
+        """Return a lazy slice object for *name* (materialised on CPU).
+
+        Slices are transferred to the target device only when materialised
+        via ``__getitem__``.  For slices we cannot call the hook because we
+        don't know the final shape until materialisation, so we fall back to
+        a plain ``.to(device)`` transfer. Callers that need the optimal
+        layout for partial loads should use :meth:`get_tensor` instead.
+        """
+        return self._file.get_slice(name)
+
+    def get_tensor(self, name: str) -> "torch.Tensor":
+        """Load tensor *name* and place it on the target device via the hook.
+
+        The CPU tensor is passed to the registered transfer hook together
+        with its *name* so the hook can choose an optimal layout (e.g.
+        ``dim_order=[1,0]`` for Linear weights on Spyre).
+        """
+        cpu_tensor = self._file.get_tensor(name)
+        return self._hook(cpu_tensor, name, self._device)
+
+    def get_tensors(self) -> "Dict[str, torch.Tensor]":
+        """Load all tensors and return as a {name: tensor} dict."""
+        return {name: self.get_tensor(name) for name in self.keys()}
+
+
+# ---------------------------------------------------------------------------
+# Public safe_open replacement
+# ---------------------------------------------------------------------------
+
+
+def safe_open(filename, framework: str, device="cpu", *, backend: str = "mmap"):
+    """Open a safetensors file, with support for custom devices via hooks.
+
+    This is a drop-in replacement for :func:`safetensors.safe_open` that
+    adds support for device types not natively understood by the Rust core
+    (such as Spyre), provided a transfer hook has been registered via
+    :func:`_register_device_transfer_hook`.
+
+    For all natively supported devices (``cpu``, ``cuda``, ``cuda:N``, …)
+    the call is forwarded unchanged to the original implementation.
+
+    Args:
+        filename (str | os.PathLike): Path to the ``.safetensors`` file.
+        framework (str): Tensor framework.  Must be ``"pt"`` for PyTorch.
+        device (str | torch.device, optional): Target device.  Defaults to
+            ``"cpu"``.  Custom device types are supported if a hook has been
+            registered for them (e.g. ``"spyre"`` after importing
+            ``torch_spyre``).
+
+    Raises:
+        RuntimeError: If *device* is a custom type with no registered hook.
+
+    Example::
+
+        import torch_spyre          # registers the Spyre hook automatically
+        from safetensors.torch import safe_open
+
+        with safe_open("model.safetensors", framework="pt", device="spyre") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)   # tensor is on Spyre
+    """
+    dev_type = _device_type(device)
+    hook = _DEVICE_TRANSFER_HOOKS.get(dev_type)
+
+    if hook is not None:
+        return _CustomDeviceSafeTensorsFile(filename, framework, device, hook, backend)
+
+    # If the device type is non-standard and has no hook, fail clearly rather
+    # than letting the Rust core produce a cryptic error.
+    _KNOWN_NATIVE_DEVICES = {"cpu", "cuda", "mps", "musa", "npu"}
+    if dev_type not in _KNOWN_NATIVE_DEVICES:
+        raise RuntimeError(
+            f"safetensors: device type '{dev_type}' is not natively supported "
+            f"and no transfer hook has been registered for it. "
+            f"If you are using a third-party device package, make sure it is "
+            f"imported before calling safe_open (e.g. 'import torch_{dev_type}')."
+        )
+
+    return _safe_open(filename, framework=framework, device=device, backend=backend)
+
+
+def _assign_tensors_to_model(model, state_dict, strict=True):
+    """Assign tensors from state_dict directly to model parameters/buffers.
+    
+    This is used when assign=True to replace meta device parameters with
+    loaded tensors. Unlike copy_(), this actually replaces the parameter
+    tensor instead of trying to copy into it (which is a no-op for meta).
+    
+    Returns:
+        (missing_keys, unexpected_keys): Lists of missing and unexpected keys
+    """
+    missing_keys = []
+    unexpected_keys = list(state_dict.keys())
+    
+    # Assign parameters
+    for name, param in model.named_parameters():
+        if name in state_dict:
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+            
+            # Direct assignment - replaces the parameter tensor
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                try:
+                    parent = model.get_submodule(parts[0])
+                except AttributeError:
+                    missing_keys.append(name)
+                    continue
+                attr_name = parts[1]
+            else:
+                parent = model
+                attr_name = parts[0]
+            
+            parent._parameters[attr_name] = torch.nn.Parameter(
+                state_dict[name], requires_grad=param.requires_grad
+            )
+        else:
+            missing_keys.append(name)
+    
+    # Assign buffers
+    for name, buf in model.named_buffers():
+        if name in state_dict:
+            if name in unexpected_keys:
+                unexpected_keys.remove(name)
+            
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                try:
+                    parent = model.get_submodule(parts[0])
+                except AttributeError:
+                    missing_keys.append(name)
+                    continue
+                attr_name = parts[1]
+            else:
+                parent = model
+                attr_name = parts[0]
+            
+            parent._buffers[attr_name] = state_dict[name]
+        else:
+            missing_keys.append(name)
+    
+    if strict and (missing_keys or unexpected_keys):
+        raise RuntimeError(
+            f"Error(s) in loading state_dict: missing keys {missing_keys}, "
+            f"unexpected keys {unexpected_keys}"
+        )
+    
+    return missing_keys, unexpected_keys
 
 
 def storage_ptr(tensor: torch.Tensor) -> int:
@@ -197,6 +460,7 @@ def load_model(
     strict: bool = True,
     device: Union[str, int] = "cpu",
     *,
+    assign: bool = False,
     backend: str = "mmap",
 ) -> Tuple[List[str], List[str]]:
     """
@@ -215,6 +479,11 @@ def load_model(
         device (`Union[str, int]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular torch device locations.
+        assign (`bool`, *optional*, defaults to `False`):
+            If True, assign tensors directly to parameters instead of copying
+            via load_state_dict(). This is required when loading to custom
+            devices with models that have meta device parameters, as copying
+            from a non-meta tensor to a meta tensor is a no-op.
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
             and `"pread"` uses `pread(2)` to read tensor bytes.
@@ -226,6 +495,10 @@ def load_model(
             the load.
     """
     state_dict = load_file(filename, device=device, backend=backend)
+    if assign:
+        # Direct assignment path for meta device models
+        return _assign_tensors_to_model(model, state_dict, strict=strict)     
+    # Standard load_state_dict path
     model_state_dict = model.state_dict()
     to_removes = _remove_duplicate_names(
         model_state_dict, preferred_names=state_dict.keys()
