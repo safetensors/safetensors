@@ -1,3 +1,5 @@
+import itertools
+import math
 import os
 import sys
 from collections import defaultdict
@@ -27,7 +29,17 @@ def storage_ptr(tensor: torch.Tensor) -> int:
 
 def _end_ptr(tensor: torch.Tensor) -> int:
     if tensor.nelement():
-        stop = tensor.view(-1)[-1].data_ptr() + _SIZE[tensor.dtype]
+        stop = (
+            tensor.data_ptr()
+            + (
+                sum(
+                    (shape - 1) * max(stride, 0)
+                    for shape, stride in zip(tensor.shape, tensor.stride())
+                )
+                + 1
+            )
+            * _SIZE.get(tensor.dtype, tensor.element_size())
+        )
     else:
         stop = tensor.data_ptr()
     return stop
@@ -46,6 +58,191 @@ def storage_size(tensor: torch.Tensor) -> int:
             return tensor.nelement() * _SIZE[tensor.dtype]
 
 
+def _ceil_div(n: int, d: int) -> int:
+    return -(-n // d)
+
+
+def _ext_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    x0, x1, y0, y1 = 1, 0, 0, 1
+    while b != 0:
+        q = a // b
+        a, b = b, a % b
+        x0, x1 = x1, x0 - q * x1
+        y0, y1 = y1, y0 - q * y1
+    return a, x0, y0
+
+
+def _can_flatten_to_1d(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> Tuple[bool, int, int]:
+    if 0 in shape:
+        return True, 0, 0
+    dims = [(s, st) for s, st in zip(shape, stride) if s > 1]
+    if not dims:
+        return True, 1, 0
+    if any(st <= 0 for _, st in dims):
+        return False, 0, 0
+    dims.sort(key=lambda x: x[1])
+    base_step = dims[0][1]
+    expected_stride = base_step
+    total_len = 1
+    for s, st in dims:
+        if st != expected_stride:
+            return False, 0, 0
+        expected_stride *= s
+        total_len *= s
+    return True, total_len, base_step
+
+
+def _solve_1d_diophantine_point(S1: int, n1: int, S2: int, n2: int, k: int) -> bool:
+    g, x0, y0 = _ext_gcd(S1, S2)
+    if k % g != 0:
+        return False
+    factor = k // g
+    i0 = x0 * factor
+    j0 = -y0 * factor
+
+    step_i = S2 // g
+    step_j = S1 // g
+
+    t_min_i = _ceil_div(-i0, step_i)
+    t_max_i = (n1 - 1 - i0) // step_i
+
+    t_min_j = _ceil_div(-j0, step_j)
+    t_max_j = (n2 - 1 - j0) // step_j
+
+    t_min = max(t_min_i, t_min_j)
+    t_max = min(t_max_i, t_max_j)
+
+    return t_min <= t_max
+
+
+def _solve_1d_byte_overlap(
+    o1: int, n1: int, s1: int, w1: int,
+    o2: int, n2: int, s2: int, w2: int,
+) -> bool:
+    if n1 == 0 or n2 == 0:
+        return False
+
+    S1 = s1 * w1
+    S2 = s2 * w2
+
+    if n1 == 1 or S1 == 0:
+        if n2 == 1 or S2 == 0:
+            return max(o1, o2) < min(o1 + w1, o2 + w2)
+        L = (o1 - o2) - w2 + 1
+        R = (o1 - o2) + w1 - 1
+        j_min = max(0, _ceil_div(L, S2))
+        j_max = min(n2 - 1, R // S2)
+        return j_min <= j_max
+
+    if n2 == 1 or S2 == 0:
+        L = (o2 - o1) - w1 + 1
+        R = (o2 - o1) + w2 - 1
+        i_min = max(0, _ceil_div(L, S1))
+        i_max = min(n1 - 1, R // S1)
+        return i_min <= i_max
+
+    max_b1 = o1 + (n1 - 1) * S1 + w1
+    max_b2 = o2 + (n2 - 1) * S2 + w2
+    if max_b1 <= o2 or max_b2 <= o1:
+        return False
+
+    delta = o2 - o1
+    L = delta - w1 + 1
+    R = delta + w2 - 1
+
+    g = math.gcd(S1, S2)
+    m_min = _ceil_div(L, g)
+    m_max = R // g
+    if m_min > m_max:
+        return False
+
+    for m in range(m_min, m_max + 1):
+        k = m * g
+        if _solve_1d_diophantine_point(S1, n1, S2, n2, k):
+            return True
+
+    return False
+
+
+def _multidim_byte_gcd_reject(
+    o1: int, shape1: Tuple[int, ...], strides1: Tuple[int, ...], w1: int,
+    o2: int, shape2: Tuple[int, ...], strides2: Tuple[int, ...], w2: int,
+) -> bool:
+    S1 = [st * w1 for s, st in zip(shape1, strides1) if s > 1 and st > 0]
+    S2 = [st * w2 for s, st in zip(shape2, strides2) if s > 1 and st > 0]
+
+    all_strides = S1 + S2
+    if not all_strides:
+        return False
+
+    g = all_strides[0]
+    for s in all_strides[1:]:
+        g = math.gcd(g, s)
+
+    delta = o2 - o1
+    L = delta - w1 + 1
+    R = delta + w2 - 1
+
+    m_min = _ceil_div(L, g)
+    m_max = R // g
+    return m_min > m_max
+
+
+def _tensors_overlap(t1: torch.Tensor, t2: torch.Tensor, max_exact_numel: int = 5000) -> bool:
+    if t1.device == torch.device("meta") or t2.device == torch.device("meta"):
+        return False
+    if t1.device != t2.device or storage_ptr(t1) != storage_ptr(t2):
+        return False
+    if t1.numel() == 0 or t2.numel() == 0:
+        return False
+
+    w1 = _SIZE.get(t1.dtype, t1.element_size())
+    w2 = _SIZE.get(t2.dtype, t2.element_size())
+    o1 = t1.data_ptr()
+    o2 = t2.data_ptr()
+
+    # Tier 1: Bounding-box rejection
+    stop1 = o1 + (sum((s - 1) * max(st, 0) for s, st in zip(t1.shape, t1.stride())) + 1) * w1
+    stop2 = o2 + (sum((s - 1) * max(st, 0) for s, st in zip(t2.shape, t2.stride())) + 1) * w2
+    if stop1 <= o2 or stop2 <= o1:
+        return False
+
+    # Tier 2: Multidimensional byte GCD rejection
+    if _multidim_byte_gcd_reject(o1, t1.shape, t1.stride(), w1, o2, t2.shape, t2.stride(), w2):
+        return False
+
+    # Tier 3: 1D Diophantine solver (including legitimately flattened multidimensional tensors)
+    can1, n1, s1 = _can_flatten_to_1d(t1.shape, t1.stride())
+    can2, n2, s2 = _can_flatten_to_1d(t2.shape, t2.stride())
+    if can1 and can2:
+        return _solve_1d_byte_overlap(o1, n1, s1, w1, o2, n2, s2, w2)
+
+    # Tier 4: Exact element byte-address checking for small bounded tensors
+    if min(t1.numel(), t2.numel()) <= max_exact_numel:
+        if t1.numel() <= t2.numel():
+            small_t, small_o, small_w = t1, o1, w1
+            large_t, large_o, large_w = t2, o2, w2
+        else:
+            small_t, small_o, small_w = t2, o2, w2
+            large_t, large_o, large_w = t1, o1, w1
+
+        small_bytes = set()
+        for idx in itertools.product(*[range(s) for s in small_t.shape]):
+            elem_addr = small_o + sum(i * st for i, st in zip(idx, small_t.stride())) * small_w
+            for b in range(elem_addr, elem_addr + small_w):
+                small_bytes.add(b)
+
+        for idx in itertools.product(*[range(s) for s in large_t.shape]):
+            elem_addr = large_o + sum(i * st for i, st in zip(idx, large_t.stride())) * large_w
+            for b in range(elem_addr, elem_addr + large_w):
+                if b in small_bytes:
+                    return True
+        return False
+
+    # Tier 5: Conservative fallback for large unresolved multidimensional layouts
+    return True
+
+
 def _filter_shared_not_shared(
     tensors: List[Set[str]], state_dict: Dict[str, torch.Tensor]
 ) -> List[Set[str]]:
@@ -55,20 +252,35 @@ def _filter_shared_not_shared(
             filtered_tensors.append(shared)
             continue
 
-        areas = []
-        for name in shared:
-            tensor = state_dict[name]
-            areas.append((tensor.data_ptr(), _end_ptr(tensor), name))
-        areas.sort()
+        names = sorted(list(shared))
+        parent = {name: name for name in names}
 
-        _, last_stop, last_name = areas[0]
-        filtered_tensors.append({last_name})
-        for start, stop, name in areas[1:]:
-            if start >= last_stop:
-                filtered_tensors.append({name})
-            else:
-                filtered_tensors[-1].add(name)
-            last_stop = stop
+        def find(x: str) -> str:
+            path = []
+            while parent[x] != x:
+                path.append(x)
+                x = parent[x]
+            for p in path:
+                parent[p] = x
+            return x
+
+        def union(x: str, y: str) -> None:
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[ry] = rx
+
+        for i in range(len(names)):
+            t1 = state_dict[names[i]]
+            for j in range(i + 1, len(names)):
+                t2 = state_dict[names[j]]
+                if _tensors_overlap(t1, t2):
+                    union(names[i], names[j])
+
+        components = defaultdict(set)
+        for name in names:
+            components[find(name)].add(name)
+
+        filtered_tensors.extend(sorted(components.values(), key=lambda s: sorted(list(s))[0]))
 
     return filtered_tensors
 
@@ -132,6 +344,15 @@ def _remove_duplicate_names(
         discard_names = []
     discard_names = set(discard_names)
 
+    storage_counts = defaultdict(int)
+    for v in state_dict.values():
+        if (
+            v.device != torch.device("meta")
+            and storage_ptr(v) != 0
+            and storage_size(v) != 0
+        ):
+            storage_counts[(v.device, storage_ptr(v), storage_size(v))] += 1
+
     shareds = _find_shared_tensors(state_dict)
     to_remove = defaultdict(list)
     for shared in shareds:
@@ -139,13 +360,35 @@ def _remove_duplicate_names(
             [name for name in shared if _is_complete(state_dict[name])]
         )
         if not complete_names:
-            raise RuntimeError(
-                "Error while trying to find names to remove to save state dict, but found no suitable name to keep"
-                f" for saving amongst: {shared}. None is covering the entire storage.Refusing to save/load the model"
-                " since you could be storing much more memory than needed. Please refer to"
-                " https://huggingface.co/docs/safetensors/torch_shared_tensors for more information. Or open an"
-                " issue."
-            )
+            if len(shared) == 1:
+                name = list(shared)[0]
+                t = state_dict[name]
+                # A singleton group is safe to clone into independent contiguous storage ONLY IF:
+                # 1. It does NOT use zero-stride broadcasting (e.g. expand), AND
+                # 2. It was partitioned from a multi-tensor shared storage group where the grouping
+                #    algorithm established that no other relevant tensor overlaps it.
+                has_zero_stride = any(st == 0 for s, st in zip(t.shape, t.stride()) if s > 1)
+                was_partitioned = storage_counts.get((t.device, storage_ptr(t), storage_size(t)), 0) > 1
+
+                if not has_zero_stride and was_partitioned:
+                    state_dict[name] = t.clone()
+                    complete_names = {name}
+                else:
+                    raise RuntimeError(
+                        "Error while trying to find names to remove to save state dict, but found no suitable name to keep"
+                        f" for saving amongst: {shared}. None is covering the entire storage.Refusing to save/load the model"
+                        " since you could be storing much more memory than needed. Please refer to"
+                        " https://huggingface.co/docs/safetensors/torch_shared_tensors for more information. Or open an"
+                        " issue."
+                    )
+            else:
+                raise RuntimeError(
+                    "Error while trying to find names to remove to save state dict, but found no suitable name to keep"
+                    f" for saving amongst: {shared}. None is covering the entire storage.Refusing to save/load the model"
+                    " since you could be storing much more memory than needed. Please refer to"
+                    " https://huggingface.co/docs/safetensors/torch_shared_tensors for more information. Or open an"
+                    " issue."
+                )
 
         keep_name = sorted(list(complete_names))[0]
 
