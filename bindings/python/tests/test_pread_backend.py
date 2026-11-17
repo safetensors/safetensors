@@ -228,10 +228,16 @@ class PreadBackendTests(unittest.TestCase):
                 f.prefetch({"nope": None})
             with self.assertRaisesRegex(Exception, "step 1"):
                 f.prefetch({"fp32_2d": slice(0, 3, 2)})
-            with self.assertRaisesRegex(Exception, "0-d"):
+            with self.assertRaisesRegex(Exception, "step 1"):
+                f.prefetch({"fp32_2d": (slice(None), slice(0, 4, 2))})
+            with self.assertRaisesRegex(
+                Exception, "more slicing indexes than dimensions"
+            ):
                 f.prefetch({"scalar_fp32": slice(0, 1)})
-            with self.assertRaisesRegex(Exception, "None or a slice"):
-                f.prefetch({"fp32_2d": 3})
+            with self.assertRaisesRegex(Exception, "out of bounds"):
+                f.prefetch({"fp32_2d": 3})  # an int selects a row, as with get_slice
+            with self.assertRaisesRegex(Exception, "Unsupported slice index"):
+                f.prefetch({"fp32_2d": "rows"})
 
     def test_prefetch_rejects_unsupported_dtype(self):
         # F6 has no torch dtype: refuse at prefetch, before any device memory moves.
@@ -395,14 +401,107 @@ class PrefetchCudaTests(unittest.TestCase):
     def test_plan_rejects_out_of_range_rows(self):
         # Python would clamp slice(0, 10) on 3 rows to 3 rows; a plan is explicit
         with safe_open(self.path, framework="pt") as f:
-            with self.assertRaisesRegex(Exception, "out of range"):
+            with self.assertRaisesRegex(Exception, "out of bounds"):
                 f.prefetch({"fp32_2d": slice(0, 10)}, device="cuda:0")
             with self.assertRaisesRegex(Exception, "invalid prefetch plan slice"):
                 f.prefetch({"fp32_2d": slice(0, 3, 0)}, device="cuda:0")
             with self.assertRaisesRegex(Exception, "selects no tensors"):
                 f.prefetch({}, device="cuda:0")
-            with f.prefetch({"fp32_2d": slice(-3, 3)}, device="cuda:0") as loader:
-                self.assertEqual(tuple(loader.take("fp32_2d").shape), (3, 4))
+
+    def test_plan_slices_match_source(self):
+        # a plan entry means what indexing `get_slice` means, plus lists per dimension
+        plan = {
+            "fp32_2d": (slice(None), slice(1, 3)),
+            "fp16_3d": (1, ..., slice(1, 3)),  # an int drops its dimension
+            "i64_1d": ([slice(0, 2), slice(3, 5)],),
+            "bf16_2d": ([0, 1], [0, slice(2, 4)]),  # lists may mix ints and slices
+            "scalar_fp32": None,
+        }
+        with self._open(plan=plan) as loader:
+            got = {name: loader.take(name) for name in plan}
+        src = SOURCE_TENSORS
+        with safe_open(self.path, framework="pt") as f:
+            expected = {
+                "fp32_2d": f.get_slice("fp32_2d")[:, 1:3],
+                "fp16_3d": f.get_slice("fp16_3d")[1, ..., 1:3],
+            }
+        expected |= {
+            "i64_1d": torch.cat([src["i64_1d"][0:2], src["i64_1d"][3:5]]),
+            "bf16_2d": src["bf16_2d"][0:2][:, [0, 2, 3]],
+            "scalar_fp32": src["scalar_fp32"],
+        }
+        for name, want in expected.items():
+            self.assertTrue(got[name].is_contiguous(), name)
+            self.assertEqual(tuple(got[name].shape), tuple(want.shape), name)
+            self.assertTrue(torch.equal(got[name].cpu(), want), name)
+
+    def test_plan_int_in_a_list_keeps_its_dimension(self):
+        with self._open(plan={"fp16_3d": ([1], slice(None), slice(1, 3))}) as loader:
+            got = loader.take("fp16_3d")
+        self.assertTrue(torch.equal(got.cpu(), SOURCE_TENSORS["fp16_3d"][1:2, :, 1:3]))
+
+    def test_slices_across_chunks(self):
+        # chunks are 16 MiB: in a 64 MiB tensor, a column slice is cut by chunk edges
+        # mid-row, and so are the parts of a row list
+        path = os.path.join(self.tempdir.name, "big.safetensors")
+        w = torch.arange(2048 * 8192, dtype=torch.float32).reshape(2048, 8192)
+        save_file({"w": w}, path)
+        with safe_open(path, framework="pt") as f:
+            with f.prefetch(
+                {"w": (slice(None), slice(100, 1124))}, device="cuda:0"
+            ) as loader:
+                cols = loader.take("w")
+            with f.prefetch(
+                {"w": ([slice(0, 256), slice(1792, 2048)],)}, device="cuda:0"
+            ) as loader:
+                rows = loader.take("w")
+        self.assertTrue(torch.equal(cols.cpu(), w[:, 100:1124]))
+        self.assertTrue(torch.equal(rows.cpu(), torch.cat([w[0:256], w[1792:2048]])))
+
+    def test_plan_slices_allocate_their_bytes(self):
+        # 16 MiB tensors; a quarter of the columns of one and of the rows of the other
+        path = os.path.join(self.tempdir.name, "quarters.safetensors")
+        save_file({k: torch.zeros(1024, 4096) for k in ("a", "b")}, path)
+        plan = {"a": (slice(None), slice(0, 1024)), "b": slice(0, 256)}
+        before = torch.cuda.memory_allocated(0)
+        with self._open(path, plan=plan) as loader:
+            held = dict(loader)
+            used = torch.cuda.memory_allocated(0) - before
+        self.assertEqual(
+            {k: tuple(t.shape) for k, t in held.items()},
+            {"a": (1024, 1024), "b": (256, 4096)},
+        )
+        self.assertEqual(used, 8 * MIB)
+
+    def test_plan_rejects_bad_slices(self):
+        with safe_open(self.path, framework="pt") as f:
+            with self.assertRaisesRegex(
+                Exception, "more slicing indexes than dimensions"
+            ):
+                f.prefetch(
+                    {"fp32_2d": ([slice(None)], slice(None), slice(None))},
+                    device="cuda:0",
+                )
+            with self.assertRaisesRegex(Exception, "overlap or are out of order"):
+                f.prefetch({"fp32_2d": ([slice(2, 3), slice(0, 1)],)}, device="cuda:0")
+            with self.assertRaisesRegex(Exception, "Unsupported slice index"):
+                f.prefetch({"fp32_2d": (["a"],)}, device="cuda:0")
+            with self.assertRaisesRegex(Exception, "ints, slices or lists"):
+                f.prefetch({"fp32_2d": ([slice(0, 1)], ...)}, device="cuda:0")
+            with self.assertRaisesRegex(Exception, "step 1"):
+                f.prefetch({"fp32_2d": ([slice(0, 3, 2)],)}, device="cuda:0")
+            with self.assertRaisesRegex(Exception, "out of bounds"):
+                f.prefetch({"fp32_2d": (slice(None), slice(0, 9))}, device="cuda:0")
+
+    def test_plan_rejects_too_fragmented_slices(self):
+        path = os.path.join(self.tempdir.name, "wide.safetensors")
+        save_file({"w": torch.zeros(2, 65536)}, path)
+        every_other_column = [slice(i, i + 1) for i in range(0, 65536, 2)]
+        with safe_open(path, framework="pt") as f:
+            with self.assertRaisesRegex(
+                Exception, "load the tensor whole and index it on the device"
+            ):
+                f.prefetch({"w": (slice(None), every_other_column)}, device="cuda:0")
 
     def test_torch_accounts_prefetched_memory(self):
         # torch allocates every tensor at prefetch and frees each one on drop; untaken
@@ -525,6 +624,9 @@ class PrefetchCudaTests(unittest.TestCase):
             t = loader.take("fp32_2d")
         self.assertEqual(tuple(t.shape), (0, 4))
         self.assertEqual(t.dtype, torch.float32)
+        with self._open(plan={"fp16_3d": (slice(None), slice(1, 1))}) as loader:
+            t = loader.take("fp16_3d")
+        self.assertEqual(tuple(t.shape), (2, 0, 4))
 
     def test_two_loaders_from_one_handle(self):
         # one handle, several loaders (one per device in practice): the handle is unchanged
@@ -641,6 +743,16 @@ class PrefetchCudaTests(unittest.TestCase):
         self.assertEqual(x.dtype, torch.float4_e2m1fn_x2)
         self.assertEqual(tuple(x.shape), (2, 4))
         self.assertEqual(x.view(torch.uint8).cpu().flatten().tolist(), list(raw[4:12]))
+        # two F4 elements per byte: a column slice must cut on whole bytes
+        with self._open(path, plan={"x": (slice(None), slice(2, 6))}) as loader:
+            cols = loader.take("x")
+        self.assertEqual(tuple(cols.shape), (4, 2))
+        self.assertEqual(
+            cols.view(torch.uint8).cpu().tolist(),
+            [list(raw[r * 4 + 1 : r * 4 + 3]) for r in range(4)],
+        )
+        with self.assertRaisesRegex(Exception, "byte boundary"):
+            self._open(path, plan={"x": (slice(None), slice(1, 5))})
 
     def _assert_matches_source(self, sd):
         self.assertEqual(set(sd.keys()), set(SOURCE_TENSORS.keys()))
