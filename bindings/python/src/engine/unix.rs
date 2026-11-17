@@ -12,7 +12,8 @@
 //! ```
 //!
 //! - spans [`LoadPlan::spans`]: a byte interval of the data section, copied to
-//!   its destination. The delivery unit: `take` hands out the span's owner.
+//!   its destination, or, with a [`Gather`], packed into it by the gather's
+//!   strided copies. The delivery unit: `take` hands out the span's owner.
 //! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`] of adjacent spans,
 //!   never across a gap. The I/O unit: one `pread`, one slab, one event, one
 //!   `memcpy` per run of spans whose destinations are adjacent. `span_chunks`
@@ -32,7 +33,8 @@
 //!                                        pool; waits for its previous copy
 //!   pread(chunk c) -> lease              one read per chunk
 //!   memcpyAsync(lease -> destinations)   one copy per run of adjacent
-//!                                        destinations, on STREAMS[device]
+//!                                        destinations, on STREAMS[device];
+//!                                        memcpy2DAsync for a gather's rows
 //!   chunk_completion_events[c] = event   recorded after the copies; 0 while
 //!                                        the chunk is still pending
 //! consumer
@@ -62,6 +64,7 @@ use std::{
 };
 
 use crate::engine::cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream};
+use safetensors::slice::{Gather, StridedCopy};
 
 #[derive(Debug)]
 pub enum LoaderError {
@@ -132,6 +135,9 @@ pub struct Span {
 /// data section; device addresses never appear in the plan.
 struct LoadPlan {
     spans: Box<[Span]>,
+    /// per span, the copies that pack its bytes into its destination; `None` for
+    /// one plain copy
+    gathers: Box<[Option<Gather>]>,
     /// per span, the `chunks` that carry its bytes; empty for a zero-size span
     span_chunks: Box<[Range<usize>]>,
     /// data section byte interval of each chunk: at most [`CHUNK_SIZE`] of
@@ -142,14 +148,78 @@ struct LoadPlan {
     in_file_offset: usize,
 }
 
+/// The part of `copy` whose source bytes lie in `window`, sources relative to
+/// `window.start`: the rows inside it as one copy, and the rows its edges cut (at
+/// most two) as single-row copies of their part inside it.
+fn clip(copy: &StridedCopy, window: &Range<usize>) -> [Option<StridedCopy>; 3] {
+    let row = |k: usize| copy.src + k * copy.src_pitch;
+    let part = |k: usize| {
+        let (start, end) = (
+            row(k).max(window.start),
+            (row(k) + copy.width).min(window.end),
+        );
+        (start < end).then(|| StridedCopy {
+            src: start - window.start,
+            dst: copy.dst + k * copy.dst_pitch + (start - row(k)),
+            width: end - start,
+            height: 1,
+            src_pitch: 0,
+            dst_pitch: 0,
+        })
+    };
+    if copy.height == 1 {
+        return [part(0), None, None];
+    }
+    if window.end <= copy.src {
+        return [None; 3];
+    }
+    // rows are disjoint and in order (src_pitch >= width): the ones meeting the
+    // window are consecutive
+    let first = window
+        .start
+        .checked_sub(copy.src + copy.width)
+        .map_or(0, |past| past / copy.src_pitch + 1);
+    let last = ((window.end - copy.src - 1) / copy.src_pitch).min(copy.height - 1);
+    if first > last {
+        return [None; 3];
+    }
+    let whole = |k: usize| row(k) >= window.start && row(k) + copy.width <= window.end;
+    let (mut lo, mut hi) = (first, last);
+    let head = if whole(lo) {
+        None
+    } else {
+        lo += 1;
+        part(lo - 1)
+    };
+    let tail = if lo <= hi && !whole(hi) {
+        hi -= 1;
+        part(hi + 1)
+    } else {
+        None
+    };
+    let rows = (lo <= hi).then(|| StridedCopy {
+        src: row(lo) - window.start,
+        dst: copy.dst + lo * copy.dst_pitch,
+        height: hi - lo + 1,
+        ..*copy
+    });
+    [head, rows, tail]
+}
+
 impl LoadPlan {
-    fn new(spans: Vec<Span>, in_file_offset: usize, chunk_size: NonZeroUsize) -> Self {
+    fn new(
+        spans: Vec<Span>,
+        gathers: Vec<Option<Gather>>,
+        in_file_offset: usize,
+        chunk_size: NonZeroUsize,
+    ) -> Self {
         let chunk_size = chunk_size.get();
         assert!(
             spans.iter().all(|s| s.start <= s.end)
                 && spans.windows(2).all(|w| w[0].end <= w[1].start),
             "spans must be sorted by start and disjoint, each with start <= end"
         );
+        assert_eq!(gathers.len(), spans.len(), "one gather entry per span");
 
         let mut chunks: Vec<Range<usize>> = Vec::new();
         let mut chunk_spans: Vec<Range<usize>> = Vec::new();
@@ -180,11 +250,82 @@ impl LoadPlan {
 
         Self {
             spans: spans.into_boxed_slice(),
+            gathers: gathers.into_boxed_slice(),
             span_chunks: span_chunks.into_boxed_slice(),
             chunks: chunks.into_boxed_slice(),
             chunk_spans: chunk_spans.into_boxed_slice(),
             in_file_offset,
         }
+    }
+
+    /// Issues the copies of chunk `c` from its slab, sources as offsets in the slab
+    /// and destinations as addresses: `dst(s)` is span `s`'s destination and
+    /// `allocation_end(d)` the end of the allocation holding `d`, if known.
+    fn chunk_copies<E>(
+        &self,
+        c: usize,
+        dst: impl Fn(usize) -> u64,
+        mut allocation_end: impl FnMut(u64) -> Option<u64>,
+        mut copy: impl FnMut(StridedCopy) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let chunk = self.chunks[c].clone();
+        let plain = |(dst, at, len, _): (u64, usize, usize, u64)| StridedCopy {
+            src: at - chunk.start,
+            dst: dst as usize,
+            width: len,
+            height: 1,
+            src_pitch: 0,
+            dst_pitch: 0,
+        };
+        // one copy per run of pieces adjacent in the file and on the device,
+        // within one allocation: (device address, data section offset, length,
+        // end of the allocation, looked up once the run grows)
+        let mut run: Option<(u64, usize, usize, u64)> = None;
+        for s in self.chunk_spans[c].clone() {
+            let span = self.spans[s];
+            let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
+            if start >= end {
+                continue;
+            }
+            if let Some(gather) = &self.gathers[s] {
+                if let Some(run) = run.take() {
+                    copy(plain(run))?;
+                }
+                let window = start - span.start..end - span.start;
+                for piece in gather
+                    .copies
+                    .iter()
+                    .flat_map(|g| clip(g, &window))
+                    .flatten()
+                {
+                    copy(StridedCopy {
+                        src: start - chunk.start + piece.src,
+                        dst: dst(s) as usize + piece.dst,
+                        ..piece
+                    })?;
+                }
+                continue;
+            }
+            let dst = dst(s) + (start - span.start) as u64;
+            if let Some((d0, at, len, limit)) = run.as_mut() {
+                if *at + *len == start && *d0 + *len as u64 == dst {
+                    if *limit == 0 {
+                        *limit = allocation_end(*d0).unwrap_or(dst);
+                    }
+                    if dst + (end - start) as u64 <= *limit {
+                        *len += end - start;
+                        continue;
+                    }
+                }
+            }
+            if let Some(run) = run.replace((dst, start, end - start, 0)) {
+                copy(plain(run))?;
+            }
+        }
+        if let Some(run) = run {
+            copy(plain(run))?;
+        }
+        Ok(())
     }
 }
 
@@ -495,39 +636,28 @@ impl<D> CudaSink<D> {
         )?;
 
         let e = self.api.with_device(self.device, |d| {
-            let copy = |(dst, at, len, _): (u64, usize, usize, u64)| {
-                let src = lease.ptr().wrapping_add(at - chunk.start);
-                self.api.memcpy_h2d_async(dst, src, len, self.stream)
-            };
-            // one copy per run of pieces adjacent in the file and on the device,
-            // within one allocation: (device address, data section offset, length,
-            // end of the allocation, looked up once the run grows)
-            let mut run: Option<(u64, usize, usize, u64)> = None;
-            for s in self.plan.chunk_spans[chunk_idx].clone() {
-                let span = self.plan.spans[s];
-                let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
-                if start >= end {
-                    continue;
-                }
-                let dst = self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64;
-                if let Some((d0, at, len, limit)) = run.as_mut() {
-                    if *at + *len == start && *d0 + *len as u64 == dst {
-                        if *limit == 0 {
-                            *limit = self.api.allocation_end(*d0).unwrap_or(dst);
-                        }
-                        if dst + (end - start) as u64 <= *limit {
-                            *len += end - start;
-                            continue;
-                        }
+            self.plan.chunk_copies(
+                chunk_idx,
+                |s| self.dsts[s].load(Ordering::Relaxed),
+                |d0| self.api.allocation_end(d0),
+                |c| {
+                    let src = lease.ptr().wrapping_add(c.src);
+                    match c.height {
+                        1 => self
+                            .api
+                            .memcpy_h2d_async(c.dst as u64, src, c.width, self.stream),
+                        _ => self.api.memcpy2d_h2d_async(
+                            c.dst as u64,
+                            c.dst_pitch,
+                            src,
+                            c.src_pitch,
+                            c.width,
+                            c.height,
+                            self.stream,
+                        ),
                     }
-                }
-                if let Some(run) = run.replace((dst, start, end - start, 0)) {
-                    copy(run)?;
-                }
-            }
-            if let Some(run) = run {
-                copy(run)?;
-            }
+                },
+            )?;
             lease.release(d, self.stream)?;
             let e = d.event_create()?;
             if let Err(err) = self.api.event_record(e, self.stream) {
@@ -801,12 +931,16 @@ impl<D> Feed<D> {
 impl<D: Send + 'static> Loader<D> {
     /// Starts the workers. They copy a span once it has a destination: give
     /// them with [`Feed::provide`], in plan order, as the load advances.
+    /// `gathers` has one entry per span: `Some` when its destination is
+    /// [`Gather::len`] bytes packed by the gather's copies (see
+    /// [`safetensors::slice::slice_layout`]) rather than the span's bytes.
     pub fn load(
         file: Arc<File>,
         in_file_offset: usize,
         device: i32,
         threads: usize,
         spans: Vec<Span>,
+        gathers: Vec<Option<Gather>>,
     ) -> Result<Self, LoaderError> {
         let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
         if !(0..MAX_DEVICES as i32).contains(&device) {
@@ -821,7 +955,7 @@ impl<D: Send + 'static> Loader<D> {
             // SAFETY: `file` holds an open descriptor for the call's duration.
             let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
         }
-        let plan = Arc::new(LoadPlan::new(spans, in_file_offset, CHUNK_SIZE));
+        let plan = Arc::new(LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE));
         // avoid spawning too many threads when not needed, up to chunks.len()
         let threads = threads.clamp(1, plan.chunks.len().max(1));
         let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
@@ -951,19 +1085,182 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // one range per dimension
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, ops::Range};
 
     use super::{LoadPlan, Span};
+    use safetensors::slice::{slice_layout, Gather, StridedCopy, TensorIndexer};
+    use safetensors::Dtype;
 
     fn sp(start: usize, end: usize) -> Span {
         Span { start, end }
     }
 
     fn plan(spans: Vec<Span>, chunk_size: usize) -> LoadPlan {
-        let plan = LoadPlan::new(spans, 0, NonZeroUsize::new(chunk_size).unwrap());
+        let gathers = vec![None; spans.len()];
+        let plan = LoadPlan::new(spans, gathers, 0, NonZeroUsize::new(chunk_size).unwrap());
         check_plan(&plan, chunk_size);
         plan
+    }
+
+    /// A device of `len` bytes of 0xAA after the plan's copies of `file`, span `s`
+    /// landing at `dsts[s]`, all in one allocation
+    fn land(plan: &LoadPlan, file: &[u8], dsts: &[usize], len: usize) -> Vec<u8> {
+        let mut device = vec![0xAA; len];
+        for c in 0..plan.chunks.len() {
+            let slab = &file[plan.chunks[c].clone()];
+            let copy = |cp: StridedCopy| -> Result<(), ()> {
+                for r in 0..cp.height {
+                    let (src, dst) = (cp.src + r * cp.src_pitch, cp.dst + r * cp.dst_pitch);
+                    device[dst..dst + cp.width].copy_from_slice(&slab[src..src + cp.width]);
+                }
+                Ok(())
+            };
+            plan.chunk_copies(c, |s| dsts[s] as u64, |_| Some(len as u64), copy)
+                .unwrap();
+        }
+        device
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+
+    /// The slice's bytes by brute force over element indices, from a tensor starting at byte 0 of `bytes`.
+    fn slice_bytes(
+        bytes: &[u8],
+        shape: &[usize],
+        elem: usize,
+        intervals: &[Vec<Range<usize>>],
+    ) -> Vec<u8> {
+        fn rec(
+            d: usize,
+            at: usize,
+            strides: &[usize],
+            ivs: &[Vec<Range<usize>>],
+            elem: usize,
+            b: &[u8],
+            out: &mut Vec<u8>,
+        ) {
+            if d == strides.len() {
+                out.extend_from_slice(&b[at..at + elem]);
+                return;
+            }
+            for r in &ivs[d] {
+                for i in r.clone() {
+                    rec(d + 1, at + i * strides[d], strides, ivs, elem, b, out);
+                }
+            }
+        }
+        let mut strides = vec![elem; shape.len()];
+        for d in (0..shape.len().saturating_sub(1)).rev() {
+            strides[d] = strides[d + 1] * shape[d + 1];
+        }
+        let mut out = Vec::new();
+        rec(0, 0, &strides, intervals, elem, bytes, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_random_slices_land_exactly() {
+        let mut rng = Rng(7);
+        for trial in 0..2000 {
+            // a few tensors laid out back to back, as in a safetensors data section
+            let n_tensors = 1 + rng.below(4);
+            let mut layout = Vec::new(); // (start, shape, elem)
+            let mut cursor = 0;
+            for _ in 0..n_tensors {
+                let shape: Vec<usize> = (0..1 + rng.below(4)).map(|_| 1 + rng.below(6)).collect();
+                let elem = [1, 2, 4][rng.below(3)];
+                layout.push((cursor, shape.clone(), elem));
+                cursor += shape.iter().product::<usize>() * elem;
+            }
+            let file: Vec<u8> = (0..cursor).map(|_| rng.below(0xAA) as u8).collect();
+
+            let (mut spans, mut gathers, mut dsts) = (Vec::new(), Vec::new(), Vec::new());
+            // destinations back to back or a few bytes apart
+            let mut expected = Vec::new();
+            for (start, shape, elem) in &layout {
+                if rng.below(4) == 0 {
+                    continue; // left out of the plan
+                }
+                let intervals: Vec<Vec<Range<usize>>> = shape
+                    .iter()
+                    .map(|&n| match rng.below(3) {
+                        0 => vec![0..n],
+                        _ => {
+                            let mut cuts: Vec<usize> = (0..2 * (1 + rng.below(2)))
+                                .map(|_| rng.below(n + 1))
+                                .collect();
+                            cuts.sort_unstable();
+                            cuts.dedup();
+                            cuts.chunks(2)
+                                .filter(|c| c.len() == 2)
+                                .map(|c| c[0]..c[1])
+                                .collect()
+                        }
+                    })
+                    .collect();
+                let dtype = [Dtype::U8, Dtype::U16, Dtype::U32]
+                    [[1, 2, 4].iter().position(|e| e == elem).unwrap()];
+                let indexers: Vec<Vec<TensorIndexer>> = intervals
+                    .iter()
+                    .map(|d| d.iter().map(|r| TensorIndexer::from(r.clone())).collect())
+                    .collect();
+                let r = slice_layout(dtype, shape, &indexers).unwrap();
+                let nbytes = shape.iter().product::<usize>() * elem;
+                let bytes = slice_bytes(&file[*start..*start + nbytes], shape, *elem, &intervals);
+                expected.resize(expected.len() + [0, 3][rng.below(2)], 0xAA);
+                dsts.push(expected.len());
+                expected.extend(bytes);
+                spans.push(sp(start + r.read.start, start + r.read.end));
+                gathers.push(r.gather);
+            }
+            let chunk = 1 + rng.below(48);
+            let plan = LoadPlan::new(spans, gathers, 0, NonZeroUsize::new(chunk).unwrap());
+            assert_eq!(
+                land(&plan, &file, &dsts, expected.len()),
+                expected,
+                "trial {trial}, chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gather_rows_cut_by_chunk_edges() {
+        // columns 2..5 of a 4 x 10 tensor between two plain spans, adjacent in the
+        // file and on the device: 7-byte chunks cut its rows, and the plain spans
+        // don't join it
+        let g = Gather {
+            copies: vec![StridedCopy {
+                src: 0,
+                dst: 0,
+                width: 3,
+                height: 4,
+                src_pitch: 10,
+                dst_pitch: 3,
+            }],
+            len: 12,
+        };
+        let spans = vec![sp(0, 7), sp(7, 40), sp(40, 45)];
+        let plan = LoadPlan::new(
+            spans,
+            vec![None, Some(g), None],
+            0,
+            NonZeroUsize::new(7).unwrap(),
+        );
+        let file: Vec<u8> = (0..45).collect();
+        let rows = (0..4).flat_map(|r| 7 + r * 10..10 + r * 10);
+        let expected: Vec<u8> = (0..7).chain(rows).chain(40..45).collect();
+        assert_eq!(land(&plan, &file, &[0, 7, 19], 24), expected);
     }
 
     fn check_plan(plan: &LoadPlan, chunk_size: usize) {
