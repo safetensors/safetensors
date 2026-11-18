@@ -361,8 +361,11 @@ pub fn slice_byte_ranges(
                     (start, stop, step.get())
                 }
             };
-            if start >= dim || stop > dim {
-                let asked = if start >= dim {
+            let is_select = matches!(slice, TensorIndexer::Select(_));
+            // A narrow may start at `dim` and select nothing, e.g. `[0:0]` on an empty dim.
+            let start_oob = if is_select { start >= dim } else { start > dim };
+            if start_oob || stop > dim {
+                let asked = if start_oob {
                     start
                 } else {
                     stop.saturating_sub(1)
@@ -375,7 +378,7 @@ pub fn slice_byte_ranges(
             }
             // Reversed bounds select nothing, as in Python.
             let stop = stop.max(start);
-            if !matches!(slice, TensorIndexer::Select(_)) {
+            if !is_select {
                 newshape.push((stop - start).div_ceil(step));
             }
             if indices.is_empty() {
@@ -685,6 +688,14 @@ mod tests {
             assert!(ranges.is_empty());
             assert_eq!(shape, vec![0, 2]);
         }
+        for (dim, start) in [(8, 8), (0, 0)] {
+            let slice =
+                TensorIndexer::Narrow(Bound::Included(start), Bound::Unbounded, NonZeroUsize::MIN);
+            let (ranges, shape) = slice_byte_ranges(Dtype::F32, &[dim, 2], &[slice]).unwrap();
+            assert!(ranges.is_empty());
+            assert_eq!(shape, vec![0, 2]);
+        }
+        assert!(slice_byte_ranges(Dtype::F32, &[0, 2], &[TensorIndexer::Select(0)]).is_err());
     }
 
     #[test]
@@ -758,11 +769,11 @@ mod tests {
                 &attn_0,
                 &[
                     TensorIndexer::Select(1),
-                    TensorIndexer::Narrow(Bound::Included(3), Bound::Excluded(2), NonZeroUsize::MIN),
+                    TensorIndexer::Narrow(Bound::Included(4), Bound::Excluded(2), NonZeroUsize::MIN),
                 ],
             ),
             Err(InvalidSlice::SliceOutOfRange {
-                asked: 3,
+                asked: 4,
                 dim_index: 1,
                 dim_size: 3,
             })
