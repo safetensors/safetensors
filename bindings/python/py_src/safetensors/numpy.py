@@ -13,6 +13,9 @@ def _flatten(
     flattened = {}
     for k, v in tensor_dict.items():
         tensor = v
+        if not tensor.flags.c_contiguous:
+            tensor = np.ascontiguousarray(tensor)
+            keep_alive_buffer.append(tensor)
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
             keep_alive_buffer.append(tensor)
@@ -52,7 +55,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep copied tensors alive
     serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
     result = bytes(serialized)
     return result
@@ -89,7 +92,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep copied tensors alive
     serialize_file(
         _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
     )
