@@ -8,6 +8,7 @@ pub type Event = *mut c_void;
 type Err = c_int;
 
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x2;
 const CUDA_STREAM_NON_BLOCKING: c_uint = 0x1;
 
@@ -148,6 +149,26 @@ impl CudaApi {
                 src as *const c_void,
                 len,
                 CUDA_MEMCPY_HOST_TO_DEVICE,
+                s,
+            )
+        })
+    }
+
+    pub fn memcpy_d2h_async(
+        &self,
+        dst: *mut u8,
+        src: u64,
+        len: usize,
+        s: Stream,
+    ) -> Result<(), CudaError> {
+        // SAFETY: a runtime call, which validates the device address; the caller
+        // keeps `dst` valid for `len` bytes until the copy completes
+        self.check(unsafe {
+            (self.f.cudaMemcpyAsync)(
+                dst as *mut c_void,
+                src as *const c_void,
+                len,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
                 s,
             )
         })

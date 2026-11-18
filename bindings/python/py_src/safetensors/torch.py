@@ -316,7 +316,9 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    serialize_file(_flatten(tensors), filename, metadata=metadata)
+    serialize_file(
+        _flatten(tensors, from_cuda=_SAVE_FROM_CUDA), filename, metadata=metadata
+    )
 
 
 def load_file(
@@ -530,9 +532,20 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
         )
 
 
-def _flatten(tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorSpec]:
+# `serialize_file` reads tensors on CUDA devices itself on Linux
+_SAVE_FROM_CUDA = (
+    sys.platform.startswith("linux")
+    and sys.byteorder == "little"
+    and torch.version.cuda is not None
+)
+
+
+def _flatten(
+    tensors: Dict[str, torch.Tensor], from_cuda: bool = False
+) -> Dict[str, TensorSpec]:
     _evaluate_tensors_for_save(tensors)
     flattened = {}
+    synchronized = set()
     for k, v in tensors.items():
         # XXX: doing this check later on instead of in _evaluate_tensors_for_save
         # since on old versions of torch, SparseTensorImpl do not implement is_contiguous
@@ -544,6 +557,20 @@ def _flatten(tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorSpec]:
                 " only the full tensors, and reslice at load time, or simply call `.contiguous()` on your tensor to"
                 " pack it before saving."
             )
+        if from_cuda and v.device.type == "cuda":
+            v = v.detach().resolve_conj().resolve_neg()
+            # the tensor is read once the work queued on it so far completed
+            if v.device not in synchronized:
+                torch.cuda.current_stream(v.device).synchronize()
+                synchronized.add(v.device)
+            flattened[k] = TensorSpec.cuda(
+                dtype=str(v.dtype).split(".")[-1],
+                shape=v.shape,
+                owner=v,
+                data_ptr=v.data_ptr(),
+                device=v.device.index,
+            )
+            continue
         flattened[k] = TensorSpec(
             dtype=str(v.dtype).split(".")[-1],
             shape=v.shape,

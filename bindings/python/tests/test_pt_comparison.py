@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from safetensors import safe_open
+from safetensors import SafetensorError, TensorSpec, safe_open, serialize
 from safetensors.torch import load, load_file, save, save_file
 
 
@@ -258,6 +258,42 @@ class TorchTestCase(unittest.TestCase):
             self.assertTrue(torch.equal(mapped["a"], torch.zeros(1 << 20)))
             self.assertTrue(torch.equal(load_file(path)["a"], torch.ones(1 << 20)))
             self.assertEqual(os.listdir(d), ["out.safetensors"])
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+    def test_save_file_from_cuda(self):
+        # CUDA tensors next to host ones, across the 16 MiB blocks the file is
+        # written in, one written by work still queued on the current stream
+        devices = [f"cuda:{i}" for i in range(min(torch.cuda.device_count(), 2))]
+        data = {
+            "host": torch.randn(1000),
+            "empty": torch.zeros((3, 0), device=devices[0]),
+            **{
+                f"t{i}": torch.randn(5_000_001, device=d)
+                for i, d in enumerate(devices * 2)
+            },
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.safetensors")
+            # a first save from the device sets up what may wait for it
+            save_file({"warm": torch.zeros(1, device=devices[0])}, path)
+            late = torch.zeros(1 << 20, device=devices[0])
+            torch.cuda._sleep(2_000_000_000)
+            data["late"] = late.fill_(7)
+            save_file(data, path, metadata={"format": "pt"})
+            with open(path, "rb") as f:
+                written = f.read()
+        expected = save(
+            {k: v.cpu() for k, v in data.items()}, metadata={"format": "pt"}
+        )
+        self.assertEqual(written, expected)
+
+    def test_serialize_rejects_device_memory(self):
+        spec = TensorSpec.cuda(
+            dtype="float32", shape=[1], owner=None, data_ptr=8, device=0
+        )
+        self.assertEqual(spec.device, 0)
+        with self.assertRaises(SafetensorError):
+            serialize({"a": spec})
 
     def test_disjoint_tensors_shared_storage(self):
         A = torch.zeros((10, 10))
