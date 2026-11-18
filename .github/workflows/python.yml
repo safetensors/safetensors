@@ -17,7 +17,7 @@ jobs:
         # Lowest and highest, no version specified so that
         # new releases get automatically tested against
         version: [
-          {torch: torch==2.6, python: "3.10", arch: "x64", numpy: numpy},
+          {torch: torch==2.6, python: "3.11", arch: "x64", numpy: numpy},
           {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
         ]
         include:
@@ -36,7 +36,7 @@ jobs:
             version:
               torch: torch
               numpy: "numpy==1.26"
-              python: "3.10"
+              python: "3.11"
               arch: "x64"
           - os: macos-latest
             version:
@@ -103,7 +103,7 @@ jobs:
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
           pip install ".[${{ matrix.version.python == '3.14' && 'tf-nightly' || 'tensorflow' }}]"
-          # XXX: I assume this is still the case for 3.10
+          # XXX: I assume this is still the case for 3.11
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
           pip install ${{ matrix.version.numpy }}
         shell: bash
