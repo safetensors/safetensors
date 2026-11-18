@@ -2,6 +2,10 @@ name: Rust
 
 on:
   pull_request:
+    paths:
+      - "safetensors/**"
+      - "README.md"
+      - ".github/workflows/rust.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

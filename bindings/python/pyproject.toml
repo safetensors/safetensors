@@ -1,6 +1,6 @@
 [project]
 name = 'safetensors'
-requires-python = '>=3.10'
+requires-python = '>=3.11'
 authors = [
   { name = 'Nicolas Patry', email = 'patry.nicolas@protonmail.com' },
   { name = "Luc Georges", email = 'luc@huggingface.co' },
@@ -14,7 +14,6 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -100,7 +99,7 @@ features = ["pyo3/extension-module"]
 
 [tool.black]
 line-length = 119
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.setuptools.dynamic]
 readme = { file = ["README.rst"] }
