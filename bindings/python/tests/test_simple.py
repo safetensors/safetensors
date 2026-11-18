@@ -81,6 +81,20 @@ class TestCase(unittest.TestCase):
         out2 = save({"test2": data, "test1": data})
         self.assertEqual(out1, out2)
 
+    def test_serialization_non_contiguous(self):
+        data = np.arange(6, dtype=np.int32).reshape(2, 3)
+        views = {"transposed": data.T, "strided": data[:, ::2], "reversed": data[::-1]}
+        copies = {name: view.copy() for name, view in views.items()}
+        self.assertEqual(save(views), save(copies))
+
+    def test_load_keeps_values(self):
+        tensors = {
+            "i32": np.arange(6, dtype=np.int32).reshape(2, 3),
+            "f64": np.linspace(0.5, 3.0, 6),
+        }
+        for name, tensor in load(save(tensors)).items():
+            np.testing.assert_array_equal(tensor, tensors[name])
+
     def test_serialization_forces_alignment(self):
         data = np.zeros((2, 2), dtype=np.int32)
         data2 = np.zeros((2, 2), dtype=np.float16)
