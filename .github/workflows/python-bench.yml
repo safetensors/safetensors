@@ -12,6 +12,10 @@ permissions:
   # contents permission to update benchmark contents in gh-pages branch
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   benchmark:
     name: Performance regression check
