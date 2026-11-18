@@ -2429,7 +2429,7 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
     let mut shape = logical_shape.to_vec();
     if dtype == Dtype::F4 {
         let n = shape.len();
-        if n == 0 || shape[n - 1] % 2 != 0 {
+        if n == 0 || !shape[n - 1].is_multiple_of(2) {
             return Err(SafetensorError::new_err(format!(
                 "f4_x2 dtype requires the last dim be divisible by 2 in torch: got {logical_shape:?}",
             )));
@@ -2481,7 +2481,10 @@ fn cuda_tensor_from_buffer(
     // Tensors are views at their packed file offset inside a shared allocation,
     // which may be misaligned for the element type: stage through a flat uint8
     // view and let torch's aligned clone fix it
-    if buffer.ptr() % (dtype.bitsize() / 8).max(1) as u64 != 0 {
+    if !buffer
+        .ptr()
+        .is_multiple_of((dtype.bitsize() / 8).max(1) as u64)
+    {
         let nbytes = buffer.len() as i64;
         let capsule = dlpack::to_capsule(py, buffer, vec![nbytes], dlpack::uint8_dlpack(), device)?;
         let shape: Py<PyAny> = storage_shape.into_pyobject(py)?.into();
