@@ -18,6 +18,7 @@ jobs:
       package_path: safetensors/bindings/python/
       version_tag_suffix: bindings/python/py_src/
       install_rust: true
+      python_version: "3.11"
     secrets:
       token: ${{ secrets.HUGGINGFACE_PUSH }}
       hf_token: ${{ secrets.HF_DOC_BUILD_PUSH }}
