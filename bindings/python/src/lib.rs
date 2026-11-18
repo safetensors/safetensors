@@ -374,7 +374,14 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
             };
             indexers.push(TensorIndexer::Narrow(start_b, stop_b, step));
             dim_idx += 1;
-        } else if let Ok(idx) = it.extract::<i32>() {
+        } else if let Some(idx) = it
+            .extract::<i32>()
+            .ok()
+            // `bool` subclasses `int`, but numpy and torch treat `x[True]` and
+            // `x[False]` as a new axis, not as row 1 or row 0: reject it below
+            // rather than silently returning the wrong data.
+            .filter(|_| !it.is_instance_of::<PyBool>())
+        {
             let dim = shape.get(dim_idx).copied().unwrap_or(0);
             let resolved = if idx < 0 {
                 dim.checked_add_signed(idx as isize).ok_or_else(|| {
