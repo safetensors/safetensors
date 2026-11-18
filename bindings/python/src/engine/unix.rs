@@ -943,6 +943,11 @@ impl<D> Drop for CudaSink<D> {
     }
 }
 
+/// Whether a CUDA runtime is loaded in this process, as [`Loader::load`] needs
+pub fn available() -> bool {
+    api().is_some()
+}
+
 /// This is a generous limit on the maximum number of devices that could be connected to a single host
 const MAX_DEVICES: usize = 64;
 static STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
