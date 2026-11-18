@@ -24,6 +24,7 @@ libc = "0.2"
 # on UMA semantics that don't hold on Intel Macs with discrete GPUs. Intel
 # Macs fall back to the existing copy path.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+dlpark = { version = "0.11.1", default-features = false, features = ["pyo3"] }
 objc2 = "0.6"
 objc2-metal = { version = "0.3", features = [
   "MTLDevice",

@@ -1,88 +1,28 @@
 //! DLPack v0 producer + Python capsule wrapping.
 
 use std::ffi::{c_void, CStr};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use dlpark::ffi::{DLDataType, DLDataTypeCode, DLDevice, DLManagedTensor};
+use dlpark::legacy;
+use dlpark::metadata::Dynamic;
+use pyo3::exceptions::PyBufferError;
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
 
-// The structs and enums below are the ABI consumers read across the FFI
-// boundary, so they must match the DLPack C definitions byte-for-byte
-// (layout, field order, enum discriminants). Do not reorder or change
-// representations without checking against the canonical header:
-// https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h
-
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DLDeviceType {
-    Cpu = 1,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    Metal = 8,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DLDataTypeCode {
-    Int = 0,
-    UInt = 1,
-    Float = 2,
-    OpaqueHandle = 3,
-    Bfloat = 4,
-    Complex = 5,
-    Bool = 6,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct DLDataType {
-    pub code: DLDataTypeCode,
-    pub bits: u8,
-    pub lanes: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct DLDevice {
-    pub device_type: DLDeviceType,
-    pub device_id: i32,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct DLTensor {
-    pub data: *mut c_void,
-    pub device: DLDevice,
-    pub ndim: i32,
-    pub dtype: DLDataType,
-    pub shape: *mut i64,
-    /// `null` means row-major C-contiguous per the DLPack spec; we rely
-    /// on that to skip allocating a strides array.
-    pub strides: *mut i64,
-    pub byte_offset: u64,
-}
-
-#[repr(C)]
-pub struct DLManagedTensor {
-    pub dl_tensor: DLTensor,
-    pub manager_ctx: *mut c_void,
-    pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
-}
-
-const CAPSULE_NAME: &CStr = c"dltensor";
+const USED_CAPSULE_NAME: &CStr = c"used_dltensor";
 
 /// Source of the `data` pointer [`to_capsule`] writes into the `DLTensor`.
 ///
 /// Invariant relied on by [`to_capsule`]: the pointer must stay valid as long
 /// as `self` is alive and be unaffected by moving `self`. `to_capsule` reads
-/// it once, then moves the buffer into [`ManagedCtx`], which keeps it alive
-/// until `managed_tensor_deleter` runs.
+/// it once, then moves the buffer into [`Owner`], which keeps it alive until
+/// the DLPack deleter runs.
 pub(crate) trait AsDevicePtr: Send + 'static {
     fn as_device_ptr(&self) -> *mut c_void;
 }
@@ -97,47 +37,34 @@ impl AsDevicePtr for MTLBuffer {
         //
         // This is the address of the Obj-C buffer object, not the
         // `Retained`/`MTLBuffer` wrapper, so it survives the wrapper moving
-        // into `ManagedCtx` and stays valid until that ctx drops the
-        // `Retained`, satisfying the `AsDevicePtr` invariant.
+        // into `Owner` and stays valid until that owner drops the `Retained`,
+        // satisfying the `AsDevicePtr` invariant.
         self.as_metal_id_ptr()
     }
 }
 
-struct ManagedCtx<B: AsDevicePtr> {
+/// Managed tensor context: owns the device buffer and records its release.
+struct Owner<B: AsDevicePtr> {
     _device_buf: B,
-    /// Boxed slice (not `Vec`) so the pointer + length stay stable without
-    /// tracking capacity; `DLTensor.shape` points into this.
-    shape: Box<[i64]>,
-    /// Shared with the capsule context, which outlives this ctx.
     deleted: Arc<AtomicBool>,
 }
 
-/// # Safety
-///
-/// `self_ptr` must have been produced by [`to_capsule`] with the same `B`
-/// and not deleted before.
-unsafe extern "C" fn managed_tensor_deleter<B: AsDevicePtr>(self_ptr: *mut DLManagedTensor) {
-    if self_ptr.is_null() {
-        return;
+impl<B: AsDevicePtr> Drop for Owner<B> {
+    fn drop(&mut self) {
+        self.deleted.store(true, Ordering::Release);
     }
-    let ctx_ptr = unsafe { (*self_ptr).manager_ctx as *mut ManagedCtx<B> };
-    if !ctx_ptr.is_null() {
-        let ctx = unsafe { Box::from_raw(ctx_ptr) };
-        ctx.deleted.store(true, Ordering::Release);
-    }
-    unsafe { drop(Box::from_raw(self_ptr)) };
 }
 
 pub(crate) fn dtype_to_dlpack(dtype: Dtype) -> DLDataType {
     let bits = dtype.bitsize() as u8;
     let code = match dtype {
-        Dtype::BOOL => DLDataTypeCode::Bool,
-        Dtype::I8 | Dtype::I16 | Dtype::I32 | Dtype::I64 => DLDataTypeCode::Int,
-        Dtype::U8 | Dtype::U16 | Dtype::U32 | Dtype::U64 => DLDataTypeCode::UInt,
-        Dtype::F16 | Dtype::F32 | Dtype::F64 => DLDataTypeCode::Float,
-        Dtype::BF16 => DLDataTypeCode::Bfloat,
-        Dtype::C64 => DLDataTypeCode::Complex,
-        _ => DLDataTypeCode::OpaqueHandle,
+        Dtype::BOOL => DLDataTypeCode::BOOL,
+        Dtype::I8 | Dtype::I16 | Dtype::I32 | Dtype::I64 => DLDataTypeCode::INT,
+        Dtype::U8 | Dtype::U16 | Dtype::U32 | Dtype::U64 => DLDataTypeCode::UINT,
+        Dtype::F16 | Dtype::F32 | Dtype::F64 => DLDataTypeCode::FLOAT,
+        Dtype::BF16 => DLDataTypeCode::BFLOAT,
+        Dtype::C64 => DLDataTypeCode::COMPLEX,
+        _ => DLDataTypeCode::OPAQUEHANDLE,
     };
 
     DLDataType {
@@ -188,11 +115,7 @@ pub(crate) fn torch_view_target(dtype: Dtype) -> Option<&'static str> {
 
 /// `uint8` capsule dtype. Used as the wire dtype for `view`-cast targets.
 pub(crate) fn uint8_dlpack() -> DLDataType {
-    DLDataType {
-        code: DLDataTypeCode::UInt,
-        bits: 8,
-        lanes: 1,
-    }
+    DLDataType::U8
 }
 
 /// Whether torch's MPS fast path can ingest this dtype, either via native
@@ -202,114 +125,155 @@ pub(crate) fn torch_mps_compatible(dtype: Dtype) -> bool {
     dlpack_supported_native(dtype) || torch_view_target(dtype).is_some()
 }
 
-#[allow(dead_code)]
-pub(crate) fn cpu_device() -> DLDevice {
-    DLDevice {
-        device_type: DLDeviceType::Cpu,
-        device_id: 0,
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn metal_device() -> DLDevice {
-    DLDevice {
-        device_type: DLDeviceType::Metal,
-        device_id: 0,
-    }
+    DLDevice::metal(0)
 }
 
-/// On `PyCapsule_New` failure we invoke the deleter so the device buffer
-/// doesn't leak.
-pub(crate) fn to_capsule<B: AsDevicePtr>(
-    py: Python<'_>,
+/// Row-major strides as torch computes them for a contiguous tensor, where a
+/// zero dim counts as one (`[2, 0, 3]` gives `[3, 3, 1]`).
+fn torch_contiguous_strides(shape: &[i64]) -> Option<Vec<i64>> {
+    let mut strides = vec![1_i64; shape.len()];
+    for i in (1..shape.len()).rev() {
+        strides[i - 1] = strides[i].checked_mul(shape[i].max(1))?;
+    }
+    Some(strides)
+}
+
+/// Wraps `device_buf` in a legacy `dltensor` capsule and passes it to `consume`.
+///
+/// The buffer is dropped once: by the DLPack deleter after a consumer took the
+/// capsule, or with the capsule if it was never consumed.
+pub(crate) fn to_capsule<'py, B: AsDevicePtr, R>(
+    py: Python<'py>,
     device_buf: B,
     shape: Vec<i64>,
     dtype: DLDataType,
     device: DLDevice,
-) -> PyResult<Py<PyCapsule>> {
-    let ndim = shape.len() as i32;
+    consume: impl FnOnce(&Bound<'py, PyAny>) -> PyResult<R>,
+) -> PyResult<R> {
     let data = device_buf.as_device_ptr();
-
     let deleted = Arc::new(AtomicBool::new(false));
-    let ctx = Box::new(ManagedCtx {
+    let owner = Box::new(Owner {
         _device_buf: device_buf,
-        shape: shape.into_boxed_slice(),
         deleted: deleted.clone(),
     });
-
-    let shape_ptr = ctx.shape.as_ptr() as *mut i64;
-    let ctx_ptr = Box::into_raw(ctx);
-
-    // Hand the `DLManagedTensor` to the capsule. `managed_tensor_deleter`
-    // (invoked when the capsule is dropped or consumed) reclaims both the
-    // `ManagedCtx` (which owns the device buffer + shape) AND the
-    // `DLManagedTensor` itself via `Box::from_raw`, so no leak on drop.
-    let managed = Box::into_raw(Box::new(DLManagedTensor {
-        dl_tensor: DLTensor {
-            data,
-            device,
-            ndim,
-            dtype,
-            shape: shape_ptr,
-            strides: std::ptr::null_mut(),
-            byte_offset: 0,
-        },
-        manager_ctx: ctx_ptr as *mut c_void,
-        deleter: Some(managed_tensor_deleter::<B>),
-    }));
-
-    // `managed` came from `Box::into_raw`, so it is non-null.
-    let managed_ptr = NonNull::new(managed as *mut c_void).unwrap();
-    // SAFETY: `managed_ptr` points to a live `DLManagedTensor` produced above, and
-    // `capsule_destructor` reclaims it via the registered deleter.
-    let capsule = unsafe {
-        PyCapsule::new_with_pointer_and_destructor(
-            py,
-            managed_ptr,
-            CAPSULE_NAME,
-            Some(capsule_destructor),
-        )
-    };
-    // On failure the destructor was never registered, so reclaim the tensor ourselves.
-    let capsule = capsule.inspect_err(|_| {
-        unsafe { managed_tensor_deleter::<B>(managed) };
-    })?;
-    // The capsule owns one reference to `deleted`, released in `capsule_destructor`.
-    let ctx = Arc::into_raw(deleted).cast_mut().cast::<c_void>();
-    if let Err(e) = capsule.set_context(ctx) {
-        // The capsule never took this reference; reclaim it. The capsule drops
-        // with a null context and deletes the tensor.
-        drop(unsafe { Arc::from_raw(ctx.cast::<AtomicBool>()) });
-        return Err(e);
-    }
-    Ok(capsule.unbind())
-}
-
-unsafe extern "C" fn capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
+    let strides = torch_contiguous_strides(&shape)
+        .ok_or_else(|| PyBufferError::new_err("tensor strides overflow i64"))?;
+    let mut tensor = Dynamic::new(shape, strides)
+        .initialize_as::<DLManagedTensor>(owner)
+        .map_err(|e| PyBufferError::new_err(e.to_string()))?;
+    tensor.set_data(data).set_device(device).set_dtype(dtype);
+    // SAFETY: `data` stays valid until `Owner` drops; shape and strides live in the allocation.
+    let tensor: legacy::Dlpack = unsafe { tensor.finish() };
+    let capsule = tensor.into_pyobject(py)?;
+    let result = consume(&capsule);
     // torch only renames the capsule once `from_dlpack` succeeds; if it throws
     // after its storage took ownership, the tensor is already freed.
-    let ctx = unsafe { pyo3::ffi::PyCapsule_GetContext(capsule) }.cast::<AtomicBool>();
-    if !ctx.is_null() {
-        // Take back the capsule's reference to the flag; it drops at the end of this block.
-        let deleted = unsafe { Arc::from_raw(ctx) };
-        if deleted.load(Ordering::Acquire) {
-            return;
+    if deleted.load(Ordering::Acquire) {
+        // SAFETY: `capsule` is a live capsule and the name is a static C string.
+        unsafe { pyo3::ffi::PyCapsule_SetName(capsule.as_ptr(), USED_CAPSULE_NAME.as_ptr()) };
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyCapsule;
+    use std::ptr::NonNull;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let name_ptr = CAPSULE_NAME.as_ptr();
-    if unsafe { pyo3::ffi::PyCapsule_IsValid(capsule, name_ptr) } == 0 {
-        return;
-    }
-    let ptr = unsafe { pyo3::ffi::PyCapsule_GetPointer(capsule, name_ptr) };
-    if ptr.is_null() {
-        return;
-    }
-    let managed = ptr as *mut DLManagedTensor;
-    // SAFETY: we assume `managed` was put into the capsule by `to_capsule` and the
-    // capsule was never consumed (IsValid passed).
-    unsafe {
-        if let Some(deleter) = (*managed).deleter {
-            deleter(managed);
+
+    impl AsDevicePtr for Counted {
+        fn as_device_ptr(&self) -> *mut c_void {
+            NonNull::<u8>::dangling().as_ptr().cast()
         }
+    }
+
+    /// Returns how often the owner was dropped once the capsule is gone, and
+    /// whether the capsule was marked used.
+    fn run(consume: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<()>) -> (usize, bool) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        Python::initialize();
+        let used = Python::attach(|py| {
+            let shape = vec![2, 3];
+            let dtype = dtype_to_dlpack(Dtype::BF16);
+            let device = metal_device();
+            let mut kept = None;
+            let _ = to_capsule(
+                py,
+                Counted(drops.clone()),
+                shape,
+                dtype,
+                device,
+                |capsule| {
+                    kept = Some(capsule.clone());
+                    consume(capsule)
+                },
+            );
+            let capsule = kept.unwrap();
+            let capsule = capsule.cast::<PyCapsule>().unwrap();
+            capsule.is_valid_checked(Some(USED_CAPSULE_NAME))
+        });
+        (drops.load(Ordering::SeqCst), used)
+    }
+
+    fn take(capsule: &Bound<'_, PyAny>) -> *mut DLManagedTensor {
+        let capsule = capsule.cast::<PyCapsule>().unwrap();
+        let ptr = capsule.pointer_checked(Some(c"dltensor")).unwrap();
+        ptr.as_ptr().cast()
+    }
+
+    fn delete(managed: *mut DLManagedTensor) {
+        // SAFETY: `managed` comes from a capsule built by `to_capsule` and is deleted once.
+        unsafe { ((*managed).deleter.unwrap())(managed) };
+    }
+
+    #[test]
+    fn strides_match_torch_for_zero_dims() {
+        assert_eq!(torch_contiguous_strides(&[]), Some(vec![]));
+        assert_eq!(torch_contiguous_strides(&[2, 3]), Some(vec![3, 1]));
+        assert_eq!(torch_contiguous_strides(&[2, 0, 3]), Some(vec![3, 3, 1]));
+        assert_eq!(torch_contiguous_strides(&[0, i64::MAX, 2]), None);
+    }
+
+    #[test]
+    fn unconsumed_capsule_drops_owner() {
+        assert_eq!(run(|_| Ok(())), (1, false));
+    }
+
+    #[test]
+    fn consumed_capsule_drops_owner_once() {
+        assert_eq!(
+            run(|capsule| {
+                let managed = take(capsule);
+                // SAFETY: `capsule` is live and the name is a static C string.
+                unsafe {
+                    pyo3::ffi::PyCapsule_SetName(capsule.as_ptr(), USED_CAPSULE_NAME.as_ptr())
+                };
+                delete(managed);
+                Ok(())
+            }),
+            (1, true)
+        );
+    }
+
+    #[test]
+    fn consumer_that_frees_and_raises_marks_capsule_used() {
+        assert_eq!(
+            run(|capsule| {
+                delete(take(capsule));
+                Err(PyBufferError::new_err("consumer failed"))
+            }),
+            (1, true)
+        );
     }
 }

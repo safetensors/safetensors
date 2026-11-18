@@ -13,8 +13,6 @@ use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use pyo3::types::PyCapsule;
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
@@ -3019,8 +3017,9 @@ fn mps_tensor_from_buf(
     };
 
     let device = dlpack::metal_device();
-    let capsule = dlpack::to_capsule(py, buf, shape_i64, dl_dtype, device)?;
-    let tensor = ingest_dlpack_mps(py, framework, capsule)?;
+    let tensor = dlpack::to_capsule(py, buf, shape_i64, dl_dtype, device, |capsule| {
+        ingest_dlpack_mps(py, framework, capsule)
+    })?;
 
     if let Some(name) = view_target {
         // Reinterpret uint8 bytes as the actual dtype. Currently torch-only;
@@ -3084,7 +3083,7 @@ fn torch_supports_mps_dlpack() -> bool {
 fn ingest_dlpack_mps(
     py: Python<'_>,
     framework: &Framework,
-    capsule: Py<PyCapsule>,
+    capsule: &PyBound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     match framework {
         Framework::Pytorch => {
