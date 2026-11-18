@@ -161,7 +161,7 @@ This is my very personal and probably biased view:
   moment.
 - Order: 'C' or row-major. This seems to have won. We can add that information later if needed.
 - Stride: No striding, all tensors need to be packed before being serialized. I have yet to see a case where it seems useful to have a strided tensor stored in serialized format.
- - Sub 1 bytes dtypes: Dtypes can now have lower than 1 byte size, this makes alignment&adressing tricky. For now, the library will simply error out whenever an operation triggers an non aligned read. Trickier API may be created later for those non standard ops. 
+ - Sub 1 bytes dtypes: Dtypes can now have lower than 1 byte size, this makes alignment&addressing tricky. For now, the library will simply error out whenever an operation triggers an non aligned read. Trickier API may be created later for those non standard ops.
 
 ### Benefits
 

@@ -569,6 +569,8 @@ def _flatten_as_ptr(
     _evaluate_tensors_for_save(tensors)
     flattened = {}
     for k, v in tensors.items():
+        if v.is_conj() or v.is_neg():
+            v = v.resolve_conj().resolve_neg()
         # XXX: doing this check later on instead of in _evaluate_tensors_for_save
         # since on old versions of torch, SparseTensorImpl do not implement is_contiguous
         # and we do the sparsity check in _evaluate_tensors_for_save.
