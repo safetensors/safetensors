@@ -39,12 +39,6 @@ jobs:
               python: "3.14"
               numpy: numpy
               arch: "x64-freethreaded"
-          - os: macos-15-intel
-            version:
-              torch: torch
-              numpy: "numpy==1.26"
-              python: "3.11"
-              arch: "x64"
           - os: macos-latest
             version:
               torch: torch
