@@ -135,7 +135,7 @@ jobs:
         platform:
           - runner: macos-15-intel
             target: x86_64
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64
         python_interpreter: ['3.14', '3.14t']
     steps:
