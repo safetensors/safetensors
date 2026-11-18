@@ -303,6 +303,7 @@ pub fn serialize<
 }
 
 /// Where [`serialize`] puts each part of the file.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileLayout {
     /// The bytes written before the tensor data: the 8-byte header length and the JSON header.
