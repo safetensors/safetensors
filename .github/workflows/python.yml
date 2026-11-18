@@ -3,6 +3,10 @@ name: Python
 on:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   build_and_test:
     name: Check everything builds & tests
