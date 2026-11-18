@@ -13,6 +13,7 @@ on:
     tags:
       - '*'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,7 @@ concurrency:
 
 jobs:
   linux:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -71,6 +73,7 @@ jobs:
           path: dist
 
   musllinux:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -103,6 +106,7 @@ jobs:
           path: dist
 
   windows:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -133,6 +137,7 @@ jobs:
           path: dist
 
   macos:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -160,6 +165,7 @@ jobs:
           path: dist
 
   sdist:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
