@@ -810,6 +810,10 @@ pub struct PrefetchLoader {
 /// Reader threads of the loader `get_tensors` loads to a CUDA device with
 const GET_TENSORS_THREADS: usize = 16;
 
+/// Reader threads of `get_tensors` on the CPU with the `pread` backend
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+const CPU_READ_THREADS: usize = 16;
+
 /// Bytes of the plan torch allocates ahead of the read schedule
 const ALLOC_AHEAD: usize = 1 << 30;
 
@@ -2129,7 +2133,8 @@ impl Open {
     /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
     /// The `mmap` backend uses the sequential loop, reading through the mmap.
     /// Pytorch on a CUDA device loads through [`Open::prefetch`] when a CUDA
-    /// runtime is loaded.
+    /// runtime is loaded. Pytorch on the CPU with the `pread` backend on Linux
+    /// reads the file in parallel, see [`Self::get_tensors_pread_cpu`].
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         // The bulk parallel-pread path is gated on the `pread` backend so the
         // `backend` choice is honored: `mmap` falls through to the per-tensor
@@ -2146,6 +2151,15 @@ impl Open {
         {
             if let Storage::Pread(file) = self.storage.as_ref() {
                 return self.get_tensors_mps(file);
+            }
+        }
+
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if self.framework == Framework::Pytorch && self.device == Device::Cpu {
+            if let Storage::Pread(file) = self.storage.as_ref() {
+                if let Some(tensors) = self.get_tensors_pread_cpu(file)? {
+                    return Ok(tensors);
+                }
             }
         }
 
@@ -2170,6 +2184,47 @@ impl Open {
                 dict.set_item(&name, tensor)?;
             }
             Ok(dict.into())
+        })
+    }
+
+    /// Allocates every tensor with torch, then reads the file into them in
+    /// parallel. `None` when a dtype needs the per-tensor path: `F4`, or one torch
+    /// lacks.
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn get_tensors_pread_cpu(&self, file: &Arc<File>) -> PyResult<Option<Py<PyDict>>> {
+        Python::attach(|py| {
+            let torch = get_module(py, &TORCH_MODULE)?;
+            let mut infos = Vec::new();
+            for name in self.metadata.offset_keys() {
+                let info = self.metadata.info(&name).ok_or_else(|| {
+                    SafetensorError::new_err(format!("File does not contain tensor {name}"))
+                })?;
+                match get_pydtype(torch, info.dtype, false) {
+                    Ok(dtype) if info.dtype != Dtype::F4 => infos.push((name, info, dtype)),
+                    _ => return Ok(None),
+                }
+            }
+            let dict = PyDict::new(py);
+            let mut tensors = Vec::with_capacity(infos.len());
+            for (name, info, dtype) in infos {
+                let kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                let shape = info.shape.clone();
+                let tensor = torch.call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?;
+                let (start, end) = info.data_offsets;
+                let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                tensors.push((start..end, ptr));
+                dict.set_item(name, tensor)?;
+            }
+            let file = file.clone();
+            // SAFETY: each address is a tensor just allocated with its range's
+            // bytes, which `dict` keeps alive and only this call accesses
+            let read = py.detach(|| unsafe {
+                crate::engine::read(file, self.offset, &tensors, CPU_READ_THREADS)
+            });
+            read.map_err(|e| {
+                SafetensorError::new_err(format!("Could not read tensors from file: {e}"))
+            })?;
+            Ok(Some(dict.into()))
         })
     }
 
@@ -2490,7 +2545,8 @@ impl safe_open {
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
     /// each; for `device="mps"` it instead bulk-allocates Shared MTLBuffers,
     /// parallel-`pread(2)`s into them, and hands them off via DLPack. On a CUDA
-    /// device with PyTorch, it loads through `prefetch`.
+    /// device with PyTorch, it loads through `prefetch`. On the CPU with PyTorch
+    /// and the `"pread"` backend, on Linux, it reads the file in parallel.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
