@@ -1,9 +1,14 @@
 //! Module Containing the most important structures
-use crate::lib::{Cow, HashMap, String, ToString, Vec};
+use crate::lib::{Cow, Entry, HashMap, String, ToString, Vec};
 use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
 use core::fmt::Display;
+use core::marker::PhantomData;
 use core::str::Utf8Error;
-use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{MapAccess, Visitor},
+    ser::SerializeMap,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 #[cfg(feature = "std")]
 use std::{io::Write, path::Path};
 
@@ -26,6 +31,8 @@ pub enum SafeTensorError {
     InvalidHeaderLength,
     /// The tensor name was not found in the archive
     TensorNotFound(String),
+    /// A tensor name occurs more than once.
+    DuplicateTensorName(String),
     /// Invalid information between shape, dtype and the proposed offsets in the file
     TensorInvalidInfo,
     /// The offsets declared for tensor with name `String` in the header are invalid
@@ -74,6 +81,7 @@ impl Display for SafeTensorError {
             HeaderTooSmall => write!(f, "header too small"),
             InvalidHeaderLength => write!(f, "invalid header length"),
             TensorNotFound(name) => write!(f, "tensor `{name}` not found"),
+            DuplicateTensorName(name) => write!(f, "duplicate tensor name `{name}`"),
             TensorInvalidInfo => write!(f, "invalid shape, data type, or offset for tensor"),
             InvalidOffset(name) => write!(f, "invalid offset for tensor `{name}`"),
             #[cfg(feature = "std")]
@@ -540,15 +548,59 @@ pub struct Metadata {
 struct HashMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "__metadata__")]
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<UniqueMap<String>>,
     #[serde(flatten)]
-    tensors: HashMap<String, TensorInfo>,
+    tensors: UniqueMap<TensorInfo>,
+}
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct UniqueMap<T>(HashMap<String, T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for UniqueMap<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueMapVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<T> {
+            type Value = UniqueMap<T>;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+                formatter.write_str("a map with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    match values.entry(key) {
+                        Entry::Occupied(entry) => {
+                            return Err(serde::de::Error::custom(format_args!(
+                                "duplicate key `{}`",
+                                entry.key()
+                            )));
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(UniqueMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
+    }
 }
 
 impl TryFrom<HashMetadata> for Metadata {
     type Error = SafeTensorError;
     fn try_from(hashdata: HashMetadata) -> Result<Self, Self::Error> {
-        let (metadata, tensors) = (hashdata.metadata, hashdata.tensors);
+        let (metadata, tensors) = (hashdata.metadata.map(|map| map.0), hashdata.tensors.0);
         let mut tensors: Vec<_> = tensors.into_iter().collect();
         // We need to sort by offsets
         // Previous versions might have a different ordering
@@ -598,7 +650,7 @@ impl Serialize for Metadata {
 
 impl Metadata {
     /// Creates a new metadata structure.
-    /// May fail if there is incorrect data in the Tensor Info.
+    /// May fail if tensor names are duplicated or there is incorrect data in the Tensor Info.
     /// Notably the tensors need to be ordered by increasing data_offsets.
     pub fn new(
         metadata: Option<HashMap<String, String>>,
@@ -606,14 +658,19 @@ impl Metadata {
     ) -> Result<Self, SafeTensorError> {
         let mut index_map = HashMap::with_capacity(tensors.len());
 
-        let tensors: Vec<_> = tensors
+        let tensors = tensors
             .into_iter()
             .enumerate()
-            .map(|(index, (k, tensor))| {
-                index_map.insert(k, index);
-                tensor
+            .map(|(index, (name, tensor))| match index_map.entry(name) {
+                Entry::Occupied(entry) => {
+                    Err(SafeTensorError::DuplicateTensorName(entry.key().clone()))
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(index);
+                    Ok(tensor)
+                }
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let metadata = Self {
             metadata,
@@ -1088,6 +1145,64 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_tensor_names_metadata() {
+        for names in [vec!["a", "a"], vec!["a", "b", "a"], vec!["", ""]] {
+            let tensors = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        name.to_string(),
+                        TensorInfo {
+                            dtype: Dtype::U8,
+                            shape: vec![4],
+                            data_offsets: (4 * index, 4 * (index + 1)),
+                        },
+                    )
+                })
+                .collect();
+            let error = Metadata::new(None, tensors).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("duplicate tensor name `{}`", names.last().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_tensor_names_serialization() {
+        let data = [1, 2, 3, 4];
+        let first = TensorView::new(Dtype::U8, vec![4], &data).unwrap();
+        let middle = TensorView::new(Dtype::U16, vec![2], &data).unwrap();
+        let last = TensorView::new(Dtype::I32, vec![1], &data).unwrap();
+
+        // The duplicate names are not adjacent after sorting by dtype alignment.
+        let error = serialize([("a", first), ("b", middle), ("a", last)], None).unwrap_err();
+        assert_eq!(error.to_string(), "duplicate tensor name `a`");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_duplicate_tensor_names_serialization_to_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let filename = directory.path().join("duplicate.safetensors");
+        let data = [1, 2, 3, 4];
+        let first = TensorView::new(Dtype::U8, vec![4], &data).unwrap();
+        let middle = TensorView::new(Dtype::U16, vec![2], &data).unwrap();
+        let last = TensorView::new(Dtype::I32, vec![1], &data).unwrap();
+        let tensors = [("a", &first), ("b", &middle), ("a", &last)];
+
+        let error = serialize_to_file(tensors, None, &filename).unwrap_err();
+        assert_eq!(error.to_string(), "duplicate tensor name `a`");
+        assert!(!filename.exists());
+
+        std::fs::write(&filename, b"existing file").unwrap();
+        let error = serialize_to_file(tensors, None, &filename).unwrap_err();
+        assert_eq!(error.to_string(), "duplicate tensor name `a`");
+        assert_eq!(std::fs::read(&filename).unwrap(), b"existing file");
+    }
+
+    #[test]
     fn test_serialization_fp4() {
         let data: Vec<u8> = vec![0u8];
         let shape = vec![1, 2];
@@ -1394,6 +1509,109 @@ mod tests {
         assert_eq!(tensor.data(), b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
     }
 
+    fn assert_duplicate_header(header: &str, name: &str) {
+        let mut serialized = (header.len() as u64).to_le_bytes().to_vec();
+        serialized.extend_from_slice(header.as_bytes());
+        serialized.extend_from_slice(&[1, 2, 3, 4, 0x11, 0x12, 0x13, 0x14]);
+
+        let error = SafeTensors::deserialize(&serialized).unwrap_err();
+        assert!(matches!(
+            error,
+            SafeTensorError::InvalidHeaderDeserialization(_)
+        ));
+        assert!(error.to_string().contains("duplicate"));
+        assert!(error.to_string().contains(&format!("`{name}`")));
+
+        let error = serde_json::from_str::<Metadata>(header).unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
+        assert!(error.to_string().contains(&format!("`{name}`")));
+    }
+
+    #[test]
+    fn test_duplicate_tensor_names_deserialization() {
+        let first = r#"{"dtype":"U8","shape":[4],"data_offsets":[0,4]}"#;
+        let second = r#"{"dtype":"U8","shape":[4],"data_offsets":[4,8]}"#;
+        let third = r#"{"dtype":"U8","shape":[4],"data_offsets":[8,12]}"#;
+        let signed = r#"{"dtype":"I8","shape":[4],"data_offsets":[0,4]}"#;
+        let reshaped = r#"{"dtype":"U8","shape":[2,2],"data_offsets":[0,4]}"#;
+
+        for header in [
+            format!(r#"{{"a":{first},"a":{signed},"b":{second}}}"#),
+            format!(r#"{{"a":{first},"a":{reshaped},"b":{second}}}"#),
+            format!(r#"{{"a":{first},"a":{second}}}"#),
+            format!(r#"{{"a":{first},"a":{second},"b":{first}}}"#),
+            format!(r#"{{"a":{first},"a":{second},"a":{signed},"b":{second}}}"#),
+            format!(r#"{{"a":{first},"\u0061":{signed},"b":{second}}}"#),
+            format!(r#"{{"a":{second},"a":{first}}}"#),
+            format!(r#"{{"a":{first},"a":{third},"b":{second}}}"#),
+        ] {
+            assert_duplicate_header(&header, "a");
+        }
+    }
+
+    #[test]
+    fn test_duplicate_metadata_keys_deserialization() {
+        for metadata in [
+            r#"{"k":"first","k":"last"}"#,
+            r#"{"k":"first","\u006b":"last"}"#,
+        ] {
+            let header = format!(
+                r#"{{"__metadata__":{metadata},"a":{{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}}}"#
+            );
+            assert_duplicate_header(&header, "k");
+        }
+    }
+
+    #[test]
+    fn test_duplicate_metadata_fields_deserialization() {
+        for metadata in [
+            r#""__metadata__":{},"__metadata__":{}"#,
+            r#""__metadata__":null,"__metadata__":{}"#,
+            r#""__metadata__":{},"\u005f_metadata__":{}"#,
+        ] {
+            let header =
+                format!(r#"{{{metadata},"a":{{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}}}"#);
+            assert_duplicate_header(&header, "__metadata__");
+        }
+    }
+
+    #[test]
+    fn test_unique_header_keys_deserialization() {
+        for (metadata, expected) in [
+            ("", None),
+            (r#""__metadata__":null,"#, None),
+            (r#""__metadata__":{},"#, Some(HashMap::new())),
+            (
+                r#""__metadata__":{"a":"first","b":"second"},"#,
+                Some(
+                    [
+                        ("a".to_string(), "first".to_string()),
+                        ("b".to_string(), "second".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        ] {
+            let header = format!(
+                r#"{{{metadata}"b":{{"dtype":"U8","shape":[4],"data_offsets":[4,8]}},"\u0061":{{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}}}"#
+            );
+            let data = [1, 2, 3, 4, 0x11, 0x12, 0x13, 0x14];
+            let mut serialized = (header.len() as u64).to_le_bytes().to_vec();
+            serialized.extend_from_slice(header.as_bytes());
+            serialized.extend_from_slice(&data);
+
+            let tensors = SafeTensors::deserialize(&serialized).unwrap();
+            assert_eq!(tensors.len(), 2);
+            assert_eq!(tensors.tensor("a").unwrap().data(), &data[..4]);
+            assert_eq!(tensors.tensor("b").unwrap().data(), &data[4..]);
+            assert_eq!(tensors.metadata.metadata(), &expected);
+            let parsed: Metadata = serde_json::from_str(&header).unwrap();
+            assert_eq!(parsed.metadata(), &expected);
+            assert_eq!(parsed.offset_keys(), vec!["a", "b"]);
+        }
+    }
+
     #[test]
     fn test_lifetimes() {
         let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
@@ -1428,7 +1646,7 @@ mod tests {
 
         let metadata = HashMetadata {
             metadata: None,
-            tensors,
+            tensors: UniqueMap(tensors),
         };
         let serialized = serde_json::to_string(&metadata).unwrap();
         let serialized = serialized.as_bytes();
