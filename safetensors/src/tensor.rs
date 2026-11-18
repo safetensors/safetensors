@@ -1,5 +1,5 @@
 //! Module Containing the most important structures
-use crate::lib::{Cow, HashMap, String, ToString, Vec};
+use crate::lib::{BTreeMap, Cow, HashMap, String, ToString, Vec};
 use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
 use core::fmt::Display;
 use core::str::Utf8Error;
@@ -585,7 +585,10 @@ impl Serialize for Metadata {
         let mut map = serializer.serialize_map(Some(self.tensors.len() + length))?;
 
         if let Some(metadata) = &self.metadata {
-            map.serialize_entry("__metadata__", metadata)?;
+            // Sort the keys so that identical content always serializes to
+            // identical bytes (`HashMap` iteration order is random).
+            let metadata: BTreeMap<&String, &String> = metadata.iter().collect();
+            map.serialize_entry("__metadata__", &metadata)?;
         }
 
         for (name, info) in names.iter().zip(&self.tensors) {
@@ -1155,6 +1158,35 @@ mod tests {
             ]
         );
         let _parsed = SafeTensors::deserialize(&out).unwrap();
+    }
+
+    #[test]
+    fn test_deterministic_metadata_serialization() {
+        let tensors: HashMap<String, TensorView> = HashMap::new();
+        let make_metadata = || -> Option<HashMap<String, String>> {
+            Some(
+                (0..16)
+                    .map(|i| (format!("k{i}"), format!("v{i}")))
+                    .collect(),
+            )
+        };
+
+        // Identical content must serialize to identical bytes, even though
+        // `HashMap` iteration order is random.
+        let out = serialize(&tensors, make_metadata()).unwrap();
+        for _ in 0..10 {
+            assert_eq!(serialize(&tensors, make_metadata()).unwrap(), out);
+        }
+
+        // Metadata keys appear in the header in sorted order.
+        let header = core::str::from_utf8(&out[N_LEN..]).unwrap();
+        let mut keys: Vec<String> = (0..16).map(|i| format!("\"k{i}\"")).collect();
+        keys.sort();
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| header.find(key.as_str()).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
