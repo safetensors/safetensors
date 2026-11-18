@@ -145,6 +145,28 @@ class PreadBackendTests(unittest.TestCase):
             if a.numel() > 0:
                 self.assertTrue(_tensors_equal(a.cpu(), b.cpu()), k)
 
+    def test_load_file_reads_cold_and_cached(self):
+        # tensors across the 16 MiB chunks the file is read in, at odd offsets,
+        # one empty, read with nothing cached then from the page cache
+        sizes = [3, 17 * MIB + 5, 0, 1001, 40 * MIB + 3]
+        tensors = {
+            f"t{i}": ((torch.arange(n) * 7 + i * 31) % 251).to(torch.uint8)
+            for i, n in enumerate(sizes)
+        }
+        path = os.path.join(self.tempdir.name, "chunks.safetensors")
+        save_file(tensors, path)
+        # dropping the file from the page cache takes posix_fadvise
+        for cold in [True, False] if hasattr(os, "posix_fadvise") else [False]:
+            if cold:
+                fd = os.open(path, os.O_RDONLY)
+                os.fsync(fd)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            got = load_file_pt(path, backend="pread")
+            self.assertEqual(list(got), list(tensors))
+            for k, v in tensors.items():
+                self.assertTrue(torch.equal(got[k], v), f"{k}, cold {cold}")
+
     def test_get_slice(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
             slice_obj = f.get_slice("fp32_2d")

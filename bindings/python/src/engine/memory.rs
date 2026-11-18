@@ -329,6 +329,27 @@ impl Gather for Host {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Scatter for Host {
+    fn scatter(
+        &self,
+        staged: Staged,
+        copies: &[StridedCopy],
+    ) -> Result<Option<Arc<dyn Fence>>, Error> {
+        let src = staged.bytes();
+        for c in copies {
+            for row in 0..c.height {
+                let from = &src[c.src + row * c.src_pitch..][..c.width];
+                let to = (c.dst + row * c.dst_pitch) as *mut u8;
+                // SAFETY: `Memory::provide` requires the address writable for its
+                // span's bytes, which the row is within
+                unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), to, c.width) };
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// A chunk's copies once issued: their fence, `None` when they completed
 /// in [`Scatter::scatter`]
 type Issued = Option<Arc<dyn Fence>>;
