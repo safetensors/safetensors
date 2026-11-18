@@ -2,6 +2,7 @@
 use crate::lib::{BTreeMap, Cow, HashMap, String, ToString, Vec};
 use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
 use core::fmt::Display;
+use core::ops::Range;
 use core::str::Utf8Error;
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "std")]
@@ -121,6 +122,7 @@ struct PreparedData {
     n: u64,
     header_bytes: Vec<u8>,
     offset: usize,
+    metadata: Metadata,
 }
 
 /// The trait necessary to enable safetensors to serialize a tensor
@@ -254,11 +256,16 @@ where
     let aligned_metadata_len = metadata_buf.len().next_multiple_of(N_LEN);
     metadata_buf.resize(aligned_metadata_len, b' ');
 
+    if aligned_metadata_len > MAX_HEADER_SIZE {
+        return Err(SafeTensorError::HeaderTooLarge);
+    }
+
     Ok((
         PreparedData {
             n: aligned_metadata_len as u64,
             header_bytes: metadata_buf,
             offset,
+            metadata,
         },
         tensors,
     ))
@@ -278,13 +285,10 @@ pub fn serialize<
             n,
             header_bytes,
             offset,
+            ..
         },
         tensors,
     ) = prepare(data, data_info)?;
-
-    if n > MAX_HEADER_SIZE as u64 {
-        return Err(SafeTensorError::HeaderTooLarge);
-    }
 
     let expected_size = N_LEN + header_bytes.len() + offset;
     let mut buffer: Vec<u8> = Vec::with_capacity(expected_size);
@@ -296,6 +300,61 @@ pub fn serialize<
     }
 
     Ok(buffer)
+}
+
+/// Where [`serialize`] puts each part of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLayout {
+    /// The bytes written before the tensor data: the 8-byte header length and the JSON header.
+    pub header: Vec<u8>,
+    /// Each tensor's name and byte range within the data section (which starts right
+    /// after `header`), in file order.
+    pub tensors: Vec<(String, Range<usize>)>,
+    /// The length of the data section in bytes.
+    pub data_len: usize,
+}
+
+/// Computes the [`FileLayout`] that [`serialize`] would produce for the same arguments,
+/// without reading any tensor data: only `dtype`, `shape` and `data_len` are used.
+/// The file is the header followed by each tensor's bytes at its range.
+pub fn file_layout<S, V, I>(
+    data: I,
+    data_info: Option<HashMap<String, String>>,
+) -> Result<FileLayout, SafeTensorError>
+where
+    S: AsRef<str> + Ord + Display,
+    V: View,
+    I: IntoIterator<Item = (S, V)>,
+{
+    let (
+        PreparedData {
+            n,
+            header_bytes,
+            offset,
+            metadata,
+        },
+        _,
+    ) = prepare(data, data_info)?;
+
+    let mut header = Vec::with_capacity(N_LEN + header_bytes.len());
+    header.extend(n.to_le_bytes());
+    header.extend(header_bytes);
+
+    let mut names = vec![String::new(); metadata.tensors.len()];
+    for (name, index) in metadata.index_map {
+        names[index] = name;
+    }
+    let tensors = names
+        .into_iter()
+        .zip(metadata.tensors)
+        .map(|(name, info)| (name, info.data_offsets.0..info.data_offsets.1))
+        .collect();
+
+    Ok(FileLayout {
+        header,
+        tensors,
+        data_len: offset,
+    })
 }
 
 #[cfg(feature = "std")]
@@ -364,10 +423,6 @@ where
         },
         tensors,
     ) = prepare(data, data_info)?;
-
-    if n > MAX_HEADER_SIZE as u64 {
-        return Err(SafeTensorError::HeaderTooLarge);
-    }
 
     let total_size = N_LEN + header_bytes.len() + offset;
 
@@ -1637,5 +1692,74 @@ mod tests {
         assert_eq!(out, serialize(&tensors, Some(backward)).unwrap());
         let header = br#"{"__metadata__":{"a":"a","b":"b","c":"c","d":"d","e":"e"}}"#;
         assert_eq!(&out[8..8 + header.len()], header);
+    }
+
+    struct NoDataView(TensorView<'static>);
+
+    impl View for NoDataView {
+        fn dtype(&self) -> Dtype {
+            self.0.dtype()
+        }
+        fn shape(&self) -> &[usize] {
+            self.0.shape()
+        }
+        fn data(&self) -> Cow<'_, [u8]> {
+            panic!("layout must not read tensor data")
+        }
+        fn data_len(&self) -> usize {
+            self.0.data_len()
+        }
+    }
+
+    fn check_layout(
+        tensors: &[(&str, TensorView<'static>)],
+        data_info: Option<HashMap<String, String>>,
+    ) {
+        let serialized =
+            serialize(tensors.iter().map(|(k, v)| (*k, v)), data_info.clone()).unwrap();
+        let no_data = tensors.iter().map(|(k, v)| (*k, NoDataView(v.clone())));
+        let layout = file_layout(no_data, data_info).unwrap();
+
+        let (n, metadata) = SafeTensors::read_metadata(&serialized).unwrap();
+        assert_eq!(layout.header, serialized[..N_LEN + n]);
+        assert_eq!(layout.data_len, serialized.len() - layout.header.len());
+        let expected: Vec<_> = metadata
+            .offset_keys()
+            .into_iter()
+            .map(|name| {
+                let (start, end) = metadata.info(&name).unwrap().data_offsets;
+                (name, start..end)
+            })
+            .collect();
+        assert_eq!(layout.tensors, expected);
+    }
+
+    #[test]
+    fn test_layout_matches_serialize() {
+        static F32: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        static U8: [u8; 3] = [9, 10, 11];
+        static F64: [u8; 16] = [12; 16];
+        static BF16: [u8; 4] = [13, 14, 15, 16];
+        let tensors = [
+            ("u8", TensorView::new(Dtype::U8, vec![3], &U8).unwrap()),
+            ("f32", TensorView::new(Dtype::F32, vec![2], &F32).unwrap()),
+            (
+                "bf16",
+                TensorView::new(Dtype::BF16, vec![2], &BF16).unwrap(),
+            ),
+            ("a_f64", TensorView::new(Dtype::F64, vec![2], &F64).unwrap()),
+            (
+                "empty",
+                TensorView::new(Dtype::F32, vec![0, 3], &[]).unwrap(),
+            ),
+        ];
+        check_layout(&tensors, None);
+        let data_info = HashMap::from([("format".to_string(), "pt".to_string())]);
+        check_layout(&tensors, Some(data_info));
+    }
+
+    #[test]
+    fn test_layout_no_tensors() {
+        check_layout(&[], None);
     }
 }
