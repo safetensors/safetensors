@@ -67,6 +67,12 @@ impl std::fmt::Display for CudaError {
 
 impl std::error::Error for CudaError {}
 
+impl From<CudaError> for super::transfer::Error {
+    fn from(value: CudaError) -> Self {
+        Self::Other(Box::new(value))
+    }
+}
+
 type PrimaryCtxGetState = unsafe extern "C" fn(c_int, *mut c_uint, *mut c_int) -> c_int;
 type MemGetAddressRange = unsafe extern "C" fn(*mut c_ulonglong, *mut usize, c_ulonglong) -> c_int;
 // cudaGetDriverEntryPointByVersion (CUDA >= 12.5; the only form left in 13) and

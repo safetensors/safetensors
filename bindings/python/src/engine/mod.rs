@@ -4,6 +4,8 @@ mod cuda;
 mod file;
 #[cfg(unix)]
 mod pool;
+#[cfg(unix)]
+mod transfer;
 
 #[cfg(unix)]
 mod unix;

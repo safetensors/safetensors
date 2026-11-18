@@ -1,9 +1,10 @@
 use std::{
     collections::VecDeque,
+    ops::{Deref, DerefMut},
     sync::{Condvar, Mutex, OnceLock},
 };
 
-use super::{file::DIRECT_ALIGN, unix::CHUNK_SIZE};
+use super::{file::DIRECT_ALIGN, transfer::Error, unix::CHUNK_SIZE};
 use crate::engine::cuda::{CudaApi, CudaError, DeviceGuard, Event, Stream};
 
 /// A chunk's superset aligned to [`DIRECT_ALIGN`] fits in a slab
@@ -11,29 +12,28 @@ pub(super) const SLAB_SIZE: usize = CHUNK_SIZE.get() + 2 * DIRECT_ALIGN;
 const _: () = assert!(SLAB_SIZE.is_multiple_of(DIRECT_ALIGN));
 
 #[derive(Clone, Copy)]
-struct Slab {
+struct Slot {
     offset: usize,
     /// (completion event of the last host2device copy, device id)
     last_copy: Option<(Event, i32)>,
 }
 
-pub(super) struct SlabLease {
+/// A slab leased from a [`SlabPool`]; returns to it on drop.
+pub struct Slab {
     pool: &'static SlabPool,
-    slab: Slab,
+    slot: Slot,
 }
 
-impl SlabLease {
-    pub(super) fn ptr(&self) -> *mut u8 {
-        unsafe { self.pool.buffer_ptr.add(self.slab.offset) }
+impl Slab {
+    fn ptr(&self) -> *mut u8 {
+        // SAFETY: `offset` is a slab's start in the pool's buffer
+        unsafe { self.pool.buffer_ptr.add(self.slot.offset) }
     }
 
-    pub(super) fn slab(&mut self) -> &mut [u8] {
-        // SAFETY: the lease holds the slab, `slab_size` bytes of the pool's buffer
-        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.pool.slab_size) }
-    }
-
+    /// Records on `stream` the copies reading the slab: [`SlabPool::acquire`]
+    /// waits for them before leasing it again.
     pub(super) fn release(mut self, d: &DeviceGuard<'_>, stream: Stream) -> Result<(), CudaError> {
-        let event = match self.slab.last_copy.take() {
+        let event = match self.slot.last_copy.take() {
             Some((event, device)) if device == d.id() => event,
             Some((event, _)) => {
                 let _ = d.api().event_destroy(event);
@@ -41,23 +41,40 @@ impl SlabLease {
             }
             None => d.event_create()?,
         };
-        self.slab.last_copy = Some((event, d.id()));
+        self.slot.last_copy = Some((event, d.id()));
         d.api().event_record(event, stream)
     }
 }
 
-impl Drop for SlabLease {
-    fn drop(&mut self) {
-        self.pool.put_back(self.slab);
+impl Deref for Slab {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the lease holds the slab, `slab_size` bytes of the pool's buffer
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.pool.slab_size) }
     }
 }
 
-pub(super) struct SlabPool {
+impl DerefMut for Slab {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the lease holds the slab, `slab_size` bytes of the pool's buffer
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.pool.slab_size) }
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        self.pool.put_back(self.slot);
+    }
+}
+
+pub struct SlabPool {
+    cuda: &'static CudaApi,
     buffer_ptr: *mut u8,
     slab_size: usize,
     /// whether every slab is aligned to [`DIRECT_ALIGN`]
     pub(super) aligned: bool,
-    free: Mutex<VecDeque<Slab>>,
+    free: Mutex<VecDeque<Slot>>,
     available: Condvar,
 }
 
@@ -65,15 +82,16 @@ unsafe impl Send for SlabPool {}
 unsafe impl Sync for SlabPool {}
 
 impl SlabPool {
-    fn new(cuda: &CudaApi, n_slabs: usize, slab_size: usize) -> Result<Self, CudaError> {
+    fn new(cuda: &'static CudaApi, n_slabs: usize, slab_size: usize) -> Result<Self, CudaError> {
         let buffer_ptr = cuda.host_alloc(n_slabs * slab_size)?;
         let free = (0..n_slabs)
-            .map(|i| Slab {
+            .map(|i| Slot {
                 offset: i * slab_size,
                 last_copy: None,
             })
             .collect();
         Ok(Self {
+            cuda,
             buffer_ptr,
             slab_size,
             aligned: buffer_ptr.addr().is_multiple_of(DIRECT_ALIGN)
@@ -83,25 +101,26 @@ impl SlabPool {
         })
     }
 
-    pub(super) fn acquire(&'static self, cuda: &CudaApi) -> Result<SlabLease, CudaError> {
+    /// Leases a slab, waiting for one to be free and for the copies that read it.
+    pub fn acquire(&'static self) -> Result<Slab, Error> {
         // TODO: handle poisoning
         let mut free = self.free.lock().unwrap();
-        let slab = loop {
+        let slot = loop {
             if let Some(s) = free.pop_front() {
                 break s;
             }
             free = self.available.wait(free).unwrap();
         };
         drop(free);
-        let lease = SlabLease { pool: self, slab };
-        if let Some((event, _)) = lease.slab.last_copy {
-            cuda.event_sync(event)?;
+        let slab = Slab { pool: self, slot };
+        if let Some((event, _)) = slab.slot.last_copy {
+            self.cuda.event_sync(event)?;
         }
-        Ok(lease)
+        Ok(slab)
     }
 
-    fn put_back(&self, slab: Slab) {
-        self.free.lock().unwrap().push_back(slab);
+    fn put_back(&self, slot: Slot) {
+        self.free.lock().unwrap().push_back(slot);
         self.available.notify_one();
     }
 }
