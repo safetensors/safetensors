@@ -15,6 +15,9 @@ def _flatten(
         tensor = v
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
+        if not tensor.flags.c_contiguous:
+            tensor = np.ascontiguousarray(tensor)
+        if tensor is not v:
             keep_alive_buffer.append(tensor)
         flattened[k] = TensorSpec(
             dtype=tensor.dtype.name,
@@ -33,7 +36,7 @@ def save(
 
     Args:
         tensor_dict (`Dict[str, np.ndarray]`):
-            The incoming tensors. Tensors need to be contiguous and dense.
+            The incoming tensors. Non-C-contiguous tensors are copied into C order before saving.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
@@ -52,7 +55,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep converted tensors alive
     serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
     result = bytes(serialized)
     return result
@@ -68,7 +71,7 @@ def save_file(
 
     Args:
         tensor_dict (`Dict[str, np.ndarray]`):
-            The incoming tensors. Tensors need to be contiguous and dense.
+            The incoming tensors. Non-C-contiguous tensors are copied into C order before saving.
         filename (`str`, or `os.PathLike`)):
             The filename we're saving into.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
@@ -89,7 +92,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep converted tensors alive
     serialize_file(
         _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
     )
