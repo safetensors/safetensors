@@ -1,9 +1,5 @@
-//! CUDA prefetch engine: load byte spans of a safetensors data section into
-//! device memory the caller allocated, in the background, and hand each span's
-//! owner back, once, as its bytes land.
-//!
-//! Two units, computed once from the spans the consumer requests, sorted by
-//! start and disjoint:
+//! Memory that ranges of a file map to, as a [`Sink`] that scatters chunks into
+//! it. Two units, computed once from the extents, sorted by start and disjoint:
 //!
 //! ```text
 //! tensors  |t0 |  t1  |     t2     |  t3  |       t4        | t5 | t6  |
@@ -13,121 +9,26 @@
 //!
 //! - spans [`LoadPlan::spans`]: a byte interval of the data section, copied to
 //!   its destination, or, with a [`Gather`], packed into it by the gather's
-//!   strided copies. The delivery unit: `take` hands out the span's owner.
-//! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`] of adjacent spans,
-//!   never across a gap. The I/O unit: one `pread`, one slab, one event, one
-//!   `memcpy` per run of spans whose destinations are adjacent. `span_chunks`
-//!   and `chunk_spans` map one to the other.
+//!   strided copies.
+//! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`](super::transfer::CHUNK_SIZE) of adjacent spans,
+//!   never across a gap. The I/O unit: one read, one slab, one copy per run of
+//!   spans whose destinations are adjacent. `span_chunks` and `chunk_spans` map
+//!   one to the other.
 //!
-//! Data flow, per file:
-//!
-//! ```text
-//! caller (one at a time)
-//!   Feed::provide(dsts, stream)          the next spans' destinations, in plan
-//!                                        order, and an event on `stream`
-//! worker threads, transfer::work from the DirectFile to the CudaSink
-//!   c = the Plan's next chunk            next entry of LoadPlan::chunks
-//!   CudaSink::wait_ready(c)              c's spans provided (condvar), then
-//!                                        the events of their batches
-//!   slab = SlabPool::acquire()           a pinned host slab from the shared
-//!                                        pool; waits for its previous copy
-//!   DirectFile::fill(c, slab)            one read per chunk
-//!   CudaSink::drain: memcpyAsync         one copy per run of adjacent
-//!     (slab -> destinations)             destinations, on STREAMS[device];
-//!                                        memcpy2DAsync for a gather's rows
-//!   chunk_completion_events[c] = event   recorded after the copies; 0 while
-//!                                        the chunk is still pending
-//! consumer
-//!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
-//!     -> owner of s's destination        handed out once (AlreadyDelivered after)
-//! ```
-//!
-//! [`Loader`] owns the worker threads; [`LoaderInner`] (source, plan, sink, the
-//! [`Plan`] of chunks with its first error) is shared with them and with
-//! [`TensorIter`]. Closing
-//! signals the workers, joins them, waits for the copies in flight, then
-//! returns the owners not taken: an outstanding iterator yields `Err(Closed)`
-//! once and is exhausted.
+//! The memory's [`Scatter`] makes the copies: host memory, or a device's.
 
 use std::{
-    collections::VecDeque,
-    fmt::Display,
-    fs::File,
     num::NonZeroUsize,
     ops::Range,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
     },
-    thread::JoinHandle,
     time::Duration,
 };
 
-use super::{
-    file::DirectFile,
-    pool::{pool, SlabPool},
-    transfer::{self, Error, Plan, Sink, Staged},
-};
-use crate::engine::cuda::{api, CudaApi, CudaError, Event, Stream};
+use super::transfer::{Error, Fence, Sink, Staged};
 use safetensors::slice::{Gather, StridedCopy};
-
-#[derive(Debug)]
-pub enum LoaderError {
-    AlreadyDelivered,
-    Closed,
-    Cuda(CudaError),
-    CudaRuntimeLoad,
-    InvalidDevice(i32),
-    Io(std::io::Error),
-    WorkerFailed(String),
-}
-
-impl Display for LoaderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyDelivered => write!(
-                f,
-                "tensor already delivered (prefetch hands each tensor out once, via take or iteration)"
-            ),
-            Self::Closed => write!(f, "prefetch loader closed"),
-            Self::Cuda(e) => write!(f, "{e}"),
-            Self::CudaRuntimeLoad => write!(
-                f,
-                "no CUDA runtime is loaded in this process; import a CUDA-enabled \
-                 framework (torch) before calling prefetch()"
-            ),
-            Self::InvalidDevice(d) => write!(
-                f,
-                "device index {d} is out of range (0..{MAX_DEVICES})"
-            ),
-            Self::Io(e) => write!(f, "io error: {e}"),
-            Self::WorkerFailed(msg) => f.write_str(msg),
-        }
-    }
-}
-
-impl std::error::Error for LoaderError {}
-
-impl LoaderError {
-    /// The load failed, as opposed to a tensor taken twice or a closed loader
-    pub fn is_failure(&self) -> bool {
-        matches!(self, Self::WorkerFailed(_))
-    }
-}
-
-impl From<CudaError> for LoaderError {
-    fn from(value: CudaError) -> Self {
-        Self::Cuda(value)
-    }
-}
-
-impl From<std::io::Error> for LoaderError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-pub(super) const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
 
 /// A byte interval `start..end` of the file's data section
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,14 +39,14 @@ pub struct Span {
 
 /// Geometry of one load. Every interval here is a byte range within the file's
 /// data section; device addresses never appear in the plan.
-struct LoadPlan {
+pub struct LoadPlan {
     spans: Box<[Span]>,
     /// per span, the copies that pack its bytes into its destination; `None` for
     /// one plain copy
     gathers: Box<[Option<Gather>]>,
     /// per span, the `chunks` that carry its bytes; empty for a zero-size span
     span_chunks: Box<[Range<usize>]>,
-    /// data section byte interval of each chunk: at most [`CHUNK_SIZE`] of
+    /// data section byte interval of each chunk: at most [`CHUNK_SIZE`](super::transfer::CHUNK_SIZE) of
     /// adjacent spans, never across a gap
     chunks: Box<[Range<usize>]>,
     /// per chunk, the spans it carries bytes of
@@ -212,7 +113,7 @@ fn clip(copy: &StridedCopy, window: &Range<usize>) -> [Option<StridedCopy>; 3] {
 }
 
 impl LoadPlan {
-    fn new(
+    pub fn new(
         spans: Vec<Span>,
         gathers: Vec<Option<Gather>>,
         in_file_offset: usize,
@@ -348,96 +249,111 @@ impl LoadPlan {
     }
 }
 
-struct CudaSink<D> {
-    api: &'static CudaApi,
-    device: i32,
-    stream: Stream,
-    plan: Arc<LoadPlan>,
-    /// per span, the device address its bytes are copied to; set by `provide`
-    dsts: Box<[AtomicU64]>,
-    /// per span, the owner of its destination; `None` until provided, and once
-    /// taken or released
-    owners: Box<[Mutex<Option<D>>]>,
-    /// per span, the event of the batch that provided it, recorded on the
-    /// allocating stream: the destination is free to write once it completes
-    ready: Box<[AtomicU64]>,
-    /// the spans with a destination: a prefix of the plan
-    provided: AtomicUsize,
-    /// guards `provided` advancing and `released` turning on, so neither is missed
-    /// by a waiter on `provision`
-    provision_lock: Mutex<()>,
-    provision: Condvar,
-    batch_events: Mutex<Vec<Event>>,
-    chunk_completion_events: Box<[AtomicU64]>,
-    closed: AtomicBool,
-    released: AtomicBool,
+/// Copies chunks into the memory a [`Memory`]'s destinations are in: host
+/// memory, or a device's
+pub trait Scatter: Send + Sync {
+    /// Copies the staged bytes to their destinations as `copies` say: sources
+    /// are offsets in [`Staged::bytes`], destinations addresses in this space.
+    /// Keeps `staged` until the copies read it, and returns a fence when they
+    /// complete after the call. On an error, no copy is left in flight.
+    fn scatter(
+        &self,
+        staged: Staged,
+        copies: &[StridedCopy],
+    ) -> Result<Option<Arc<dyn Fence>>, Error>;
+
+    /// The end of the allocation holding `addr`, when known: adjacent
+    /// destinations are copied at once only within one allocation.
+    fn allocation_end(&self, _addr: u64) -> Option<u64> {
+        None
+    }
 }
 
-unsafe impl<D: Send> Send for CudaSink<D> {}
-unsafe impl<D: Send> Sync for CudaSink<D> {}
+/// A chunk's copies once issued: their fence, `None` when they completed
+/// in [`Scatter::scatter`]
+type Issued = Option<Arc<dyn Fence>>;
 
-impl<D> CudaSink<D> {
-    fn new(api: &'static CudaApi, plan: Arc<LoadPlan>, device: i32) -> Result<Self, LoaderError> {
-        let stream = device_stream(api, device)?;
-        let n = plan.spans.len();
-        Ok(Self {
-            api,
-            device,
-            stream,
-            dsts: (0..n).map(|_| AtomicU64::new(0)).collect(),
-            owners: (0..n).map(|_| Mutex::new(None)).collect(),
-            ready: (0..n).map(|_| AtomicU64::new(0)).collect(),
+/// Where a span's bytes go, once `ready` completed
+struct Destination {
+    addr: u64,
+    ready: Option<Arc<dyn Fence>>,
+}
+
+/// The destinations of a [`LoadPlan`]'s spans in some memory. They arrive in
+/// plan order as the transfer advances, see [`Self::provide`]: draining a
+/// chunk waits for those of its spans.
+pub struct Memory<S> {
+    plan: LoadPlan,
+    space: S,
+    /// per span, set by `provide`
+    dests: Box<[OnceLock<Destination>]>,
+    /// the spans with a destination: a prefix of the plan
+    provided: AtomicUsize,
+    /// guards `provided` advancing and `stopped` turning on, so neither is
+    /// missed by a waiter on `provision`
+    provision_lock: Mutex<()>,
+    provision: Condvar,
+    stopped: AtomicBool,
+    /// per chunk, set once its copies are issued
+    landed: Box<[OnceLock<Issued>]>,
+}
+
+impl<S> Memory<S> {
+    pub fn new(plan: LoadPlan, space: S) -> Self {
+        Self {
+            dests: (0..plan.spans.len()).map(|_| OnceLock::new()).collect(),
             provided: AtomicUsize::new(0),
             provision_lock: Mutex::new(()),
             provision: Condvar::new(),
-            batch_events: Mutex::new(Vec::new()),
-            chunk_completion_events: (0..plan.chunks.len()).map(|_| AtomicU64::new(0)).collect(),
-            closed: AtomicBool::new(false),
-            released: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            landed: (0..plan.chunks.len()).map(|_| OnceLock::new()).collect(),
             plan,
-        })
+            space,
+        }
     }
 
-    /// Gives the next `dsts.len()` spans their destinations, allocated on
-    /// `alloc_stream`. Hands `dsts` back if the sink is released or the event fails.
-    fn provide(
+    /// How many spans the plan has
+    pub fn spans(&self) -> usize {
+        self.plan.spans.len()
+    }
+
+    /// The plan's chunks, as byte ranges of the file
+    pub fn chunks(&self) -> Box<[Range<u64>]> {
+        self.plan.file_chunks()
+    }
+
+    /// How many spans have a destination
+    pub fn provided(&self) -> usize {
+        self.provided.load(Ordering::Acquire)
+    }
+
+    /// Gives the next spans, in plan order, their destination addresses. The
+    /// copies to them wait for `ready`. One caller at a time.
+    ///
+    /// # Safety
+    ///
+    /// Each address is valid for writes of its span's bytes (or its gather's
+    /// [`Gather::len`]) in this memory's space, until every copy to it
+    /// completed: [`Self::wait_landed`] returned for its span, or
+    /// [`Self::wait_copies`] once no worker is left.
+    pub unsafe fn provide(
         &self,
-        dsts: Vec<(u64, D)>,
-        alloc_stream: Stream,
-    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
+        addrs: impl ExactSizeIterator<Item = u64>,
+        ready: Option<Arc<dyn Fence>>,
+    ) {
         let _g = self.provision_lock.lock().unwrap();
-        if self.released.load(Ordering::Acquire) {
-            return Err((LoaderError::Closed, dsts));
-        }
         let first = self.provided.load(Ordering::Acquire);
         assert!(
-            first + dsts.len() <= self.plan.spans.len(),
+            first + addrs.len() <= self.dests.len(),
             "more destinations than spans"
         );
-        // the caller's allocator may hand out memory still in use by work queued
-        // on the stream it allocated on: workers wait for that work before copying
-        let ready = self.api.with_device(self.device, |d| {
-            let e = d.event_create()?;
-            if let Err(err) = self.api.event_record(e, alloc_stream) {
-                let _ = self.api.event_destroy(e);
-                return Err(err);
-            }
-            Ok(e)
-        });
-        let ready = match ready {
-            Ok(e) => e,
-            Err(err) => return Err((err.into(), dsts)),
-        };
-        self.batch_events.lock().unwrap().push(ready);
-        let n = dsts.len();
-        for (i, (ptr, owner)) in dsts.into_iter().enumerate() {
-            self.dsts[first + i].store(ptr, Ordering::Relaxed);
-            self.ready[first + i].store(ready as u64, Ordering::Relaxed);
-            *self.owners[first + i].lock().unwrap() = Some(owner);
+        let n = addrs.len();
+        for (dest, addr) in self.dests[first..].iter().zip(addrs) {
+            let ready = ready.clone();
+            assert!(dest.set(Destination { addr, ready }).is_ok());
         }
         self.provided.store(first + n, Ordering::Release);
         self.provision.notify_all();
-        Ok(())
     }
 
     /// Waits until the first `n` spans have a destination.
@@ -450,443 +366,119 @@ impl<D> CudaSink<D> {
             if self.provided.load(Ordering::Acquire) >= n {
                 return Ok(());
             }
-            if self.closed.load(Ordering::Acquire) {
+            if self.stopped.load(Ordering::Acquire) {
                 return Err(Error::Stopped);
             }
             g = self.provision.wait(g).unwrap();
         }
     }
 
+    fn dest(&self, span: usize) -> &Destination {
+        self.dests[span].get().expect("span provided")
+    }
+
     /// Waits until span `span`'s bytes landed.
-    fn wait_landed(&self, span: usize) -> Result<(), LoaderError> {
+    pub fn wait_landed(&self, span: usize) -> Result<(), Error> {
         // a zero-size span has no chunk: it is ready once provided
-        self.wait_provided(span + 1)
-            .map_err(|_| LoaderError::Closed)?;
+        self.wait_provided(span + 1)?;
         for chunk in self.plan.span_chunks[span].clone() {
             let mut i = 0;
-            let e = loop {
-                match self.chunk_completion_events[chunk].load(Ordering::Acquire) {
-                    0 => {
-                        if self.closed.load(Ordering::Acquire) {
-                            return Err(LoaderError::Closed);
-                        }
-                        if i < 64 {
-                            std::thread::yield_now();
-                            i += 1;
-                        } else {
-                            std::thread::sleep(Duration::from_micros(200));
-                        }
+            let fence = loop {
+                match self.landed[chunk].get() {
+                    Some(fence) => break fence,
+                    None if self.stopped.load(Ordering::Acquire) => return Err(Error::Stopped),
+                    None if i < 64 => {
+                        std::thread::yield_now();
+                        i += 1;
                     }
-                    e => break e as Event,
+                    None => std::thread::sleep(Duration::from_micros(200)),
                 }
             };
-            self.api.event_sync(e)?;
+            if let Some(fence) = fence {
+                fence.wait()?;
+            }
         }
         Ok(())
     }
 
-    fn take(&self, idx: usize) -> Result<D, LoaderError> {
-        match self.owners[idx].lock().unwrap().take() {
-            Some(owner) => Ok(owner),
-            None if self.released.load(Ordering::Acquire) => Err(LoaderError::Closed),
-            None => Err(LoaderError::AlreadyDelivered),
-        }
-    }
-
-    /// Called once the workers are joined: waits for the copies in flight, then
-    /// returns the owners not taken, or leaks them if the wait fails.
-    fn close(&self) -> Vec<D> {
-        {
-            let _g = self.provision_lock.lock().unwrap();
-            self.closed.store(true, Ordering::Release);
-            self.released.store(true, Ordering::Release);
-            self.provision.notify_all();
-        }
-        let synced: Result<(), CudaError> = self.api.with_device(self.device, |d| {
-            let e = d.event_create()?;
-            let res = self
-                .api
-                .event_record(e, self.stream)
-                .and_then(|()| self.api.event_sync(e));
-            let _ = self.api.event_destroy(e);
-            res
-        });
-        let owners: Vec<D> = self
-            .owners
-            .iter()
-            .filter_map(|o| o.lock().unwrap().take())
-            .collect();
-        if synced.is_err() {
-            // copies may still be queued into them: leak them rather than free them
-            std::mem::forget(owners);
-            return Vec::new();
-        }
-        owners
-    }
-
-    fn signal_stop(&self) {
-        let _g = self.provision_lock.lock().unwrap();
-        self.closed.store(true, Ordering::Release);
-        self.provision.notify_all();
-    }
-
-    fn fully_scheduled(&self, span: usize) -> bool {
+    /// Whether span `span`'s copies are all issued
+    pub fn landed(&self, span: usize) -> bool {
         self.provided.load(Ordering::Acquire) > span
             && self.plan.span_chunks[span]
                 .clone()
-                .all(|c| self.chunk_completion_events[c].load(Ordering::Acquire) != 0)
+                .all(|c| self.landed[c].get().is_some())
     }
 
-    /// How many spans the claimed chunks reach
-    fn scheduled(&self, claimed: usize) -> usize {
+    /// How many spans the first `claimed` chunks reach
+    pub fn scheduled(&self, claimed: usize) -> usize {
         match claimed.min(self.plan.chunks.len()) {
             n if n == self.plan.chunks.len() => self.plan.spans.len(),
             0 => 0,
             n => self.plan.chunk_spans[n - 1].end,
         }
     }
+
+    /// Waits for every copy issued. Call once no worker is left.
+    pub fn wait_copies(&self) -> Result<(), Error> {
+        self.landed
+            .iter()
+            .filter_map(|l| l.get().and_then(Option::as_ref))
+            .try_for_each(|fence| fence.wait())
+    }
 }
 
-impl<D: Send> Sink for CudaSink<D> {
+impl<S: Scatter> Sink for Memory<S> {
     fn wait_ready(&self, file: &Range<u64>) -> Result<(), Error> {
         let spans = self.plan.chunk_spans[self.plan.chunk_at(file)].clone();
         self.wait_provided(spans.end)?;
         // host-side: a pending copy would hold its slab and stall other loaders
-        let mut last = 0;
+        let mut last: Option<&Arc<dyn Fence>> = None;
         for s in spans {
-            let e = self.ready[s].load(Ordering::Relaxed);
-            if e != last {
-                self.api.event_sync(e as Event)?;
-                last = e;
+            if let Some(ready) = &self.dest(s).ready {
+                if !last.is_some_and(|l| Arc::ptr_eq(l, ready)) {
+                    ready.wait()?;
+                    last = Some(ready);
+                }
             }
         }
         Ok(())
     }
 
     fn drain(&self, staged: Staged) -> Result<(), Error> {
-        let chunk_idx = self.plan.chunk_at(staged.file());
-        let src = staged.bytes().as_ptr();
-        let e = self.api.with_device(self.device, |d| {
-            self.plan.chunk_copies(
-                chunk_idx,
-                |s| self.dsts[s].load(Ordering::Relaxed),
-                |d0| self.api.allocation_end(d0),
-                |c| {
-                    let src = src.wrapping_add(c.src);
-                    match c.height {
-                        1 => self
-                            .api
-                            .memcpy_h2d_async(c.dst as u64, src, c.width, self.stream),
-                        _ => self.api.memcpy2d_h2d_async(
-                            c.dst as u64,
-                            c.dst_pitch,
-                            src,
-                            c.src_pitch,
-                            c.width,
-                            c.height,
-                            self.stream,
-                        ),
-                    }
-                },
-            )?;
-            staged.into_slab().release(d, self.stream)?;
-            let e = d.event_create()?;
-            if let Err(err) = self.api.event_record(e, self.stream) {
-                let _ = self.api.event_destroy(e);
-                return Err(err);
-            }
-            Ok(e)
-        })?;
-        self.chunk_completion_events[chunk_idx].store(e as u64, Ordering::Release);
+        let chunk = self.plan.chunk_at(staged.file());
+        let mut copies = Vec::new();
+        self.plan.chunk_copies(
+            chunk,
+            |s| self.dest(s).addr,
+            |addr| self.space.allocation_end(addr),
+            |copy| {
+                copies.push(copy);
+                Ok::<_, Error>(())
+            },
+        )?;
+        let fence = self.space.scatter(staged, &copies)?;
+        let _ = self.landed[chunk].set(fence);
         Ok(())
     }
 
     fn stop(&self) {
-        self.signal_stop();
-    }
-}
-
-impl<D> Drop for CudaSink<D> {
-    fn drop(&mut self) {
-        self.close();
-        for e in self.batch_events.get_mut().unwrap().drain(..) {
-            let _ = self.api.event_destroy(e);
-        }
-        for e in self.chunk_completion_events.iter() {
-            let e = e.swap(0, Ordering::AcqRel);
-            if e != 0 {
-                let _ = self.api.event_destroy(e as Event);
-            }
-        }
-    }
-}
-
-/// Whether a CUDA runtime is loaded in this process, as [`Loader::load`] needs
-pub fn available() -> bool {
-    api().is_some()
-}
-
-/// This is a generous limit on the maximum number of devices that could be connected to a single host
-const MAX_DEVICES: usize = 64;
-static STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
-
-fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
-    let slot = stream_slots
-        .get(device as usize)
-        .unwrap_or_else(|| panic!("device index {device} exceeds MAX_DEVICES ({MAX_DEVICES})"));
-    let stream = slot.load(Ordering::Acquire);
-    if stream != 0 {
-        return Ok(stream as Stream);
-    }
-
-    let new = api.with_device(device, |d| d.stream_create())?;
-    match slot.compare_exchange(0, new as u64, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(new),
-        Err(existing) => {
-            let _ = api.stream_destroy(new);
-            Ok(existing as Stream)
-        }
-    }
-}
-
-fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
-    get_stream(&STREAMS, api, device)
-}
-
-struct LoaderInner<D> {
-    source: DirectFile,
-    plan: Arc<LoadPlan>,
-    sink: CudaSink<D>,
-    pool: &'static SlabPool,
-    /// the plan's chunks as the workers claim them, and the first error
-    transfer: Plan,
-    workers: Mutex<Vec<JoinHandle<()>>>,
-}
-
-impl<D> LoaderInner<D> {
-    /// Stops loading and returns the owners not taken. A `take_tensor` waiting in
-    /// another thread returns its owner or an error: `Closed`, or what failed the load.
-    fn close(&self) -> Vec<D> {
-        self.halt();
-        self.sink.close()
-    }
-
-    /// Signals the workers and joins them; the owners stay in the sink.
-    fn halt(&self) {
-        self.transfer.stop();
-        self.sink.signal_stop();
-        // held while joining: a concurrent halt returns once the workers are gone
-        let mut workers = self.workers.lock().unwrap();
-        for h in workers.drain(..) {
-            let _ = h.join();
-        }
-    }
-
-    fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
-        self.sink
-            .wait_landed(idx)
-            .and_then(|()| self.sink.take(idx))
-            .map_err(|e| match (e, self.transfer.error()) {
-                (LoaderError::Closed, Some(err)) => LoaderError::WorkerFailed(err.to_string()),
-                (e, _) => e,
-            })
-    }
-}
-
-pub struct Loader<D> {
-    inner: Arc<LoaderInner<D>>,
-}
-
-/// The side of a [`Loader`] that gives its spans their destinations, see
-/// [`Loader::feed`].
-pub struct Feed<D> {
-    inner: Arc<LoaderInner<D>>,
-}
-
-impl<D> Feed<D> {
-    /// Gives the next `dsts.len()` spans, in plan order, their device address
-    /// and owner. They were allocated on `stream`: workers wait for the work
-    /// queued on it so far before writing. One caller at a time. Hands `dsts`
-    /// back when the loader is closed or the event can't be recorded.
-    #[allow(clippy::type_complexity)]
-    pub fn provide(
-        &self,
-        dsts: Vec<(u64, D)>,
-        stream: u64,
-    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
-        self.inner.sink.provide(dsts, stream as Stream)
-    }
-
-    /// How many spans have a destination
-    pub fn provided(&self) -> usize {
-        self.inner.sink.provided.load(Ordering::Acquire)
-    }
-
-    /// How many spans the read schedule has reached: at least the ones a
-    /// worker is reading or waiting to read
-    pub fn scheduled(&self) -> usize {
-        self.inner.sink.scheduled(self.inner.transfer.claimed())
-    }
-
-    /// Whether the load stopped: closed, failed or halted
-    pub fn stopped(&self) -> bool {
-        self.inner.transfer.stopped()
-    }
-
-    /// Stops the load as a worker error would: `take` of a span not loaded yet
-    /// fails with `reason`. No-op once the load stopped.
-    pub fn fail(&self, reason: String) {
-        if self.inner.transfer.stopped() {
-            return;
-        }
-        self.inner.transfer.fail(Error::Other(reason.into()));
-        self.inner.sink.signal_stop();
-    }
-
-    /// Waits until the read schedule is past `scheduled` spans or the load stopped
-    pub fn wait_scheduled(&self, scheduled: usize) {
-        self.inner
-            .transfer
-            .wait_until(|| self.scheduled() != scheduled);
-    }
-
-    /// Stops the load without joining the workers
-    pub fn stop(&self) {
-        self.inner.transfer.stop();
-        self.inner.sink.signal_stop();
-    }
-
-    /// Stops the load and joins the workers; the owners stay until `close`.
-    pub fn halt(&self) {
-        self.inner.halt();
-    }
-
-    /// Stops the load, joins the workers and returns the owners not taken.
-    pub fn close(&self) -> Vec<D> {
-        self.inner.close()
-    }
-}
-
-impl<D: Send + 'static> Loader<D> {
-    /// Starts the workers. They copy a span once it has a destination: give
-    /// them with [`Feed::provide`], in plan order, as the load advances.
-    /// `gathers` has one entry per span: `Some` when its destination is
-    /// [`Gather::len`] bytes packed by the gather's copies (see
-    /// [`safetensors::slice::slice_layout`]) rather than the span's bytes.
-    /// `direct`: `Some(false)` reads chunks through the page cache, `Some(true)`
-    /// with `O_DIRECT`, `None` through the page cache when it holds the whole
-    /// chunk and with `O_DIRECT` otherwise.
-    pub fn load(
-        file: Arc<File>,
-        direct: Option<bool>,
-        in_file_offset: usize,
-        device: i32,
-        threads: usize,
-        spans: Vec<Span>,
-        gathers: Vec<Option<Gather>>,
-    ) -> Result<Self, LoaderError> {
-        let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
-        if !(0..MAX_DEVICES as i32).contains(&device) {
-            return Err(LoaderError::InvalidDevice(device));
-        }
-        let plan = Arc::new(LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE));
-        // avoid spawning too many threads when not needed, up to chunks.len()
-        let threads = threads.clamp(1, plan.chunks.len().max(1));
-        let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
-        let inner = Arc::new(LoaderInner {
-            source: DirectFile::new(file, direct, pool.aligned),
-            transfer: Plan::new(plan.file_chunks()),
-            plan: plan.clone(),
-            sink: CudaSink::new(cuda_api, plan, device)?,
-            pool,
-            workers: Mutex::new(Vec::with_capacity(threads)),
-        });
-        let loader = Self { inner };
-        for _ in 0..threads {
-            let inner = loader.inner.clone();
-            let spawned = std::thread::Builder::new().spawn(move || {
-                let _ = cuda_api.set_device(device);
-                transfer::work(&inner.transfer, &inner.source, &inner.sink, inner.pool)
-            });
-            // on failure, dropping the loader stops and joins the workers already started
-            loader.inner.workers.lock().unwrap().push(spawned?);
-        }
-        Ok(loader)
-    }
-}
-
-impl<D> Loader<D> {
-    /// `idx` indexes [`Loader::spans`]
-    pub fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
-        self.inner.take_tensor(idx)
-    }
-
-    pub fn feed(&self) -> Feed<D> {
-        Feed {
-            inner: self.inner.clone(),
-        }
-    }
-
-    /// See [`LoaderInner::close`].
-    pub fn close(&self) -> Vec<D> {
-        self.inner.close()
-    }
-
-    pub fn iter(&self) -> TensorIter<D> {
-        TensorIter {
-            inner: self.inner.clone(),
-            pending: (0..self.inner.plan.spans.len()).collect(),
-        }
-    }
-}
-
-impl<D> Drop for Loader<D> {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-pub struct TensorIter<D> {
-    inner: Arc<LoaderInner<D>>,
-    pending: VecDeque<usize>,
-}
-
-impl<D> Iterator for TensorIter<D> {
-    type Item = Result<(usize, D), LoaderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.pending.is_empty() {
-                return None;
-            }
-            let pos = self
-                .pending
-                .iter()
-                .take(64)
-                .position(|&idx| self.inner.sink.fully_scheduled(idx))
-                .unwrap_or(0);
-            let idx = self.pending[pos];
-            match self.inner.take_tensor(idx) {
-                Ok(owner) => {
-                    self.pending.remove(pos);
-                    return Some(Ok((idx, owner)));
-                }
-                Err(LoaderError::AlreadyDelivered) => self.pending.remove(pos),
-                Err(e) => {
-                    self.pending.clear();
-                    return Some(Err(e));
-                }
-            };
-        }
+        let _g = self.provision_lock.lock().unwrap();
+        self.stopped.store(true, Ordering::Release);
+        self.provision.notify_all();
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)] // one range per dimension
 mod tests {
-    use std::{num::NonZeroUsize, ops::Range};
+    use std::{
+        num::NonZeroUsize,
+        ops::Range,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use super::{LoadPlan, Span};
+    use super::{LoadPlan, Memory, Scatter, Span};
     #[cfg(target_os = "linux")]
     use crate::engine::file::{
         tests::{evict, random_file},
@@ -895,6 +487,10 @@ mod tests {
     use crate::engine::{
         file::tests::{slab_buf, Rng},
         pool::SLAB_SIZE,
+    };
+    use crate::engine::{
+        pool::{tests::heap_pool, Slab},
+        transfer::{work, Error, Fence, Plan, Source, Staged},
     };
     use safetensors::slice::{slice_layout, Gather, StridedCopy, TensorIndexer};
     use safetensors::Dtype;
@@ -1248,5 +844,106 @@ mod tests {
             assert_eq!(got, expected, "{direct:?}");
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A file's bytes in memory
+    struct Bytes(Vec<u8>);
+
+    impl Source for Bytes {
+        fn fill(&self, file: Range<u64>, mut slab: Slab) -> Result<Staged, Error> {
+            let (start, end) = (file.start as usize, file.end as usize);
+            slab[..end - start].copy_from_slice(&self.0[start..end]);
+            Ok(Staged::new(slab, 0, file))
+        }
+    }
+
+    /// A space whose addresses are offsets in a buffer; every copy fails with `fail`
+    struct Buffer {
+        bytes: Mutex<Vec<u8>>,
+        fail: bool,
+    }
+
+    impl Scatter for Buffer {
+        fn scatter(
+            &self,
+            staged: Staged,
+            copies: &[StridedCopy],
+        ) -> Result<Option<Arc<dyn Fence>>, Error> {
+            if self.fail {
+                return Err(Error::Other("copy failed".into()));
+            }
+            let (src, mut dst) = (staged.bytes(), self.bytes.lock().unwrap());
+            for c in copies {
+                for r in 0..c.height {
+                    let (from, to) = (c.src + r * c.src_pitch, c.dst + r * c.dst_pitch);
+                    dst[to..to + c.width].copy_from_slice(&src[from..from + c.width]);
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_memory_takes_destinations_as_they_arrive() {
+        // a span, a gap, columns of a 4 x 10 tensor, then a span: 7-byte chunks
+        // wait for the second batch of destinations
+        let gather = Gather {
+            copies: vec![StridedCopy {
+                src: 0,
+                dst: 0,
+                width: 3,
+                height: 4,
+                src_pitch: 10,
+                dst_pitch: 3,
+            }],
+            len: 12,
+        };
+        let plan = LoadPlan::new(
+            vec![sp(0, 7), sp(12, 45), sp(50, 60)],
+            vec![None, Some(gather), None],
+            0,
+            NonZeroUsize::new(7).unwrap(),
+        );
+        let bytes = Mutex::new(vec![0xAA; 29]);
+        let memory = Memory::new(plan, Buffer { bytes, fail: false });
+        let (transfer, pool) = (Plan::new(memory.chunks()), heap_pool(2, 7));
+        let file = Bytes((0..60).collect());
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| work(&transfer, &file, &memory, &pool));
+            // SAFETY: offsets in the buffer, which `memory` holds
+            unsafe { memory.provide([0].into_iter(), None) };
+            std::thread::sleep(Duration::from_millis(20));
+            // SAFETY: as above
+            unsafe { memory.provide([7, 19].into_iter(), None) };
+            worker.join().unwrap();
+        });
+        assert!(transfer.error().is_none());
+        (0..3).for_each(|span| memory.wait_landed(span).unwrap());
+        let rows = (0..4).flat_map(|r| 12 + r * 10..15 + r * 10);
+        let expected: Vec<u8> = (0..7).chain(rows).chain(50..60).collect();
+        assert_eq!(*memory.space.bytes.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_failed_copy_stops_the_transfer() {
+        let plan = LoadPlan::new(
+            vec![sp(0, 40)],
+            vec![None],
+            0,
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let bytes = Mutex::new(vec![0; 40]);
+        let memory = Memory::new(plan, Buffer { bytes, fail: true });
+        let (transfer, pool) = (Plan::new(memory.chunks()), heap_pool(2, 8));
+        let file = Bytes(vec![1; 40]);
+        // SAFETY: an offset in the buffer, which `memory` holds
+        unsafe { memory.provide([0].into_iter(), None) };
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| work(&transfer, &file, &memory, &pool));
+            }
+        });
+        assert_eq!(transfer.error().unwrap().to_string(), "copy failed");
+        assert!(matches!(memory.wait_landed(0), Err(Error::Stopped)));
     }
 }

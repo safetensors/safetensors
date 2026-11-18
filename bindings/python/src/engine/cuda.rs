@@ -40,6 +40,7 @@ cuda_fns! {
     cudaMemcpy2DAsync:           fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, Stream) -> Err,
     cudaStreamCreateWithFlags:   fn(*mut Stream, c_uint) -> Err,
     cudaStreamDestroy:           fn(Stream) -> Err,
+    cudaStreamSynchronize:       fn(Stream) -> Err,
     cudaStreamWaitEvent:         fn(Stream, Event, c_uint) -> Err,
     cudaEventCreateWithFlags:    fn(*mut Event, c_uint) -> Err,
     cudaEventRecord:             fn(Event, Stream) -> Err,
@@ -118,7 +119,6 @@ impl CudaApi {
         Ok(ptr as *mut u8)
     }
 
-    #[cfg(test)]
     pub fn free_host(&self, ptr: *mut u8) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaFreeHost)(ptr as *mut c_void) })
     }
@@ -192,6 +192,11 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaStreamDestroy)(s) })
     }
 
+    pub fn stream_sync(&self, s: Stream) -> Result<(), CudaError> {
+        // SAFETY: a runtime call on a stream handle, which the runtime validates
+        self.check(unsafe { (self.f.cudaStreamSynchronize)(s) })
+    }
+
     fn event_create(&self) -> Result<Event, CudaError> {
         let mut e = std::ptr::null_mut();
         self.check(unsafe {
@@ -258,7 +263,6 @@ impl CudaApi {
         self.set_device(device)?;
         let guard = DeviceGuard {
             api: self,
-            device,
             prev,
             restore,
             _thread_bound: std::marker::PhantomData,
@@ -278,7 +282,6 @@ impl CudaApi {
 /// Restores the caller's current device on drop.
 pub struct DeviceGuard<'a> {
     api: &'a CudaApi,
-    device: i32,
     prev: c_int,
     restore: bool,
     /// `cudaSetDevice` is per-thread state: the guard must be dropped on the
@@ -287,14 +290,6 @@ pub struct DeviceGuard<'a> {
 }
 
 impl DeviceGuard<'_> {
-    pub fn id(&self) -> i32 {
-        self.device
-    }
-
-    pub fn api(&self) -> &CudaApi {
-        self.api
-    }
-
     pub fn stream_create(&self) -> Result<Stream, CudaError> {
         self.api.stream_create()
     }
