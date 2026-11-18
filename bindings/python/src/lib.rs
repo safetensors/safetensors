@@ -2567,7 +2567,7 @@ fn mps_tensor_from_buf(
 }
 
 /// Whether torch's `from_dlpack` accepts an MPS-device capsule, added in
-/// torch 2.9. We advertise support back to 2.4, so older torch takes the
+/// torch 2.9. We advertise support back to 2.6, so older torch takes the
 /// generic CPU-tensor + `.to("mps")` path instead: correct on every version,
 /// but it copies host->device rather than aliasing the `MTLBuffer`.
 ///
