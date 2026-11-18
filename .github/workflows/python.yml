@@ -17,7 +17,7 @@ jobs:
         # Lowest and highest, no version specified so that
         # new releases get automatically tested against
         version: [
-          {torch: torch==2.5, python: "3.10", arch: "x64", numpy: numpy},
+          {torch: torch==2.6, python: "3.10", arch: "x64", numpy: numpy},
           {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
         ]
         include:
