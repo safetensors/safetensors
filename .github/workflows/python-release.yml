@@ -64,7 +64,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
-          sccache: 'true'
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -97,7 +96,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
-          sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -129,7 +127,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target == 'arm64' && 'aarch64-pc-windows-msvc' || matrix.platform.target }}
           args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
-          sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -157,7 +154,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked --interpreter ${{ matrix.python_interpreter }}
-          sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
