@@ -15,6 +15,7 @@ def save(tensors: Dict[str, Array], metadata: Optional[Dict[str, str]] = None) -
     Args:
         tensors (`Dict[str, Array]`):
             The incoming tensors. Tensors need to be contiguous and dense.
+            The dictionary and its tensors are not modified.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
@@ -48,6 +49,7 @@ def save_file(
     Args:
         tensors (`Dict[str, Array]`):
             The incoming tensors. Tensors need to be contiguous and dense.
+            The dictionary and its tensors are not modified.
         filename (`str`, or `os.PathLike`)):
             The filename we're saving into.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
@@ -135,6 +137,4 @@ def _np2jnp(numpy_dict: Dict[str, np.ndarray]) -> Dict[str, Array]:
 
 
 def _jnp2np(jnp_dict: Dict[str, Array]) -> Dict[str, np.array]:
-    for k, v in jnp_dict.items():
-        jnp_dict[k] = np.asarray(v)
-    return jnp_dict
+    return {k: np.asarray(v) for k, v in jnp_dict.items()}

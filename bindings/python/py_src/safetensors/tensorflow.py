@@ -16,6 +16,7 @@ def save(
     Args:
         tensors (`Dict[str, tf.Tensor]`):
             The incoming tensors. Tensors need to be contiguous and dense.
+            The dictionary and its tensors are not modified.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
@@ -49,6 +50,7 @@ def save_file(
     Args:
         tensors (`Dict[str, tf.Tensor]`):
             The incoming tensors. Tensors need to be contiguous and dense.
+            The dictionary and its tensors are not modified.
         filename (`str`, or `os.PathLike`)):
             The filename we're saving into.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
@@ -136,6 +138,4 @@ def _np2tf(numpy_dict: Dict[str, np.ndarray]) -> Dict[str, tf.Tensor]:
 
 
 def _tf2np(tf_dict: Dict[str, tf.Tensor]) -> Dict[str, np.array]:
-    for k, v in tf_dict.items():
-        tf_dict[k] = v.numpy()
-    return tf_dict
+    return {k: v.numpy() for k, v in tf_dict.items()}
