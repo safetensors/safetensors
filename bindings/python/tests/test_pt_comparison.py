@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import unittest
 
 import torch
@@ -202,6 +204,43 @@ class TorchTestCase(unittest.TestCase):
         reloaded = load_file(local)
         self.assertTrue(torch.equal(data["test"], reloaded["test"]))
         self.assertTrue(torch.equal(data["test2"], reloaded["test2"]))
+
+    def assertSavedAsSave(self, data, metadata=None, directory=None):
+        with tempfile.TemporaryDirectory(dir=directory) as d:
+            path = os.path.join(d, "out.safetensors")
+            save_file(data, path, metadata=metadata)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), save(data, metadata=metadata))
+
+    def test_save_file_writes_what_save_returns(self):
+        # odd sizes across the 16 MiB blocks the file is written in, zero-size
+        # tensors, many small ones, one metadata entry
+        data = {
+            "a": torch.arange(17 << 20, dtype=torch.uint8),
+            "empty": torch.zeros((3, 0)),
+            "b": torch.randn(5_000_001),
+            **{
+                f"small.{i}": torch.full((i % 7,), i, dtype=torch.int16)
+                for i in range(1000)
+            },
+        }
+        self.assertSavedAsSave(data, metadata={"format": "pt"})
+        self.assertSavedAsSave({})
+        self.assertSavedAsSave({"empty": torch.zeros(0)})
+
+    @unittest.skipUnless(os.path.isdir("/dev/shm"), "no tmpfs at /dev/shm")
+    def test_save_file_on_tmpfs(self):
+        self.assertSavedAsSave({"a": torch.randn(3 << 20)}, directory="/dev/shm")
+
+    def test_save_file_over_a_mapped_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.safetensors")
+            save_file({"a": torch.zeros(1 << 20)}, path)
+            mapped = load_file(path)
+            save_file({"a": torch.ones(1 << 20)}, path)
+            self.assertTrue(torch.equal(mapped["a"], torch.zeros(1 << 20)))
+            self.assertTrue(torch.equal(load_file(path)["a"], torch.ones(1 << 20)))
+            self.assertEqual(os.listdir(d), ["out.safetensors"])
 
     def test_disjoint_tensors_shared_storage(self):
         A = torch.zeros((10, 10))
