@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795030369825,
+  "lastUpdate": 1795031123701,
   "repoUrl": "https://github.com/safetensors/safetensors",
   "entries": {
     "Benchmark": [
@@ -66238,6 +66238,117 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.019667224883399295",
             "extra": "mean: 203.32681540000976 msec\nrounds: 5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "safetensors",
+            "username": "safetensors"
+          },
+          "committer": {
+            "name": "safetensors",
+            "username": "safetensors"
+          },
+          "id": "0a96ed96a2a730e59f431f5472ed0042bc453387",
+          "message": "docs(prefetch): document loading on a side stream",
+          "timestamp": "2026-11-18T14:52:01Z",
+          "url": "https://github.com/safetensors/safetensors/pull/939/commits/0a96ed96a2a730e59f431f5472ed0042bc453387"
+        },
+        "date": 1795031121598,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "benches/test_flax.py::test_flax_flax_load",
+            "value": 1.796432558140991,
+            "unit": "iter/sec",
+            "range": "stddev: 0.008123739749202654",
+            "extra": "mean: 556.6588044000014 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_flax.py::test_flax_sf_load",
+            "value": 4.163727207109604,
+            "unit": "iter/sec",
+            "range": "stddev: 0.010178625201981765",
+            "extra": "mean: 240.16943240001183 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_paddle_load",
+            "value": 3.2957859143315695,
+            "unit": "iter/sec",
+            "range": "stddev: 0.006665963471945494",
+            "extra": "mean: 303.4177662000275 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_paddle.py::test_paddle_sf_load",
+            "value": 689.6051923497814,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00033059031618663185",
+            "extra": "mean: 1.4501050907006225 msec\nrounds: 441"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu",
+            "value": 4.8962494053860945,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0051060912473190586",
+            "extra": "mean: 204.23796200004745 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu",
+            "value": 588.9521608958282,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00043728226970904746",
+            "extra": "mean: 1.6979307767186822 msec\nrounds: 421"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_pread",
+            "value": 4.578541609485407,
+            "unit": "iter/sec",
+            "range": "stddev: 0.006077676565797405",
+            "extra": "mean: 218.41015879997485 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_pt_load_cpu_small",
+            "value": 23.66888444870563,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0001968468386026189",
+            "extra": "mean: 42.249561958324 msec\nrounds: 24"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small",
+            "value": 94.85462093415181,
+            "unit": "iter/sec",
+            "range": "stddev: 0.014166861994512633",
+            "extra": "mean: 10.542448961914054 msec\nrounds: 105"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_load_cpu_small_pread",
+            "value": 201.5279613313657,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0005353085303059022",
+            "extra": "mean: 4.962090587299365 msec\nrounds: 126"
+          },
+          {
+            "name": "benches/test_pt.py::test_pt_sf_save_cpu",
+            "value": 7.269476267776889,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0003876387568290541",
+            "extra": "mean: 137.5614917999883 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_tf_load",
+            "value": 3.026341963190396,
+            "unit": "iter/sec",
+            "range": "stddev: 0.005645928367095998",
+            "extra": "mean: 330.4319247999956 msec\nrounds: 5"
+          },
+          {
+            "name": "benches/test_tf.py::test_tf_sf_load",
+            "value": 3.272906811303128,
+            "unit": "iter/sec",
+            "range": "stddev: 0.006021605406255201",
+            "extra": "mean: 305.53879400001733 msec\nrounds: 5"
           }
         ]
       }
