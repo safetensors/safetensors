@@ -15,7 +15,7 @@ mod save;
 #[cfg(unix)]
 mod transfer;
 #[cfg(target_os = "linux")]
-pub use save::save;
+pub use save::{save, Location};
 #[cfg(unix)]
 pub use {
     cuda_memory::available,
