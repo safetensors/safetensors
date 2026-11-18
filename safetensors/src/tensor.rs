@@ -1,5 +1,5 @@
 //! Module Containing the most important structures
-use crate::lib::{Cow, HashMap, String, ToString, Vec};
+use crate::lib::{BTreeMap, Cow, HashMap, String, ToString, Vec};
 use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
 use core::fmt::Display;
 use core::str::Utf8Error;
@@ -585,7 +585,8 @@ impl Serialize for Metadata {
         let mut map = serializer.serialize_map(Some(self.tensors.len() + length))?;
 
         if let Some(metadata) = &self.metadata {
-            map.serialize_entry("__metadata__", metadata)?;
+            let sorted: BTreeMap<&String, &String> = metadata.iter().collect();
+            map.serialize_entry("__metadata__", &sorted)?;
         }
 
         for (name, info) in names.iter().zip(&self.tensors) {
@@ -1616,5 +1617,25 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
+    }
+
+    #[test]
+    fn test_metadata_keys_serialized_sorted() {
+        let tensors: HashMap<String, TensorView> = HashMap::new();
+        let keys = ["e", "b", "d", "a", "c"];
+        let forward: HashMap<String, String> = keys
+            .iter()
+            .map(|k| (k.to_string(), k.to_string()))
+            .collect();
+        let backward: HashMap<String, String> = keys
+            .iter()
+            .rev()
+            .map(|k| (k.to_string(), k.to_string()))
+            .collect();
+
+        let out = serialize(&tensors, Some(forward)).unwrap();
+        assert_eq!(out, serialize(&tensors, Some(backward)).unwrap());
+        let header = br#"{"__metadata__":{"a":"a","b":"b","c":"c","d":"d","e":"e"}}"#;
+        assert_eq!(&out[8..8 + header.len()], header);
     }
 }

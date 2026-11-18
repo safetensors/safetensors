@@ -95,6 +95,22 @@ class TestCase(unittest.TestCase):
         for name, tensor in load(save(tensors)).items():
             np.testing.assert_array_equal(tensor, tensors[name])
 
+    def test_serialization_metadata_deterministic(self):
+        tensors = {"test": np.zeros((2, 2), dtype=np.int32)}
+        metadata = {k: k for k in ["e", "b", "d", "a", "c"]}
+        out = save(tensors, metadata=metadata)
+        self.assertIn(b'{"a":"a","b":"b","c":"c","d":"d","e":"e"}', out)
+        for _ in range(5):
+            self.assertEqual(save(tensors, metadata=dict(metadata)), out)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(5):
+                filename = os.path.join(tmpdir, f"out_{i}.safetensors")
+                save_file(tensors, filename, metadata=dict(metadata))
+                self.assertEqual(Path(filename).read_bytes(), out)
+            with safe_open(filename, framework="np") as f:
+                self.assertEqual(list(f.metadata()), ["a", "b", "c", "d", "e"])
+
     def test_serialization_forces_alignment(self):
         data = np.zeros((2, 2), dtype=np.int32)
         data2 = np.zeros((2, 2), dtype=np.float16)
