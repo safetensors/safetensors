@@ -193,7 +193,11 @@ class ReadmeTestCase(unittest.TestCase):
             self.assertTrue(equality_fn(v1, v2), f"{k} tensors are different")
 
     def test_numpy_example(self):
-        tensors = {"a": np.zeros((2, 2)), "b": np.zeros((2, 3), dtype=np.uint8)}
+        tensors = {
+            "a": np.arange(4, dtype=np.float32).reshape(2, 2),
+            "b": np.arange(6, dtype=np.uint8).reshape(2, 3),
+        }
+        self.assertTrue(all(tensor.flags.c_contiguous for tensor in tensors.values()))
 
         save_file(tensors, "./out_np.safetensors")
         out = save(tensors)
@@ -204,6 +208,28 @@ class ReadmeTestCase(unittest.TestCase):
 
         loaded = load(out)
         self.assertTensorEqual(tensors, loaded, np.allclose)
+
+    def test_numpy_rejects_non_c_contiguous_arrays(self):
+        tensors = {
+            "fortran": np.asfortranarray(np.arange(6, dtype=np.float32).reshape(2, 3)),
+            "strided": np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2],
+        }
+
+        for name, tensor in tensors.items():
+            with self.subTest(name=name):
+                self.assertFalse(tensor.flags.c_contiguous)
+                with self.assertRaisesRegex(
+                    ValueError, "C-contiguous.*ascontiguousarray"
+                ):
+                    save({"tensor": tensor})
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "tensor.safetensors"
+                    with self.assertRaisesRegex(
+                        ValueError, "C-contiguous.*ascontiguousarray"
+                    ):
+                        save_file({"tensor": tensor}, path)
+                    self.assertFalse(path.exists())
 
     def test_numpy_bool(self):
         tensors = {"a": np.asarray(False)}

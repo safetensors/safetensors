@@ -13,6 +13,11 @@ def _flatten(
     flattened = {}
     for k, v in tensor_dict.items():
         tensor = v
+        if not tensor.flags.c_contiguous:
+            raise ValueError(
+                f"You are trying to save a non-C-contiguous tensor: `{k}` which is not allowed. "
+                "Please call `np.ascontiguousarray` on your tensor to pack it before saving."
+            )
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
             keep_alive_buffer.append(tensor)
@@ -33,7 +38,7 @@ def save(
 
     Args:
         tensor_dict (`Dict[str, np.ndarray]`):
-            The incoming tensors. Tensors need to be contiguous and dense.
+            The incoming tensors. Tensors need to be C-contiguous and dense.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
@@ -68,7 +73,7 @@ def save_file(
 
     Args:
         tensor_dict (`Dict[str, np.ndarray]`):
-            The incoming tensors. Tensors need to be contiguous and dense.
+            The incoming tensors. Tensors need to be C-contiguous and dense.
         filename (`str`, or `os.PathLike`)):
             The filename we're saving into.
         metadata (`Dict[str, str]`, *optional*, defaults to `None`):
