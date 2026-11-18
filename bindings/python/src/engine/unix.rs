@@ -42,7 +42,7 @@
 //!     -> owner of s's destination        handed out once (AlreadyDelivered after)
 //! ```
 //!
-//! [`Loader`] owns the worker threads; [`LoaderInner`] (file, plan, sink, chunk
+//! [`Loader`] owns the worker threads; [`LoaderInner`] (source, plan, sink, chunk
 //! counter, first error) is shared with them and with [`TensorIter`]. Closing
 //! signals the workers, joins them, waits for the copies in flight, then
 //! returns the owners not taken: an outstanding iterator yields `Err(Closed)`
@@ -123,6 +123,169 @@ impl From<std::io::Error> for LoaderError {
 }
 
 const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+
+/// The largest alignment of offset, length and buffer a direct read may need
+const DIRECT_ALIGN: usize = 4096;
+
+/// A chunk's superset aligned to [`DIRECT_ALIGN`] fits in a slab
+const SLAB_SIZE: usize = CHUNK_SIZE.get() + 2 * DIRECT_ALIGN;
+const _: () = assert!(SLAB_SIZE.is_multiple_of(DIRECT_ALIGN));
+
+/// The file the workers read chunks from
+struct Source {
+    file: Arc<File>,
+    #[cfg(target_os = "linux")]
+    direct: Option<Direct>,
+}
+
+impl Source {
+    /// `direct` as in [`Loader::load`]. Direct reads need `aligned_slabs` and a
+    /// filesystem that supports them; reads go through the page cache otherwise.
+    fn new(file: Arc<File>, direct: Option<bool>, aligned_slabs: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let direct = match direct {
+                Some(true) | None if aligned_slabs => Direct::open(&file, direct.is_none()),
+                _ => None,
+            };
+            if direct.is_none() {
+                // Chunks are read out of order by several threads and a plan may
+                // skip regions: kernel readahead would pull in bytes nobody asked
+                // for. Best effort, the hint failing only costs throughput.
+                // SAFETY: `file` holds an open descriptor for the call's duration.
+                let _ =
+                    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+            }
+            Self { file, direct }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (direct, aligned_slabs);
+            Self { file }
+        }
+    }
+
+    /// Reads `len` bytes at `offset` into `slab`, aligned to [`DIRECT_ALIGN`] and
+    /// at least `len + 2 * DIRECT_ALIGN` long, and returns where they start in it.
+    fn read(&self, slab: &mut [u8], offset: u64, len: usize) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(direct) = self
+            .direct
+            .as_ref()
+            .filter(|d| d.ok.load(Ordering::Relaxed))
+        {
+            if direct.cached_first && read_cached(&self.file, &mut slab[..len], offset) == len {
+                return Ok(0);
+            }
+            match direct.read(slab, offset, len) {
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    direct.ok.store(false, Ordering::Relaxed);
+                }
+                res => return res,
+            }
+        }
+        self.file.read_exact_at(&mut slab[..len], offset)?;
+        Ok(0)
+    }
+}
+
+/// The file reopened `O_DIRECT`
+#[cfg(target_os = "linux")]
+struct Direct {
+    file: File,
+    /// of offsets, lengths and buffers; divides [`DIRECT_ALIGN`]
+    align: usize,
+    /// whether a chunk the page cache holds is read from it
+    cached_first: bool,
+    /// cleared when a direct read fails with `EINVAL`
+    ok: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl Direct {
+    fn open(file: &File, cached_first: bool) -> Option<Self> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        let align = direct_align(file)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .ok()?;
+        Some(Self {
+            file,
+            align,
+            cached_first,
+            ok: AtomicBool::new(true),
+        })
+    }
+
+    /// Reads the [`Self::align`]ed superset of `len` bytes at `offset` into
+    /// `slab` and returns where they start in it; the end of the file may cut the
+    /// superset short.
+    fn read(&self, slab: &mut [u8], offset: u64, len: usize) -> std::io::Result<usize> {
+        let head = (offset % self.align as u64) as usize;
+        let from = offset - head as u64;
+        let buf = &mut slab[..(head + len).next_multiple_of(self.align)];
+        let mut got = 0;
+        while got < head + len {
+            match self.file.read_at(&mut buf[got..], from + got as u64) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(head)
+    }
+}
+
+/// The alignment direct reads of `file` need, as `statx` reports it, or
+/// [`DIRECT_ALIGN`] where it does not; `None` if it does not divide
+/// [`DIRECT_ALIGN`] or the file takes no direct reads.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_env = "gnu"), allow(unused_variables))]
+fn direct_align(file: &File) -> Option<usize> {
+    #[cfg(target_env = "gnu")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `statx` is plain integers, valid zeroed; `file` holds an open
+        // descriptor, and `AT_EMPTY_PATH` with an empty path describes it
+        let (r, stx) = unsafe {
+            let mut stx: libc::statx = std::mem::zeroed();
+            let r = libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_DIOALIGN,
+                &mut stx,
+            );
+            (r, stx)
+        };
+        if r == 0 && stx.stx_mask & libc::STATX_DIOALIGN != 0 {
+            let align = stx.stx_dio_mem_align.max(stx.stx_dio_offset_align) as usize;
+            return (align != 0 && DIRECT_ALIGN.is_multiple_of(align)).then_some(align);
+        }
+    }
+    Some(DIRECT_ALIGN)
+}
+
+/// Reads what the page cache holds of `buf.len()` bytes at `offset`, up to the
+/// first byte it does not, without waiting for the disk.
+#[cfg(target_os = "linux")]
+fn read_cached(file: &File, buf: &mut [u8], offset: u64) -> usize {
+    use std::os::fd::AsRawFd;
+    let Ok(offset) = libc::off_t::try_from(offset) else {
+        return 0;
+    };
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: `iov` describes `buf`, writable for the call's duration
+    let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
+    n.max(0) as usize
+}
 
 /// A byte interval `start..end` of the file's data section
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,11 +497,12 @@ enum Sink<D> {
 }
 
 impl<D> Sink<D> {
-    /// `read(buffer, offset)` fills the chunk's slab from the source
+    /// `read(slab, offset, len)` fills the chunk's slab from the source and
+    /// returns where the chunk starts in it
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
+        read: impl FnOnce(&mut [u8], u64, usize) -> std::io::Result<usize>,
     ) -> Result<(), LoaderError> {
         match self {
             Self::Cuda(sink) => sink.load_chunk(chunk_idx, read),
@@ -421,9 +585,9 @@ impl SlabLease {
         unsafe { self.pool.buffer_ptr.add(self.slab.offset) }
     }
 
-    fn mut_slice(&mut self, len: usize) -> &mut [u8] {
-        assert!(len <= self.pool.slab_size, "chunk does not fit in slab");
-        unsafe { std::slice::from_raw_parts_mut(self.ptr(), len) }
+    fn slab(&mut self) -> &mut [u8] {
+        // SAFETY: the lease holds the slab, `slab_size` bytes of the pool's buffer
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.pool.slab_size) }
     }
 
     fn release(mut self, d: &DeviceGuard<'_>, stream: Stream) -> Result<(), CudaError> {
@@ -449,6 +613,8 @@ impl Drop for SlabLease {
 struct SlabPool {
     buffer_ptr: *mut u8,
     slab_size: usize,
+    /// whether every slab is aligned to [`DIRECT_ALIGN`]
+    aligned: bool,
     free: Mutex<VecDeque<Slab>>,
     available: Condvar,
 }
@@ -468,6 +634,8 @@ impl SlabPool {
         Ok(Self {
             buffer_ptr,
             slab_size,
+            aligned: buffer_ptr.addr().is_multiple_of(DIRECT_ALIGN)
+                && slab_size.is_multiple_of(DIRECT_ALIGN),
             free: Mutex::new(free),
             available: Condvar::new(),
         })
@@ -615,7 +783,7 @@ impl<D> CudaSink<D> {
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
+        read: impl FnOnce(&mut [u8], u64, usize) -> std::io::Result<usize>,
     ) -> Result<(), LoaderError> {
         let chunk = self.plan.chunks[chunk_idx].clone();
         let spans = self.plan.chunk_spans[chunk_idx].clone();
@@ -630,9 +798,10 @@ impl<D> CudaSink<D> {
             }
         }
         let mut lease = self.pool.acquire(self.api)?;
-        read(
-            lease.mut_slice(chunk.len()),
+        let head = read(
+            lease.slab(),
             (self.plan.in_file_offset + chunk.start) as u64,
+            chunk.len(),
         )?;
 
         let e = self.api.with_device(self.device, |d| {
@@ -641,7 +810,7 @@ impl<D> CudaSink<D> {
                 |s| self.dsts[s].load(Ordering::Relaxed),
                 |d0| self.api.allocation_end(d0),
                 |c| {
-                    let src = lease.ptr().wrapping_add(c.src);
+                    let src = lease.ptr().wrapping_add(head + c.src);
                     match c.height {
                         1 => self
                             .api
@@ -802,7 +971,7 @@ fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
 }
 
 struct LoaderInner<D> {
-    file: Arc<File>,
+    source: Source,
     plan: Arc<LoadPlan>,
     sink: Sink<D>,
     next_chunk: AtomicUsize,
@@ -934,8 +1103,12 @@ impl<D: Send + 'static> Loader<D> {
     /// `gathers` has one entry per span: `Some` when its destination is
     /// [`Gather::len`] bytes packed by the gather's copies (see
     /// [`safetensors::slice::slice_layout`]) rather than the span's bytes.
+    /// `direct`: `Some(false)` reads chunks through the page cache, `Some(true)`
+    /// with `O_DIRECT`, `None` through the page cache when it holds the whole
+    /// chunk and with `O_DIRECT` otherwise.
     pub fn load(
         file: Arc<File>,
+        direct: Option<bool>,
         in_file_offset: usize,
         device: i32,
         threads: usize,
@@ -946,21 +1119,12 @@ impl<D: Send + 'static> Loader<D> {
         if !(0..MAX_DEVICES as i32).contains(&device) {
             return Err(LoaderError::InvalidDevice(device));
         }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // Chunks are read out of order by several threads and a plan may skip
-            // regions: kernel readahead would pull in bytes nobody asked for.
-            // Best effort, the hint failing only costs throughput.
-            // SAFETY: `file` holds an open descriptor for the call's duration.
-            let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
-        }
         let plan = Arc::new(LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE));
         // avoid spawning too many threads when not needed, up to chunks.len()
         let threads = threads.clamp(1, plan.chunks.len().max(1));
         let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
-            file,
+            source: Source::new(file, direct, pool.aligned),
             error: OnceLock::new(),
             plan: plan.clone(),
             sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
@@ -1055,7 +1219,7 @@ fn pool(cuda_api: &'static CudaApi) -> Result<&'static SlabPool, CudaError> {
     if POOL.get().is_none() {
         let _g = INIT.lock().unwrap();
         if POOL.get().is_none() {
-            let _ = POOL.set(SlabPool::new(cuda_api, 32, CHUNK_SIZE.get())?);
+            let _ = POOL.set(SlabPool::new(cuda_api, 32, SLAB_SIZE)?);
         }
     }
     Ok(POOL.get().unwrap())
@@ -1071,8 +1235,8 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
         if chunk_idx >= loader.plan.chunks.len() {
             return;
         }
-        let res = loader.sink.load_chunk(chunk_idx, |buffer, offset| {
-            loader.file.read_exact_at(buffer, offset)
+        let res = loader.sink.load_chunk(chunk_idx, |slab, offset, len| {
+            loader.source.read(slab, offset, len)
         });
         if let Err(err) = res {
             if !matches!(err, LoaderError::Closed) {
@@ -1089,9 +1253,14 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
 mod tests {
     use std::{num::NonZeroUsize, ops::Range};
 
-    use super::{LoadPlan, Span};
+    use super::{LoadPlan, Span, DIRECT_ALIGN, SLAB_SIZE};
     use safetensors::slice::{slice_layout, Gather, StridedCopy, TensorIndexer};
     use safetensors::Dtype;
+    #[cfg(target_os = "linux")]
+    use {
+        super::Source,
+        std::{fs::File, sync::Arc},
+    };
 
     fn sp(start: usize, end: usize) -> Span {
         Span { start, end }
@@ -1107,9 +1276,28 @@ mod tests {
     /// A device of `len` bytes of 0xAA after the plan's copies of `file`, span `s`
     /// landing at `dsts[s]`, all in one allocation
     fn land(plan: &LoadPlan, file: &[u8], dsts: &[usize], len: usize) -> Vec<u8> {
+        land_read(plan, dsts, len, |slab, offset, n| {
+            let at = offset as usize - plan.in_file_offset;
+            slab[..n].copy_from_slice(&file[at..at + n]);
+            0
+        })
+    }
+
+    /// [`land`] with each chunk read as the sink reads it: `read(slab, offset,
+    /// len)` fills the slab and returns where the chunk starts in it
+    fn land_read(
+        plan: &LoadPlan,
+        dsts: &[usize],
+        len: usize,
+        mut read: impl FnMut(&mut [u8], u64, usize) -> usize,
+    ) -> Vec<u8> {
         let mut device = vec![0xAA; len];
+        let (mut buf, at) = slab_buf(SLAB_SIZE, 0);
         for c in 0..plan.chunks.len() {
-            let slab = &file[plan.chunks[c].clone()];
+            let chunk = plan.chunks[c].clone();
+            let offset = (plan.in_file_offset + chunk.start) as u64;
+            let head = read(&mut buf[at.clone()], offset, chunk.len());
+            let slab = &buf[at.start + head..];
             let copy = |cp: StridedCopy| -> Result<(), ()> {
                 for r in 0..cp.height {
                     let (src, dst) = (cp.src + r * cp.src_pitch, cp.dst + r * cp.dst_pitch);
@@ -1398,5 +1586,121 @@ mod tests {
     #[should_panic(expected = "sorted by start and disjoint")]
     fn test_overlapping_spans_are_rejected() {
         plan(vec![sp(0, 5), sp(3, 8)], 5);
+    }
+
+    /// `len` pseudo-random bytes in a new file, and the bytes
+    #[cfg(target_os = "linux")]
+    fn random_file(name: &str, len: usize) -> (std::path::PathBuf, Arc<File>, Vec<u8>) {
+        let mut rng = Rng(len as u64);
+        let data: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+        let path = std::env::temp_dir().join(format!("st_{name}_{}", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        (path.clone(), Arc::new(File::open(path).unwrap()), data)
+    }
+
+    /// Drops `file` from the page cache
+    #[cfg(target_os = "linux")]
+    fn evict(file: &File) {
+        use std::os::fd::AsRawFd;
+        file.sync_all().unwrap();
+        // SAFETY: `file` holds an open descriptor for the call's duration
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+
+    /// A zeroed buffer of `len` bytes, `misalign` bytes past a [`DIRECT_ALIGN`] boundary
+    fn slab_buf(len: usize, misalign: usize) -> (Vec<u8>, Range<usize>) {
+        let buf = vec![0u8; len + DIRECT_ALIGN + misalign];
+        let at = buf.as_ptr().align_offset(DIRECT_ALIGN) + misalign;
+        (buf, at..at + len)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_source_reads_cold_and_cached() {
+        // odd offsets, and a tail whose aligned superset reaches past the end of a
+        // file of 125 blocks and 123 bytes
+        let (path, file, data) = random_file("source", 125 * DIRECT_ALIGN + 123);
+        let cases = [
+            (0, 1),
+            (1, 4095),
+            (4095, 2),
+            (4096, 8192),
+            (4099, data.len() - 4099),
+            (data.len() - 7, 7),
+        ];
+        let (mut buf, at) = slab_buf(SLAB_SIZE, 0);
+        for direct in [None, Some(true), Some(false)] {
+            let source = Source::new(file.clone(), direct, true);
+            for cold in [true, false] {
+                for (offset, len) in cases {
+                    if cold {
+                        evict(&file);
+                    }
+                    let head = source
+                        .read(&mut buf[at.clone()], offset as u64, len)
+                        .unwrap();
+                    assert_eq!(
+                        &buf[at.start + head..][..len],
+                        &data[offset..offset + len],
+                        "{direct:?}, cold {cold}, {offset}+{len}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_source_falls_back_when_direct_is_refused() {
+        // a direct read into a misaligned buffer fails with EINVAL
+        let (path, file, data) = random_file("einval", 3 * DIRECT_ALIGN);
+        let (mut buf, at) = slab_buf(SLAB_SIZE, 1);
+        let source = Source::new(file.clone(), Some(true), true);
+        if let Some(direct) = &source.direct {
+            evict(&file);
+            let head = source.read(&mut buf[at.clone()], 5, 5000).unwrap();
+            assert_eq!(&buf[at.start + head..][..5000], &data[5..5005]);
+            assert!(!direct.ok.load(std::sync::atomic::Ordering::Relaxed));
+        } else {
+            eprintln!("skipped: no direct reads in {:?}", std::env::temp_dir());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sliced_plan_reads_cold_as_cached() {
+        // rows and columns of a 64 x 300 U16 tensor, then a whole tensor, in a data
+        // section at an odd offset, read in chunks that start mid-block
+        let (offset, tensor) = (4099, 64 * 600);
+        let (path, file, data) = random_file("sliced", offset + tensor + 777);
+        let intervals = [vec![3..60], vec![10..50, 200..260]];
+        let indexers: Vec<Vec<TensorIndexer>> = intervals
+            .iter()
+            .map(|d| d.iter().map(|r| TensorIndexer::from(r.clone())).collect())
+            .collect();
+        let r = slice_layout(Dtype::U16, &[64, 300], &indexers).unwrap();
+        let packed = r.gather.as_ref().unwrap().len;
+        let plan = LoadPlan::new(
+            vec![sp(r.read.start, r.read.end), sp(tensor, tensor + 777)],
+            vec![r.gather, None],
+            offset,
+            NonZeroUsize::new(5000).unwrap(),
+        );
+        let (dsts, len) = ([0, packed], packed + 777);
+        let mut expected = slice_bytes(&data[offset..], &[64, 300], 2, &intervals);
+        expected.extend_from_slice(&data[offset + tensor..]);
+        for (direct, cold) in [(Some(true), true), (Some(false), false)] {
+            let source = Source::new(file.clone(), direct, true);
+            if cold {
+                evict(&file);
+            }
+            let got = land_read(&plan, &dsts, len, |slab, at, n| {
+                source.read(slab, at, n).unwrap()
+            });
+            assert_eq!(got, expected, "{direct:?}");
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

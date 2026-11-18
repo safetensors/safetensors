@@ -75,6 +75,7 @@ impl<D> Feed<D> {
 impl<D> Loader<D> {
     pub fn load(
         _file: Arc<File>,
+        _direct: Option<bool>,
         _in_file_offset: usize,
         _device: i32,
         _threads: usize,
