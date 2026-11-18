@@ -85,6 +85,7 @@ with safe_open("model.safetensors", framework="pt", device="cpu") as f:
 
 Notes:
  - Duplicate keys are disallowed. Not all parsers may respect this.
+ - This library writes `__metadata__` keys in sorted order; readers must not rely on key order.
  - In general the subset of JSON is implicitly decided by `serde_json` for
    this library. Anything obscure might be modified at a later time, that odd ways
    to represent integer, newlines and escapes in utf-8 strings. This would only

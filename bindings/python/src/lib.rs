@@ -21,7 +21,7 @@ use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range};
@@ -931,8 +931,8 @@ impl Open {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> Option<HashMap<String, String>> {
-        self.metadata.metadata().clone()
+    pub fn metadata(&self) -> Option<BTreeMap<String, String>> {
+        self.metadata.metadata().clone().map(BTreeMap::from_iter)
     }
 
     /// Returns the names of the tensors in the file.
@@ -1778,7 +1778,7 @@ impl safe_open {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
+    pub fn metadata(&self) -> PyResult<Option<BTreeMap<String, String>>> {
         Ok(self.inner()?.metadata())
     }
 
@@ -2920,7 +2920,7 @@ impl _safe_open_handle {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
+    pub fn metadata(&self) -> PyResult<Option<BTreeMap<String, String>>> {
         Ok(self.inner()?.metadata())
     }
 
