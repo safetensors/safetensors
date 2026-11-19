@@ -179,8 +179,8 @@ class PrefetchLoader:
     """
     The tensors of one file loading to a CUDA device in the background, returned by
     `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating, as a
-    zero-copy view of device memory. An allocation's memory is freed once every tensor in it
-    has been taken and dropped; allocations with untaken tensors are held until `close`.
+    tensor in its own device allocation, freed when the tensor is dropped; tensors not taken
+    are held until `close`.
 
     Tensors are ready on any stream when handed out. The free is fenced on the CUDA stream that was
     current at hand-out; a consumer that reads a tensor on another stream must synchronize it before

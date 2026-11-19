@@ -666,9 +666,8 @@ struct SpanMeta {
 
 /// The tensors of one file loading to a CUDA device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
-/// by iterating, as a zero-copy view of device memory. An allocation's memory is
-/// freed once every tensor in it has been taken and dropped; allocations with
-/// untaken tensors are held until the loader is closed.
+/// by iterating, in its own device allocation, freed when the tensor is dropped;
+/// tensors not taken are held until the loader is closed.
 ///
 /// Tensors are ready on any stream when handed out. The free is fenced on the
 /// CUDA stream that was current at hand-out; a consumer that reads a tensor on
@@ -2484,23 +2483,6 @@ fn cuda_tensor_from_buffer(
         .extract()?;
     buffer.consumed_on(stream);
     let device = dlpack::cuda_device(buffer.device());
-    // Tensors are views at their packed file offset inside a shared allocation,
-    // which may be misaligned for the element type: stage through a flat uint8
-    // view and let torch's aligned clone fix it
-    if !buffer
-        .ptr()
-        .is_multiple_of((dtype.bitsize() / 8).max(1) as u64)
-    {
-        let nbytes = buffer.len() as i64;
-        let capsule = dlpack::to_capsule(py, buffer, vec![nbytes], dlpack::uint8_dlpack(), device)?;
-        let shape: Py<PyAny> = storage_shape.into_pyobject(py)?.into();
-        return Ok(torch
-            .call_method1(intern!(py, "from_dlpack"), (capsule,))?
-            .call_method0(intern!(py, "clone"))?
-            .call_method1(intern!(py, "view"), (get_pydtype(torch, dtype, false)?,))?
-            .call_method1(intern!(py, "reshape"), (shape,))?
-            .unbind());
-    }
     let shape_i64 = storage_shape.iter().map(|&n| n as i64).collect();
     let view_target = if dlpack::dlpack_supported_native(dtype) {
         None
