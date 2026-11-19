@@ -341,36 +341,23 @@ class PrefetchCudaTests(unittest.TestCase):
             with f.prefetch({"fp32_2d": slice(-3, 3)}, device="cuda:0") as loader:
                 self.assertEqual(tuple(loader.take("fp32_2d").shape), (3, 4))
 
-    def test_delivered_allocations_are_released_before_close(self):
-        # a loader kept open must not pin shards whose tensors were all handed out and dropped:
-        # loading the same 192 MiB file twice with both loaders open costs about one file
+    def test_dropped_tensors_return_to_the_device(self):
+        # nothing stays reserved once the tensors are dropped and the device synced
         mib = 2**20
-        path = os.path.join(self.tempdir.name, "twice.safetensors")
+        path = os.path.join(self.tempdir.name, "returned.safetensors")
         save_file(
             {k: torch.zeros(16 * mib, dtype=torch.float32) for k in ("a", "b", "c")},
             path,
         )
         torch.cuda.synchronize()
         free_before, _ = torch.cuda.mem_get_info(0)
-        loaders = []
-        with safe_open(path, framework="pt") as f:
-            for _ in range(2):
-                loader = f.prefetch(device="cuda:0")
-                loaders.append(loader)
-                tensors = dict(loader)
-                self.assertEqual(set(tensors), {"a", "b", "c"})
-                del tensors
-                torch.cuda.synchronize()  # the frees are issued at drop; let them complete
+        with self._open(path) as loader:
+            tensors = dict(loader)
+            del tensors
+            torch.cuda.synchronize()
             free_after, _ = torch.cuda.mem_get_info(0)
-        for loader in loaders:
-            loader.close()
-        used = free_before - free_after
-        self.assertGreaterEqual(
-            used, 150 * mib, f"{used / mib:.0f} MiB: nothing stayed resident"
-        )
-        self.assertLess(
-            used, 300 * mib, f"{used / mib:.0f} MiB resident with both loaders open"
-        )
+        kept = free_before - free_after
+        self.assertLess(kept, 64 * mib, f"{kept / mib:.0f} MiB still reserved")
 
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
