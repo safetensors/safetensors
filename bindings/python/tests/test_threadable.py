@@ -14,23 +14,19 @@ class TestCase(unittest.TestCase):
     def test_serialize_file_releases_gil(self):
         """Test that serialize_file releases the GIL and can run concurrently."""
         # Create large numpy arrays to ensure serialization takes measurable time
-        # Keep them alive throughout the test since we pass raw pointers
         tensor_a = np.random.randn(2000, 20000).astype(np.float32)
         tensor_b = np.random.randint(0, 128, (20000, 2000), dtype=np.int8)
 
-        # Build the tensor dict with data pointers (as serialize_file expects)
         tensor_data = {
             "tensor_a": TensorSpec(
                 dtype=tensor_a.dtype.name,
                 shape=tensor_a.shape,
-                data_ptr=tensor_a.ctypes.data,
-                data_len=tensor_a.nbytes,
+                data=tensor_a,
             ),
             "tensor_b": TensorSpec(
                 dtype=tensor_b.dtype.name,
                 shape=tensor_b.shape,
-                data_ptr=tensor_b.ctypes.data,
-                data_len=tensor_b.nbytes,
+                data=tensor_b,
             ),
         }
 

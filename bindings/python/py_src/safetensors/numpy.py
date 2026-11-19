@@ -1,29 +1,24 @@
 import os
 import sys
-from typing import Dict, List, Optional, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 
 from safetensors import TensorSpec, deserialize, safe_open, serialize, serialize_file
 
 
-def _flatten(
-    tensor_dict: Dict[str, np.ndarray], keep_alive_buffer: List
-) -> Dict[str, Dict]:
+def _flatten(tensor_dict: Dict[str, np.ndarray]) -> Dict[str, TensorSpec]:
     flattened = {}
     for k, v in tensor_dict.items():
         tensor = v
         if not tensor.flags.c_contiguous:
             tensor = np.ascontiguousarray(tensor)
-            keep_alive_buffer.append(tensor)
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
-            keep_alive_buffer.append(tensor)
         flattened[k] = TensorSpec(
-            dtype=tensor.dtype.name,
-            shape=tensor.shape,
-            data_ptr=tensor.ctypes.data,
-            data_len=tensor.nbytes,
+            dtype=v.dtype.name,
+            shape=v.shape,
+            data=tensor.reshape(-1).view(np.uint8),
         )
     return flattened
 
@@ -55,8 +50,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
-    keep_alive_buffer = []  # to keep copied tensors alive
-    serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
+    serialized = serialize(_flatten(tensor_dict), metadata=metadata)
     result = bytes(serialized)
     return result
 
@@ -92,10 +86,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    keep_alive_buffer = []  # to keep copied tensors alive
-    serialize_file(
-        _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
-    )
+    serialize_file(_flatten(tensor_dict), filename, metadata=metadata)
 
 
 def load(data: bytes) -> Dict[str, np.ndarray]:
