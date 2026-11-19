@@ -1,6 +1,6 @@
 //! CUDA prefetch engine: load byte spans of a safetensors data section into
-//! device memory in the background and hand tensors out, once each, as they
-//! land.
+//! device memory the caller allocated, in the background, and hand each span's
+//! owner back, once, as its bytes land.
 //!
 //! Two units, computed once from the spans the consumer requests, sorted by
 //! start and disjoint:
@@ -11,9 +11,8 @@
 //! chunks   |c0 |  |  c1   |               |   c2   |   c3   |   c4   |c|
 //! ```
 //!
-//! - spans [`LoadPlan::spans`]: a byte interval of the data section, with its
-//!   own [`Allocation`]. The delivery unit: `take` hands out one span as a
-//!   device view.
+//! - spans [`LoadPlan::spans`]: a byte interval of the data section, copied to
+//!   its destination. The delivery unit: `take` hands out the span's owner.
 //! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`] of adjacent spans,
 //!   never across a gap. The I/O unit: one `pread`, one slab, one event, one
 //!   `memcpy` per span it carries. `span_chunks` and `chunk_spans` map one to
@@ -22,8 +21,8 @@
 //! Data flow, per file:
 //!
 //! ```text
-//! Loader::load, allocating each span
-//!   provide(dsts, stream)                the next spans' destinations, in plan
+//! caller (one at a time)
+//!   Feed::provide(dsts, stream)          the next spans' destinations, in plan
 //!                                        order, and an event on `stream`
 //! worker threads
 //!   c = next_chunk.fetch_add(1)          next entry of LoadPlan::chunks
@@ -32,24 +31,20 @@
 //!   lease = SlabPool::acquire()          a pinned host slab from the shared
 //!                                        pool; waits for its previous copy
 //!   pread(chunk c) -> lease              one read per chunk
-//!   memcpyAsync(lease -> device)         one copy per span in the chunk, into
-//!                                        the span's Allocation, on STREAMS[device]
+//!   memcpyAsync(lease -> destinations)   one copy per span in the chunk,
+//!                                        on STREAMS[device]
 //!   chunk_completion_events[c] = event   recorded after the copies; 0 while
 //!                                        the chunk is still pending
 //! consumer
 //!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
-//!     -> CudaBuffer                      owns the span's Allocation, handed
-//!                                        out once (AlreadyDelivered after)
-//!   drop(CudaBuffer)                     free_async on FREE_STREAMS[device],
-//!                                        fenced on the load stream, the legacy
-//!                                        default stream and the streams the
-//!                                        views were handed out on
+//!     -> owner of s's destination        handed out once (AlreadyDelivered after)
 //! ```
 //!
 //! [`Loader`] owns the worker threads; [`LoaderInner`] (file, plan, sink, chunk
 //! counter, first error) is shared with them and with [`TensorIter`]. Closing
-//! signals the workers, joins them, then releases the sink: an outstanding
-//! iterator yields `Err(Closed)` once and is exhausted.
+//! signals the workers, joins them, waits for the copies in flight, then
+//! returns the owners not taken: an outstanding iterator yields `Err(Closed)`
+//! once and is exhausted.
 
 use std::{
     collections::VecDeque,
@@ -118,66 +113,6 @@ impl From<std::io::Error> for LoaderError {
 }
 
 const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
-/// CUDA's default stream (null handle): where torch/CuPy enqueue work
-/// unless the caller uses an explicit stream context.
-const DEFAULT_STREAM: Stream = std::ptr::null_mut();
-
-/// One span's device memory, the only malloc/free site for tensor memory.
-/// Freed when the sink clears its slot and the [`CudaBuffer`] is dropped.
-struct Allocation {
-    api: &'static CudaApi,
-    device: i32,
-    stream: Stream,
-    ptr: u64,
-    /// streams consumers were on when a view was handed out (see
-    /// [`CudaBuffer::consumed_on`]); the free waits for them as well
-    consumer_streams: Mutex<Vec<u64>>,
-}
-
-unsafe impl Send for Allocation {}
-unsafe impl Sync for Allocation {}
-
-impl Allocation {
-    fn new(
-        api: &'static CudaApi,
-        device: i32,
-        stream: Stream,
-        bytes: usize,
-    ) -> Result<Arc<Self>, LoaderError> {
-        let ptr = api.with_device(device, |_| api.malloc_async(bytes, stream))?;
-        Ok(Arc::new(Self {
-            api,
-            device,
-            stream,
-            ptr,
-            consumer_streams: Mutex::new(Vec::new()),
-        }))
-    }
-}
-
-/// Frees on the per-device free stream once it has waited on the load stream
-/// (our pending copies), the legacy default stream and every stream a view was
-/// handed out on (the consumer's current stream at that time). A consumer that
-/// reads on yet another stream must sync before dropping its last view.
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        let free = free_stream(self.api, self.device).unwrap_or(self.stream);
-        let consumers = std::mem::take(&mut *self.consumer_streams.lock().unwrap());
-        let _: Result<(), CudaError> = self.api.with_device(self.device, |d| {
-            let fenced = [self.stream, DEFAULT_STREAM]
-                .into_iter()
-                .chain(consumers.into_iter().map(|s| s as Stream));
-            for stream in fenced {
-                if let Ok(e) = d.event_create() {
-                    let _ = self.api.event_record(e, stream);
-                    let _ = self.api.stream_wait_event(free, e);
-                    let _ = self.api.event_destroy(e);
-                }
-            }
-            self.api.free_async(self.ptr, free)
-        });
-    }
-}
 
 /// A byte interval `start..end` of the file's data section
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,51 +181,11 @@ impl LoadPlan {
     }
 }
 
-pub struct CudaBuffer {
-    _alloc: Option<Arc<Allocation>>,
-    device: i32,
-    ptr: u64,
-    len: usize,
+enum Sink<D> {
+    Cuda(CudaSink<D>),
 }
 
-impl CudaBuffer {
-    pub(crate) fn ptr(&self) -> u64 {
-        self.ptr
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(crate) fn device(&self) -> i32 {
-        self.device
-    }
-
-    /// Records the stream the consumer is about to use this view on (its
-    /// current stream at hand-out), so the allocation's free waits for that
-    /// stream too. `0` is the legacy default stream, always fenced.
-    pub(crate) fn consumed_on(&self, stream: u64) {
-        if stream == 0 {
-            return;
-        }
-        if let Some(alloc) = &self._alloc {
-            let mut streams = alloc.consumer_streams.lock().unwrap();
-            if !streams.contains(&stream) {
-                streams.push(stream);
-            }
-        }
-    }
-}
-
-pub enum DeviceBuffer {
-    Cuda(CudaBuffer),
-}
-
-enum Sink {
-    Cuda(CudaSink),
-}
-
-impl Sink {
+impl<D> Sink<D> {
     /// `read(buffer, offset)` fills the chunk's slab from the source
     fn load_chunk(
         &self,
@@ -308,9 +203,9 @@ impl Sink {
         }
     }
 
-    fn take(&self, idx: usize) -> Result<DeviceBuffer, LoaderError> {
+    fn take(&self, idx: usize) -> Result<D, LoaderError> {
         match self {
-            Self::Cuda(sink) => Ok(DeviceBuffer::Cuda(sink.take(idx)?)),
+            Self::Cuda(sink) => sink.take(idx),
         }
     }
 
@@ -326,7 +221,7 @@ impl Sink {
         }
     }
 
-    fn release(&self) {
+    fn release(&self) -> Vec<D> {
         match self {
             Self::Cuda(sink) => sink.close(),
         }
@@ -338,9 +233,13 @@ impl Sink {
         }
     }
 
-    fn allocate(&self) -> Result<(), LoaderError> {
+    fn provide(
+        &self,
+        dsts: Vec<(u64, D)>,
+        stream: Stream,
+    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         match self {
-            Self::Cuda(sink) => sink.allocate(),
+            Self::Cuda(sink) => sink.provide(dsts, stream),
         }
     }
 }
@@ -437,17 +336,17 @@ impl SlabPool {
     }
 }
 
-struct CudaSink {
+struct CudaSink<D> {
     api: &'static CudaApi,
     device: i32,
     stream: Stream,
     pool: &'static SlabPool,
     plan: Arc<LoadPlan>,
-    /// per span, its allocation until taken; set by `provide`
-    allocations: Box<[Mutex<Option<Arc<Allocation>>>]>,
-    delivered: Box<[AtomicBool]>,
     /// per span, the device address its bytes are copied to; set by `provide`
     dsts: Box<[AtomicU64]>,
+    /// per span, the owner of its destination; `None` until provided, and once
+    /// taken or released
+    owners: Box<[Mutex<Option<D>>]>,
     /// per span, the event of the batch that provided it, recorded on the
     /// allocating stream: the destination is free to write once it completes
     ready: Box<[AtomicU64]>,
@@ -463,10 +362,10 @@ struct CudaSink {
     released: AtomicBool,
 }
 
-unsafe impl Send for CudaSink {}
-unsafe impl Sync for CudaSink {}
+unsafe impl<D: Send> Send for CudaSink<D> {}
+unsafe impl<D: Send> Sync for CudaSink<D> {}
 
-impl CudaSink {
+impl<D> CudaSink<D> {
     fn new(
         api: &'static CudaApi,
         pool: &'static SlabPool,
@@ -480,9 +379,8 @@ impl CudaSink {
             device,
             stream,
             pool,
-            allocations: (0..n).map(|_| Mutex::new(None)).collect(),
-            delivered: (0..n).map(|_| AtomicBool::new(false)).collect(),
             dsts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            owners: (0..n).map(|_| Mutex::new(None)).collect(),
             ready: (0..n).map(|_| AtomicU64::new(0)).collect(),
             provided: AtomicUsize::new(0),
             provision_lock: Mutex::new(()),
@@ -495,44 +393,24 @@ impl CudaSink {
         })
     }
 
-    /// Allocates every span on the load stream, providing them a chunk's worth at
-    /// a time so the workers start on the first ones.
-    fn allocate(&self) -> Result<(), LoaderError> {
-        let mut batch = Vec::new();
-        let mut bytes = 0;
-        for (i, &Span { start, end }) in self.plan.spans.iter().enumerate() {
-            if start < end {
-                let alloc = Allocation::new(self.api, self.device, self.stream, end - start)?;
-                batch.push((alloc.ptr, Some(alloc)));
-            } else {
-                batch.push((0, None));
-            }
-            bytes += end - start;
-            if bytes >= CHUNK_SIZE.get() || i + 1 == self.plan.spans.len() {
-                self.provide(std::mem::take(&mut batch), self.stream)?;
-                bytes = 0;
-            }
-        }
-        Ok(())
-    }
-
     /// Gives the next `dsts.len()` spans their destinations, allocated on
-    /// `alloc_stream`.
+    /// `alloc_stream`. Hands `dsts` back if the sink is released or the event fails.
     fn provide(
         &self,
-        dsts: Vec<(u64, Option<Arc<Allocation>>)>,
+        dsts: Vec<(u64, D)>,
         alloc_stream: Stream,
-    ) -> Result<(), LoaderError> {
+    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         let _g = self.provision_lock.lock().unwrap();
         if self.released.load(Ordering::Acquire) {
-            return Err(LoaderError::Closed);
+            return Err((LoaderError::Closed, dsts));
         }
         let first = self.provided.load(Ordering::Acquire);
         assert!(
             first + dsts.len() <= self.plan.spans.len(),
             "more destinations than spans"
         );
-        // workers wait for the work queued on the allocating stream before copying
+        // the caller's allocator may hand out memory still in use by work queued
+        // on the stream it allocated on: workers wait for that work before copying
         let ready = self.api.with_device(self.device, |d| {
             let e = d.event_create()?;
             if let Err(err) = self.api.event_record(e, alloc_stream) {
@@ -540,13 +418,17 @@ impl CudaSink {
                 return Err(err);
             }
             Ok(e)
-        })?;
+        });
+        let ready = match ready {
+            Ok(e) => e,
+            Err(err) => return Err((err.into(), dsts)),
+        };
         self.batch_events.lock().unwrap().push(ready);
         let n = dsts.len();
-        for (i, (ptr, alloc)) in dsts.into_iter().enumerate() {
+        for (i, (ptr, owner)) in dsts.into_iter().enumerate() {
             self.dsts[first + i].store(ptr, Ordering::Relaxed);
             self.ready[first + i].store(ready as u64, Ordering::Relaxed);
-            *self.allocations[first + i].lock().unwrap() = alloc;
+            *self.owners[first + i].lock().unwrap() = Some(owner);
         }
         self.provided.store(first + n, Ordering::Release);
         self.provision.notify_all();
@@ -593,23 +475,18 @@ impl CudaSink {
             (self.plan.in_file_offset + chunk.start) as u64,
         )?;
 
-        let mut copies = Vec::new();
-        for s in self.plan.chunk_spans[chunk_idx].clone() {
-            let span = self.plan.spans[s];
-            let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
-            if start < end {
-                let dst = self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64;
-                copies.push((dst, start - chunk.start, end - start));
-            }
-        }
         let e = self.api.with_device(self.device, |d| {
-            for &(dst, offset, len) in &copies {
-                self.api.memcpy_h2d_async(
-                    dst,
-                    lease.ptr().wrapping_add(offset),
-                    len,
-                    self.stream,
-                )?;
+            for s in self.plan.chunk_spans[chunk_idx].clone() {
+                let span = self.plan.spans[s];
+                let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
+                if start < end {
+                    self.api.memcpy_h2d_async(
+                        self.dsts[s].load(Ordering::Relaxed) + (start - span.start) as u64,
+                        lease.ptr().wrapping_add(start - chunk.start),
+                        end - start,
+                        self.stream,
+                    )?;
+                }
             }
             lease.release(d, self.stream)?;
             let e = d.event_create()?;
@@ -650,41 +527,43 @@ impl CudaSink {
         Ok(())
     }
 
-    fn take(&self, idx: usize) -> Result<CudaBuffer, LoaderError> {
-        if self.delivered[idx].swap(true, Ordering::AcqRel) {
-            return Err(LoaderError::AlreadyDelivered);
+    fn take(&self, idx: usize) -> Result<D, LoaderError> {
+        match self.owners[idx].lock().unwrap().take() {
+            Some(owner) => Ok(owner),
+            None if self.released.load(Ordering::Acquire) => Err(LoaderError::Closed),
+            None => Err(LoaderError::AlreadyDelivered),
         }
-        let Span { start, end } = self.plan.spans[idx];
-        let mut buffer = CudaBuffer {
-            _alloc: None,
-            device: self.device,
-            ptr: 0,
-            len: end - start,
-        };
-        if start < end {
-            let alloc = self.allocations[idx]
-                .lock()
-                .unwrap()
-                .take()
-                .ok_or(LoaderError::Closed)?;
-            buffer.ptr = alloc.ptr;
-            buffer._alloc = Some(alloc);
-        }
-        Ok(buffer)
     }
 
-    fn close(&self) {
+    /// Called once the workers are joined: waits for the copies in flight, then
+    /// returns the owners not taken, or leaks them if the wait fails.
+    fn close(&self) -> Vec<D> {
         {
             let _g = self.provision_lock.lock().unwrap();
             self.closed.store(true, Ordering::Release);
+            self.released.store(true, Ordering::Release);
             self.provision.notify_all();
-            if self.released.swap(true, Ordering::AcqRel) {
-                return;
-            }
         }
-        for slot in self.allocations.iter() {
-            *slot.lock().unwrap() = None;
+        let synced: Result<(), CudaError> = self.api.with_device(self.device, |d| {
+            let e = d.event_create()?;
+            let res = self
+                .api
+                .event_record(e, self.stream)
+                .and_then(|()| self.api.event_sync(e));
+            let _ = self.api.event_destroy(e);
+            res
+        });
+        let owners: Vec<D> = self
+            .owners
+            .iter()
+            .filter_map(|o| o.lock().unwrap().take())
+            .collect();
+        if synced.is_err() {
+            // copies may still be queued into them: leak them rather than free them
+            std::mem::forget(owners);
+            return Vec::new();
         }
+        owners
     }
 
     fn signal_stop(&self) {
@@ -701,7 +580,7 @@ impl CudaSink {
     }
 }
 
-impl Drop for CudaSink {
+impl<D> Drop for CudaSink<D> {
     fn drop(&mut self) {
         self.close();
         for e in self.batch_events.get_mut().unwrap().drain(..) {
@@ -719,7 +598,6 @@ impl Drop for CudaSink {
 /// This is a generous limit on the maximum number of devices that could be connected to a single host
 const MAX_DEVICES: usize = 64;
 static STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
-static FREE_STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
 
 fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
     let slot = stream_slots
@@ -740,24 +618,20 @@ fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<
     }
 }
 
-fn free_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
-    get_stream(&FREE_STREAMS, api, device)
-}
-
 fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
     get_stream(&STREAMS, api, device)
 }
 
-struct LoaderInner {
+struct LoaderInner<D> {
     file: Arc<File>,
     plan: Arc<LoadPlan>,
-    sink: Sink,
+    sink: Sink<D>,
     next_chunk: AtomicUsize,
     error: OnceLock<LoaderError>,
 }
 
-impl LoaderInner {
-    fn take_tensor(&self, idx: usize) -> Result<DeviceBuffer, LoaderError> {
+impl<D> LoaderInner<D> {
+    fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
         self.sink
             .wait_ready(idx)
             .and_then(|()| self.sink.take(idx))
@@ -768,12 +642,35 @@ impl LoaderInner {
     }
 }
 
-pub struct Loader {
-    inner: Arc<LoaderInner>,
+pub struct Loader<D> {
+    inner: Arc<LoaderInner<D>>,
     workers: Box<[JoinHandle<()>]>,
 }
 
-impl Loader {
+/// The side of a [`Loader`] that gives its spans their destinations, see
+/// [`Loader::feed`].
+pub struct Feed<D> {
+    inner: Arc<LoaderInner<D>>,
+}
+
+impl<D> Feed<D> {
+    /// Gives the next `dsts.len()` spans, in plan order, their device address
+    /// and owner. They were allocated on `stream`: workers wait for the work
+    /// queued on it so far before writing. One caller at a time. Hands `dsts`
+    /// back when the loader is closed or the event can't be recorded.
+    #[allow(clippy::type_complexity)]
+    pub fn provide(
+        &self,
+        dsts: Vec<(u64, D)>,
+        stream: u64,
+    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
+        self.inner.sink.provide(dsts, stream as Stream)
+    }
+}
+
+impl<D: Send + 'static> Loader<D> {
+    /// Starts the workers. They copy a span once it has a destination: give
+    /// them with [`Feed::provide`], in plan order, as the load advances.
     pub fn load(
         file: Arc<File>,
         in_file_offset: usize,
@@ -816,25 +713,32 @@ impl Loader {
                 })
             })
             .collect();
-        let loader = Self { inner, workers };
-        loader.inner.sink.allocate()?;
-        Ok(loader)
+        Ok(Self { inner, workers })
     }
+}
 
+impl<D> Loader<D> {
     /// `idx` indexes [`Loader::spans`]
-    pub fn take_tensor(&self, idx: usize) -> Result<DeviceBuffer, LoaderError> {
+    pub fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
         self.inner.take_tensor(idx)
     }
 
-    pub fn close(&mut self) {
+    pub fn feed(&self) -> Feed<D> {
+        Feed {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Stops loading and returns the owners not taken.
+    pub fn close(&mut self) -> Vec<D> {
         self.inner.sink.signal_stop();
         for h in std::mem::take(&mut self.workers) {
             let _ = h.join();
         }
-        self.inner.sink.release();
+        self.inner.sink.release()
     }
 
-    pub fn iter(&self) -> TensorIter {
+    pub fn iter(&self) -> TensorIter<D> {
         TensorIter {
             inner: self.inner.clone(),
             pending: (0..self.inner.plan.spans.len()).collect(),
@@ -842,19 +746,19 @@ impl Loader {
     }
 }
 
-impl Drop for Loader {
+impl<D> Drop for Loader<D> {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-pub struct TensorIter {
-    inner: Arc<LoaderInner>,
+pub struct TensorIter<D> {
+    inner: Arc<LoaderInner<D>>,
     pending: VecDeque<usize>,
 }
 
-impl Iterator for TensorIter {
-    type Item = Result<(usize, DeviceBuffer), LoaderError>;
+impl<D> Iterator for TensorIter<D> {
+    type Item = Result<(usize, D), LoaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -869,9 +773,9 @@ impl Iterator for TensorIter {
                 .unwrap_or(0);
             let idx = self.pending[pos];
             match self.inner.take_tensor(idx) {
-                Ok(buffer) => {
+                Ok(owner) => {
                     self.pending.remove(pos);
-                    return Some(Ok((idx, buffer)));
+                    return Some(Ok((idx, owner)));
                 }
                 Err(LoaderError::AlreadyDelivered) => self.pending.remove(pos),
                 Err(e) => {
@@ -895,7 +799,7 @@ fn pool(cuda_api: &'static CudaApi) -> Result<&'static SlabPool, CudaError> {
     Ok(POOL.get().unwrap())
 }
 
-fn worker(loader: Arc<LoaderInner>) {
+fn worker<D>(loader: Arc<LoaderInner<D>>) {
     loop {
         if loader.sink.stopped() {
             return;

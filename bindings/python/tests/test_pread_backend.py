@@ -5,6 +5,7 @@ the file, dropping each host buffer immediately after the device transfer so
 cumulative host residency stays bounded at one tensor.
 """
 
+import gc
 import json
 import os
 import struct
@@ -32,6 +33,35 @@ SOURCE_TENSORS = {
 
 if hasattr(torch, "float8_e4m3fn"):
     SOURCE_TENSORS["fp8_e4m3fn"] = torch.zeros(8, dtype=torch.float8_e4m3fn)
+
+
+MIB, GIB = 1 << 20, 1 << 30
+
+
+def _pattern(i, n):
+    # bytes of tensor i: depend on the tensor and the position
+    return ((torch.arange(n, device="cuda:0") * 7 + i * 31) % 251).to(torch.uint8)
+
+
+def _write_u8(path, sizes, fill=True):
+    # U8 tensors t0..tN of the given byte sizes, filled with `_pattern` or sparse
+    header, offset = {}, 0
+    for i, n in enumerate(sizes):
+        header[f"t{i}"] = {
+            "dtype": "U8",
+            "shape": [n],
+            "data_offsets": [offset, offset + n],
+        }
+        offset += n
+    raw = json.dumps(header).encode()
+    raw += b" " * (-len(raw) % 8)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(raw)))
+        fh.write(raw)
+        for i, n in enumerate(sizes):
+            if fill and n:
+                fh.write(_pattern(i, n).cpu().numpy().tobytes())
+        fh.truncate(8 + len(raw) + offset)
 
 
 def _tensors_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -239,7 +269,7 @@ class PreadBackendTests(unittest.TestCase):
 @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
 class PrefetchCudaTests(unittest.TestCase):
     """`safe_open(...).prefetch(...)`: a `PrefetchLoader` reading the file into
-    device memory in the background, tensors handed out once as zero-copy views."""
+    tensors torch allocates, in the background, each handed out once."""
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -309,25 +339,19 @@ class PrefetchCudaTests(unittest.TestCase):
                 self._assert_matches_source(streamed)
 
     def test_plan_gap_is_not_allocated(self):
-        # a, b, c of 64 MiB each; the plan skips b: the device must hold ~128 MiB, not 192
+        # a, b, c of 64 MiB each; the plan skips b: torch holds 128 MiB, not 192
         mib = 2**20
         path = os.path.join(self.tempdir.name, "gap.safetensors")
         save_file(
             {k: torch.zeros(16 * mib, dtype=torch.float32) for k in ("a", "b", "c")},
             path,
         )
-        torch.cuda.synchronize()
-        free_before, _ = torch.cuda.mem_get_info(0)
+        before = torch.cuda.memory_allocated(0)
         with self._open(path, plan={"a": None, "c": None}) as loader:
             held = dict(loader)
-            torch.cuda.synchronize()
-            free_after, _ = torch.cuda.mem_get_info(0)
+            used = torch.cuda.memory_allocated(0) - before
         self.assertEqual(set(held), {"a", "c"})
-        used = free_before - free_after
-        self.assertGreaterEqual(used, 120 * mib, f"{used / mib:.0f} MiB")
-        self.assertLess(
-            used, 176 * mib, f"{used / mib:.0f} MiB resident, gap was allocated"
-        )
+        self.assertEqual(used, 128 * mib)
 
     def test_plan_rejects_out_of_range_rows(self):
         # Python would clamp slice(0, 10) on 3 rows to 3 rows; a plan is explicit
@@ -341,23 +365,42 @@ class PrefetchCudaTests(unittest.TestCase):
             with f.prefetch({"fp32_2d": slice(-3, 3)}, device="cuda:0") as loader:
                 self.assertEqual(tuple(loader.take("fp32_2d").shape), (3, 4))
 
-    def test_dropped_tensors_return_to_the_device(self):
-        # nothing stays reserved once the tensors are dropped and the device synced
+    def test_torch_accounts_prefetched_memory(self):
+        # torch allocates every tensor at prefetch and frees each one on drop; untaken
+        # tensors go at close, and `empty_cache` hands it all back to the device
         mib = 2**20
-        path = os.path.join(self.tempdir.name, "returned.safetensors")
+        path = os.path.join(self.tempdir.name, "accounted.safetensors")
         save_file(
             {k: torch.zeros(16 * mib, dtype=torch.float32) for k in ("a", "b", "c")},
             path,
         )
-        torch.cuda.synchronize()
-        free_before, _ = torch.cuda.mem_get_info(0)
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
         with self._open(path) as loader:
-            tensors = dict(loader)
-            del tensors
-            torch.cuda.synchronize()
-            free_after, _ = torch.cuda.mem_get_info(0)
-        kept = free_before - free_after
-        self.assertLess(kept, 64 * mib, f"{kept / mib:.0f} MiB still reserved")
+            a = loader.take("a")
+            self.assertEqual(torch.cuda.memory_allocated(0) - allocated, 192 * mib)
+            del a
+            self.assertEqual(torch.cuda.memory_allocated(0) - allocated, 128 * mib)
+        self.assertEqual(torch.cuda.memory_allocated(0), allocated)
+        torch.cuda.empty_cache()
+        self.assertEqual(torch.cuda.memory_reserved(0), reserved)
+
+    def test_allocation_failure_at_the_call(self):
+        # torch can allocate 512 MiB more: prefetch of 4 GiB raises with torch's error
+        # as the cause and gives back what it allocated
+        path = os.path.join(self.tempdir.name, "fill.safetensors")
+        _write_u8(path, [64 * MIB] * 64, fill=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_allocated(0)
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction((before + 512 * MIB) / total, 0)
+        self.addCleanup(torch.cuda.set_per_process_memory_fraction, 1.0, 0)
+        with self.assertRaisesRegex(SafetensorError, "cannot allocate") as failure:
+            self._open(path)
+        self.assertIsInstance(failure.exception.__cause__, torch.OutOfMemoryError)
+        self.assertEqual(torch.cuda.memory_allocated(0), before)
 
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
@@ -572,7 +615,7 @@ class PrefetchCudaTests(unittest.TestCase):
 
     def test_misaligned_offsets(self):
         # save_file keeps tensors aligned; hand-build a file where an F32 tensor
-        # sits at byte offset 3: it still lands in its own aligned allocation.
+        # sits at byte offset 3: it still lands in an aligned torch tensor.
         bad_path = os.path.join(self.tempdir.name, "misaligned.safetensors")
         header = (
             b'{"u8":{"dtype":"U8","shape":[3],"data_offsets":[0,3]},'

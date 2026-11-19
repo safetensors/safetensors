@@ -1,4 +1,9 @@
 //! DLPack v0 producer + Python capsule wrapping.
+// The producer only serves Metal buffers; the dtype helpers are used everywhere.
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
@@ -10,7 +15,6 @@ use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
-use crate::engine::CudaBuffer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
 
@@ -24,7 +28,6 @@ use crate::metal::MTLBuffer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DLDeviceType {
     Cpu = 1,
-    Cuda = 2,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Metal = 8,
 }
@@ -102,12 +105,6 @@ impl AsDevicePtr for MTLBuffer {
         // into `ManagedCtx` and stays valid until that ctx drops the
         // `Retained`, satisfying the `AsDevicePtr` invariant.
         self.as_metal_id_ptr()
-    }
-}
-
-impl AsDevicePtr for CudaBuffer {
-    fn as_device_ptr(&self) -> *mut c_void {
-        self.ptr() as *mut c_void
     }
 }
 
@@ -215,13 +212,6 @@ pub(crate) fn cpu_device() -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Cpu,
         device_id: 0,
-    }
-}
-
-pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
-    DLDevice {
-        device_type: DLDeviceType::Cuda,
-        device_id: ordinal,
     }
 }
 

@@ -113,12 +113,14 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaFreeHost)(ptr as *mut c_void) })
     }
 
+    #[cfg(test)]
     pub fn malloc_async(&self, len: usize, s: Stream) -> Result<u64, CudaError> {
         let mut ptr = std::ptr::null_mut();
         self.check(unsafe { (self.f.cudaMallocAsync)(&mut ptr, len, s) })?;
         Ok(ptr as u64)
     }
 
+    #[cfg(test)]
     pub fn free_async(&self, ptr: u64, s: Stream) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaFreeAsync)(ptr as *mut c_void, s) })
     }
@@ -185,6 +187,7 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaEventDestroy)(e) })
     }
 
+    #[cfg(test)]
     pub fn stream_wait_event(&self, s: Stream, e: Event) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaStreamWaitEvent)(s, e, 0) })
     }
