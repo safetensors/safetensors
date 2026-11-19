@@ -1,12 +1,13 @@
 //! DLPack v0 producer + Python capsule wrapping.
 
-use std::ffi::{c_void, CStr};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dlpark::ffi::{DLDataType, DLDataTypeCode, DLDevice, DLManagedTensor};
 use dlpark::legacy;
 use dlpark::metadata::Dynamic;
+use dlpark::python::mark_dlpack_capsule_consumed;
 use pyo3::exceptions::PyBufferError;
 use pyo3::prelude::*;
 
@@ -14,8 +15,6 @@ use safetensors::Dtype;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
-
-const USED_CAPSULE_NAME: &CStr = c"used_dltensor";
 
 /// Source of the `data` pointer [`to_capsule`] writes into the `DLTensor`.
 ///
@@ -171,8 +170,7 @@ pub(crate) fn to_capsule<'py, B: AsDevicePtr, R>(
     // torch only renames the capsule once `from_dlpack` succeeds; if it throws
     // after its storage took ownership, the tensor is already freed.
     if deleted.load(Ordering::Acquire) {
-        // SAFETY: `capsule` is a live capsule and the name is a static C string.
-        unsafe { pyo3::ffi::PyCapsule_SetName(capsule.as_ptr(), USED_CAPSULE_NAME.as_ptr()) };
+        mark_dlpack_capsule_consumed(capsule.as_any().as_borrowed())?;
     }
     result
 }
@@ -221,7 +219,7 @@ mod tests {
             );
             let capsule = kept.unwrap();
             let capsule = capsule.cast::<PyCapsule>().unwrap();
-            capsule.is_valid_checked(Some(USED_CAPSULE_NAME))
+            capsule.is_valid_checked(Some(c"used_dltensor"))
         });
         (drops.load(Ordering::SeqCst), used)
     }
@@ -255,10 +253,7 @@ mod tests {
         assert_eq!(
             run(|capsule| {
                 let managed = take(capsule);
-                // SAFETY: `capsule` is live and the name is a static C string.
-                unsafe {
-                    pyo3::ffi::PyCapsule_SetName(capsule.as_ptr(), USED_CAPSULE_NAME.as_ptr())
-                };
+                mark_dlpack_capsule_consumed(capsule.as_borrowed())?;
                 delete(managed);
                 Ok(())
             }),
