@@ -10,7 +10,7 @@ use core::slice;
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
-use pyo3::sync::OnceLockExt;
+use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use pyo3::types::PyCapsule;
@@ -26,7 +26,10 @@ use std::fs::File;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -682,7 +685,13 @@ pub struct PrefetchLoader {
     device: i32,
     /// the stream torch allocated the tensors on
     alloc_stream: u64,
+    background: Arc<Background>,
 }
+
+/// Bytes of the plan torch allocates ahead of the read schedule
+const ALLOC_AHEAD: usize = 1 << 30;
+
+const ALLOCATOR_THREAD: &str = "safetensors-prefetch-alloc";
 
 /// The CUDA stream current on `device` in this thread, with its raw handle.
 fn current_stream<'py>(py: Python<'py>, device: i32) -> PyResult<(PyBound<'py, PyAny>, u64)> {
@@ -784,6 +793,166 @@ impl Allocation {
     }
 }
 
+/// What a loader runs besides its workers: the thread that allocates as the load
+/// advances. Shared with that thread and, weakly, with the `atexit` hook.
+struct Background {
+    stop: AtomicBool,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    feed: Feed<Py<PyAny>>,
+    /// the stream current at `prefetch`, made current in the allocator thread
+    stream: Py<PyAny>,
+    stream_raw: u64,
+    /// torch's error, when the allocator thread failed to allocate
+    error: OnceLock<PyErr>,
+    /// set once the allocator thread ended, after releasing the tensors not taken
+    /// on `error`; set from the start when there is no such thread
+    exited: Mutex<bool>,
+    exit: Condvar,
+}
+
+impl Background {
+    /// Stops the load and joins the allocator thread, then the workers, without
+    /// the GIL.
+    /// The tensors not taken stay with the loader.
+    fn halt(&self, py: Python<'_>) {
+        self.stop.store(true, Ordering::Release);
+        let thread = self.thread.lock().unwrap().take();
+        // dropped from the allocator thread itself (a collection it triggered): it
+        // returns on its own once it sees `stop`
+        let thread = thread.filter(|t| t.thread().id() != std::thread::current().id());
+        py.detach(|| {
+            // wakes the allocator thread
+            self.feed.stop();
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+            self.feed.halt();
+        });
+    }
+
+    /// `msg` as a `SafetensorError`, caused by the allocation failure if any. That
+    /// failure is reported once the tensors not taken are released.
+    fn error(&self, py: Python<'_>, e: &LoaderError, msg: String) -> PyErr {
+        let err = SafetensorError::new_err(msg);
+        if let (true, Some(cause)) = (e.is_failure(), self.error.get()) {
+            // the allocator thread releases them: never wait for it from itself
+            if std::thread::current().name() != Some(ALLOCATOR_THREAD) {
+                py.detach(|| {
+                    let mut exited = self.exited.lock().unwrap();
+                    while !*exited {
+                        exited = self.exit.wait(exited).unwrap();
+                    }
+                });
+            }
+            err.set_cause(py, Some(cause.clone_ref(py)));
+        }
+        err
+    }
+}
+
+/// Every loader started in this process, for [`halt_prefetch_loaders`]; `None`
+/// once it ran
+static LIVE_LOADERS: Mutex<Option<Vec<Weak<Background>>>> = Mutex::new(Some(Vec::new()));
+static ATEXIT_HOOK: PyOnceLock<()> = PyOnceLock::new();
+static HOOK_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Registered with `atexit`: no allocator thread may reach for the GIL once the
+/// interpreter finalizes, so stop them, and the workers, before.
+#[pyfunction]
+fn halt_prefetch_loaders(py: Python<'_>) {
+    // a forked child has none of its parent's threads: nothing to halt
+    if std::process::id() != HOOK_PID.load(Ordering::Relaxed) {
+        return;
+    }
+    let live: Vec<_> = LIVE_LOADERS
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for background in live {
+        background.halt(py);
+    }
+}
+
+/// The allocator thread: keeps the destinations [`ALLOC_AHEAD`] bytes ahead of
+/// the read schedule, taking the GIL once per batch. A failure ends the load and
+/// releases the tensors not taken.
+fn allocate_ahead(background: Arc<Background>, mut alloc: Allocation) {
+    let bg = &*background;
+    let _exited = Exited(bg);
+    let (mut entered, mut failed) = (false, false);
+    while !alloc.done() {
+        if bg.stop.load(Ordering::Acquire) || bg.feed.stopped() {
+            return;
+        }
+        let scheduled = bg.feed.scheduled();
+        let target = alloc.before[scheduled] + ALLOC_AHEAD;
+        if alloc.before[bg.feed.provided()] >= target {
+            bg.feed.wait_scheduled(scheduled);
+            continue;
+        }
+        let more = Python::attach(|py| {
+            if bg.stop.load(Ordering::Acquire) {
+                return false;
+            }
+            if !entered {
+                // the current stream is per thread
+                entered = true;
+                let set = get_module(py, &TORCH_MODULE).and_then(|torch| {
+                    torch
+                        .getattr(intern!(py, "cuda"))?
+                        .call_method1(intern!(py, "set_stream"), (bg.stream.bind(py),))
+                });
+                if let Err(cause) = set {
+                    let reason = format!("cannot enter the allocating stream: {cause}");
+                    let _ = bg.error.set(cause);
+                    bg.feed.fail(reason);
+                    failed = true;
+                    return false;
+                }
+            }
+            match alloc.batch(py, target) {
+                Ok(dsts) => match bg.feed.provide(dsts, bg.stream_raw) {
+                    Ok(()) => true,
+                    Err((e, dsts)) => {
+                        drop(dsts);
+                        bg.feed.fail(e.to_string()); // no-op once closed
+                        failed = true;
+                        false
+                    }
+                },
+                Err(AllocFailure { reason, cause }) => {
+                    let _ = bg.error.set(cause);
+                    bg.feed.fail(reason);
+                    failed = true;
+                    false
+                }
+            }
+        });
+        if !more {
+            break;
+        }
+    }
+    if failed {
+        // joined without the GIL, dropped attached so torch frees them now
+        let untaken = bg.feed.close();
+        Python::attach(|_| drop(untaken));
+    }
+}
+
+/// Sets [`Background::exited`] however the allocator thread ends, panics included.
+struct Exited<'a>(&'a Background);
+
+impl Drop for Exited<'_> {
+    fn drop(&mut self) {
+        *self.0.exited.lock().unwrap() = true;
+        self.0.exit.notify_all();
+    }
+}
+
 /// Hands `tensor` out on the consumer's current stream, resolved before the take
 /// so it can't fail with the tensor in hand: when that isn't the allocating
 /// stream, torch must not reuse its memory before that stream is done with it.
@@ -821,7 +990,7 @@ impl PrefetchLoader {
         })?;
         let current = current_stream(py, self.device)?;
         let taken = py.detach(|| self.loader.take_tensor(idx));
-        let tensor = taken.map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))?;
+        let tensor = taken.map_err(|e| self.background.error(py, &e, format!("{name}: {e}")))?;
         hand_out(py, tensor, current, self.alloc_stream)
     }
 
@@ -835,6 +1004,7 @@ impl PrefetchLoader {
             names,
             device: slf.device,
             alloc_stream: slf.alloc_stream,
+            background: slf.background.clone(),
             _keepalive: Some(Py::from(slf).into_any()),
         }
     }
@@ -842,6 +1012,7 @@ impl PrefetchLoader {
     /// Stops the background load and releases every tensor not taken yet.
     /// Tensors already handed out keep their memory.
     pub fn close(&mut self, py: Python<'_>) {
+        self.background.halt(py);
         // dropped attached, so torch frees them now
         let untaken = py.detach(|| self.loader.close());
         drop(untaken);
@@ -859,6 +1030,12 @@ impl PrefetchLoader {
         _traceback: Py<PyAny>,
     ) {
         self.close(py);
+    }
+}
+
+impl Drop for PrefetchLoader {
+    fn drop(&mut self) {
+        Python::attach(|py| self.close(py));
     }
 }
 
@@ -1148,21 +1325,58 @@ impl Open {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
 
-        // torch allocates every tensor here, on its current stream: its allocator
-        // accounts for them and reuses their memory once dropped
+        // torch allocates the tensors on the stream current here, as the load advances:
+        // the first [`ALLOC_AHEAD`] bytes now, the rest from the allocator thread
         let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
         let mut loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
         let started = (|| -> PyResult<_> {
-            let (_, stream_raw) = current_stream(py, device_idx)?;
+            let (stream, stream_raw) = current_stream(py, device_idx)?;
             let mut alloc = Allocation::new(metas, sizes, device_idx);
-            let first = alloc.batch(py, usize::MAX).map_err(|f| f.into_pyerr(py))?;
+            let first = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
             let feed = loader.feed();
             feed.provide(first, stream_raw)
                 .map_err(|(e, _)| PyErr::from(e))?;
-            Ok(stream_raw)
+            ATEXIT_HOOK.get_or_try_init(py, || -> PyResult<()> {
+                HOOK_PID.store(std::process::id(), Ordering::Relaxed);
+                let hook = wrap_pyfunction!(halt_prefetch_loaders, py)?;
+                PyModule::import(py, intern!(py, "atexit"))?
+                    .call_method1(intern!(py, "register"), (hook,))?;
+                Ok(())
+            })?;
+            let background = Arc::new(Background {
+                stop: AtomicBool::new(false),
+                thread: Mutex::new(None),
+                feed,
+                stream: stream.unbind(),
+                stream_raw,
+                error: OnceLock::new(),
+                exited: Mutex::new(alloc.done()),
+                exit: Condvar::new(),
+            });
+            {
+                let mut live = LIVE_LOADERS.lock().unwrap();
+                // a thread started now would outlive the hook into finalization
+                let live = live.as_mut().ok_or_else(|| {
+                    SafetensorError::new_err("cannot prefetch once the interpreter exits")
+                })?;
+                live.retain(|w| w.strong_count() > 0);
+                live.push(Arc::downgrade(&background));
+            }
+            if !alloc.done() {
+                let thread = std::thread::Builder::new()
+                    .name(ALLOCATOR_THREAD.into())
+                    .spawn({
+                        let background = background.clone();
+                        move || allocate_ahead(background, alloc)
+                    })
+                    // the hook may already wait on it
+                    .inspect_err(|_| drop(Exited(&background)))?;
+                *background.thread.lock().unwrap() = Some(thread);
+            }
+            Ok((background, stream_raw))
         })();
-        let alloc_stream = match started {
+        let (background, alloc_stream) = match started {
             Ok(started) => started,
             Err(err) => {
                 let untaken = py.detach(|| loader.close());
@@ -1176,6 +1390,7 @@ impl Open {
             index_map,
             device: device_idx,
             alloc_stream,
+            background,
         })
     }
 
@@ -1794,6 +2009,7 @@ pub struct TensorStream {
     names: Vec<String>,
     device: i32,
     alloc_stream: u64,
+    background: Arc<Background>,
     _keepalive: Option<Py<PyAny>>,
 }
 
@@ -1807,7 +2023,7 @@ impl TensorStream {
         let current = current_stream(py, self.device)?;
         match py.detach(|| self.iter.next()) {
             None => Ok(None),
-            Some(Err(e)) => Err(e.into()),
+            Some(Err(e)) => Err(self.background.error(py, &e, e.to_string())),
             Some(Ok((idx, tensor))) => {
                 let tensor = hand_out(py, tensor, current, self.alloc_stream)?;
                 Ok(Some((std::mem::take(&mut self.names[idx]), tensor)))
@@ -1870,7 +2086,8 @@ impl safe_open {
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
-    /// readiness order, as tensors torch allocates at the call. The handle itself
+    /// readiness order, as tensors torch allocates as the load advances, at most
+    /// about 1 GiB ahead of the reads. The handle itself
     /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
     /// started from one handle (for instance one per device). Requires
     /// `framework="pt"`; works with either backend. Each loader runs `threads`
@@ -1890,7 +2107,9 @@ impl safe_open {
     ///
     /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
     /// slice has a step other than 1, if a sliced tensor is 0-d, or if torch can't
-    /// allocate the planned tensors.
+    /// allocate the first 1 GiB. A later allocation failure ends the load: `take`
+    /// and iteration raise, and the tensors not taken are released at once; after
+    /// any other failure they are released at `close`.
     ///
     /// Example:
     /// ```python
@@ -2055,7 +2274,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{Loader, LoaderError, Span, TensorIter};
+use crate::engine::{Feed, Loader, LoaderError, Span, TensorIter};
 
 struct Disp(Vec<TensorIndexer>);
 

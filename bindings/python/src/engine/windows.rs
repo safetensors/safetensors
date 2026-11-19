@@ -21,6 +21,12 @@ impl Display for LoaderError {
     }
 }
 
+impl LoaderError {
+    pub fn is_failure(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
@@ -39,6 +45,30 @@ impl<D> Feed<D> {
         _stream: u64,
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         Err((LoaderError, dsts))
+    }
+
+    pub fn provided(&self) -> usize {
+        0
+    }
+
+    pub fn scheduled(&self) -> usize {
+        0
+    }
+
+    pub fn stopped(&self) -> bool {
+        true
+    }
+
+    pub fn fail(&self, _reason: String) {}
+
+    pub fn wait_scheduled(&self, _scheduled: usize) {}
+
+    pub fn stop(&self) {}
+
+    pub fn halt(&self) {}
+
+    pub fn close(&self) -> Vec<D> {
+        Vec::new()
     }
 }
 

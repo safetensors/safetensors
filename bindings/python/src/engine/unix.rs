@@ -100,6 +100,13 @@ impl Display for LoaderError {
 
 impl std::error::Error for LoaderError {}
 
+impl LoaderError {
+    /// The load failed, as opposed to a tensor taken twice or a closed loader
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::WorkerFailed(_))
+    }
+}
+
 impl From<CudaError> for LoaderError {
     fn from(value: CudaError) -> Self {
         Self::Cuda(value)
@@ -240,6 +247,18 @@ impl<D> Sink<D> {
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         match self {
             Self::Cuda(sink) => sink.provide(dsts, stream),
+        }
+    }
+
+    fn provided(&self) -> usize {
+        match self {
+            Self::Cuda(sink) => sink.provided.load(Ordering::Acquire),
+        }
+    }
+
+    fn scheduled(&self, claimed: usize) -> usize {
+        match self {
+            Self::Cuda(sink) => sink.scheduled(claimed),
         }
     }
 }
@@ -578,6 +597,15 @@ impl<D> CudaSink<D> {
                 .clone()
                 .all(|c| self.chunk_completion_events[c].load(Ordering::Acquire) != 0)
     }
+
+    /// How many spans the claimed chunks reach
+    fn scheduled(&self, claimed: usize) -> usize {
+        match claimed.min(self.plan.chunks.len()) {
+            n if n == self.plan.chunks.len() => self.plan.spans.len(),
+            0 => 0,
+            n => self.plan.chunk_spans[n - 1].end,
+        }
+    }
 }
 
 impl<D> Drop for CudaSink<D> {
@@ -627,10 +655,35 @@ struct LoaderInner<D> {
     plan: Arc<LoadPlan>,
     sink: Sink<D>,
     next_chunk: AtomicUsize,
+    /// guards `next_chunk` advancing and the load stopping, so neither is missed
+    /// by a waiter on `schedule`
+    schedule_lock: Mutex<()>,
+    schedule: Condvar,
     error: OnceLock<LoaderError>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl<D> LoaderInner<D> {
+    fn signal_stop(&self) {
+        self.sink.signal_stop();
+        self.notify_schedule();
+    }
+
+    fn notify_schedule(&self) {
+        drop(self.schedule_lock.lock().unwrap());
+        self.schedule.notify_all();
+    }
+
+    /// Signals the workers and joins them; the owners stay in the sink.
+    fn halt(&self) {
+        self.signal_stop();
+        // held while joining: a concurrent halt returns once the workers are gone
+        let mut workers = self.workers.lock().unwrap();
+        for h in workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+
     fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
         self.sink
             .wait_ready(idx)
@@ -644,7 +697,6 @@ impl<D> LoaderInner<D> {
 
 pub struct Loader<D> {
     inner: Arc<LoaderInner<D>>,
-    workers: Box<[JoinHandle<()>]>,
 }
 
 /// The side of a [`Loader`] that gives its spans their destinations, see
@@ -665,6 +717,57 @@ impl<D> Feed<D> {
         stream: u64,
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         self.inner.sink.provide(dsts, stream as Stream)
+    }
+
+    /// How many spans have a destination
+    pub fn provided(&self) -> usize {
+        self.inner.sink.provided()
+    }
+
+    /// How many spans the read schedule has reached: at least the ones a
+    /// worker is reading or waiting to read
+    pub fn scheduled(&self) -> usize {
+        let claimed = self.inner.next_chunk.load(Ordering::Relaxed);
+        self.inner.sink.scheduled(claimed)
+    }
+
+    /// Whether the load stopped: closed, failed or halted
+    pub fn stopped(&self) -> bool {
+        self.inner.sink.stopped()
+    }
+
+    /// Stops the load as a worker error would: `take` of a span not loaded yet
+    /// fails with `reason`. No-op once the load stopped.
+    pub fn fail(&self, reason: String) {
+        if self.inner.sink.stopped() {
+            return;
+        }
+        let _ = self.inner.error.set(LoaderError::WorkerFailed(reason));
+        self.inner.signal_stop();
+    }
+
+    /// Waits until the read schedule is past `scheduled` spans or the load stopped
+    pub fn wait_scheduled(&self, scheduled: usize) {
+        let mut g = self.inner.schedule_lock.lock().unwrap();
+        while self.scheduled() == scheduled && !self.stopped() {
+            g = self.inner.schedule.wait(g).unwrap();
+        }
+    }
+
+    /// Stops the load without joining the workers
+    pub fn stop(&self) {
+        self.inner.signal_stop();
+    }
+
+    /// Stops the load and joins the workers; the owners stay until `close`.
+    pub fn halt(&self) {
+        self.inner.halt();
+    }
+
+    /// Stops the load, joins the workers and returns the owners not taken.
+    pub fn close(&self) -> Vec<D> {
+        self.inner.halt();
+        self.inner.sink.release()
     }
 }
 
@@ -701,6 +804,9 @@ impl<D: Send + 'static> Loader<D> {
             plan: plan.clone(),
             sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
             next_chunk: AtomicUsize::new(0),
+            schedule_lock: Mutex::new(()),
+            schedule: Condvar::new(),
+            workers: Mutex::new(Vec::with_capacity(threads)),
         });
         let workers = (0..threads)
             .map(|_| {
@@ -713,7 +819,8 @@ impl<D: Send + 'static> Loader<D> {
                 })
             })
             .collect();
-        Ok(Self { inner, workers })
+        *inner.workers.lock().unwrap() = workers;
+        Ok(Self { inner })
     }
 }
 
@@ -731,10 +838,7 @@ impl<D> Loader<D> {
 
     /// Stops loading and returns the owners not taken.
     pub fn close(&mut self) -> Vec<D> {
-        self.inner.sink.signal_stop();
-        for h in std::mem::take(&mut self.workers) {
-            let _ = h.join();
-        }
+        self.inner.halt();
         self.inner.sink.release()
     }
 
@@ -805,6 +909,7 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
             return;
         }
         let chunk_idx = loader.next_chunk.fetch_add(1, Ordering::Relaxed);
+        loader.notify_schedule();
         if chunk_idx >= loader.plan.chunks.len() {
             return;
         }
@@ -815,7 +920,7 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
             if !matches!(err, LoaderError::Closed) {
                 let _ = loader.error.set(err);
             }
-            loader.sink.signal_stop();
+            loader.signal_stop();
             return;
         }
     }

@@ -9,12 +9,14 @@ import gc
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 import numpy as np
 import torch
@@ -386,22 +388,6 @@ class PrefetchCudaTests(unittest.TestCase):
         torch.cuda.empty_cache()
         self.assertEqual(torch.cuda.memory_reserved(0), reserved)
 
-    def test_allocation_failure_at_the_call(self):
-        # torch can allocate 512 MiB more: prefetch of 4 GiB raises with torch's error
-        # as the cause and gives back what it allocated
-        path = os.path.join(self.tempdir.name, "fill.safetensors")
-        _write_u8(path, [64 * MIB] * 64, fill=False)
-        gc.collect()
-        torch.cuda.empty_cache()
-        before = torch.cuda.memory_allocated(0)
-        total = torch.cuda.get_device_properties(0).total_memory
-        torch.cuda.set_per_process_memory_fraction((before + 512 * MIB) / total, 0)
-        self.addCleanup(torch.cuda.set_per_process_memory_fraction, 1.0, 0)
-        with self.assertRaisesRegex(SafetensorError, "cannot allocate") as failure:
-            self._open(path)
-        self.assertIsInstance(failure.exception.__cause__, torch.OutOfMemoryError)
-        self.assertEqual(torch.cuda.memory_allocated(0), before)
-
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
             t = loader.take("fp32_2d")
@@ -633,6 +619,170 @@ class PrefetchCudaTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(u8.cpu(), torch.tensor([1, 2, 3], dtype=torch.uint8))
         )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
+class PrefetchAllocationTests(unittest.TestCase):
+    """Plans over the 1 GiB torch allocates at `prefetch`: the rest is allocated
+    in the background as the load advances."""
+
+    # odd sizes so chunks carry several tensors and batch ends fall inside chunks;
+    # zero-size and small tensors in every batch
+    SIZES = [
+        n
+        for k in range(200)
+        for n in (
+            (k % 7 + 1) * 3 * MIB + 17 * k,
+            0 if k % 9 == 0 else 4096 + k,
+            1 + k % 3,
+        )
+    ] + [0, 5, 0]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tempdir = tempfile.TemporaryDirectory()
+        cls.path = os.path.join(cls.tempdir.name, "pattern.safetensors")
+        _write_u8(cls.path, cls.SIZES)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tempdir.cleanup()
+
+    def _check(self, sd):
+        self.assertEqual(len(sd), len(self.SIZES))
+        for i, n in enumerate(self.SIZES):
+            t = sd[f"t{i}"]
+            self.assertEqual(t.numel(), n, i)
+            if n:
+                self.assertTrue(torch.equal(t, _pattern(i, n)), f"t{i} ({n} bytes)")
+
+    def _fill_device_at(self, extra):
+        # torch can allocate `extra` bytes more on cuda:0
+        gc.collect()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_allocated(0)
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction((before + extra) / total, 0)
+        self.addCleanup(torch.cuda.set_per_process_memory_fraction, 1.0, 0)
+        return before
+
+    def test_bytes_land_across_batches(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info(0)[0] < 9 * GIB:
+            self.skipTest("needs 9 GiB free on cuda:0")
+        for threads in (1, 8, 32):
+            for how in ("iterate", "take", "take reversed"):
+                with self.subTest(threads=threads, how=how):
+                    # torch's cache holds 0xFF where the tensors go: a missed copy shows
+                    torch.full((6 * GIB,), 255, dtype=torch.uint8, device="cuda:0")
+                    with (
+                        safe_open(self.path, framework="pt") as f,
+                        f.prefetch(device="cuda:0", threads=threads) as loader,
+                    ):
+                        names = loader.names()
+                        if how == "iterate":
+                            sd = dict(loader)
+                        else:
+                            order = names[::-1] if how == "take reversed" else names
+                            sd = {n: loader.take(n) for n in order}
+                    torch.cuda.synchronize()
+                    self._check(sd)
+                    del sd
+
+    def test_allocator_thread_uses_the_callers_stream(self):
+        # every block holding a tensor comes from the stream current at prefetch,
+        # including the background ones; hand-out on that stream records nothing
+        side = torch.cuda.Stream(device=0)
+        gc.collect()
+        torch.cuda.empty_cache()
+        with torch.cuda.stream(side):
+            with (
+                safe_open(self.path, framework="pt") as f,
+                f.prefetch(device="cuda:0") as loader,
+            ):
+                with mock.patch.object(torch.Tensor, "record_stream") as record:
+                    sd = dict(loader)
+                record.assert_not_called()
+        ptrs = {t.data_ptr() for t in sd.values() if t.numel()}
+        streams = set()
+        for seg in torch.cuda.memory_snapshot():
+            addr = seg["address"]
+            if any(addr <= p < addr + seg["total_size"] for p in ptrs):
+                streams.add(seg["stream"])
+        self.assertEqual(streams, {side.cuda_stream})
+        torch.cuda.synchronize()
+        self._check(sd)
+
+    def test_footprint_follows_the_load(self):
+        gc.collect()
+        before = torch.cuda.memory_allocated(0)
+        with (
+            safe_open(self.path, framework="pt") as f,
+            f.prefetch(device="cuda:0", threads=1) as loader,
+        ):
+            first = torch.cuda.memory_allocated(0) - before
+            sd = dict(loader)
+            # torch's blocks, or more where it doesn't split off a small remainder
+            rounded = sum(-(-n // 512) * 512 for n in self.SIZES)
+            self.assertGreaterEqual(torch.cuda.memory_allocated(0) - before, rounded)
+        self.assertGreaterEqual(first, GIB)
+        # the allocator thread may have topped up already, far from all of it
+        self.assertLess(first, 2 * GIB)
+        del sd
+        gc.collect()
+        self.assertEqual(torch.cuda.memory_allocated(0), before)
+
+    def test_prefetch_after_the_exit_hook_raises(self):
+        # a loader started once the `atexit` hook ran would keep its allocator
+        # thread into finalization
+        path = os.path.join(self.tempdir.name, "exit.safetensors")
+        _write_u8(path, [MIB])
+        script = (
+            "import atexit, sys, torch\n"
+            "from safetensors import safe_open\n"
+            "f = safe_open(sys.argv[1], framework='pt')\n"
+            "f.prefetch(device='cuda:0').close()\n"
+            "atexit._run_exitfuncs()\n"
+            "try:\n"
+            "    f.prefetch(device='cuda:0')\n"
+            "except Exception as e:\n"
+            "    assert 'interpreter exits' in str(e), e\n"
+            "else:\n"
+            "    raise AssertionError('prefetch started')\n"
+        )
+        subprocess.run([sys.executable, "-c", script, path], check=True)
+
+    def test_first_batch_must_fit(self):
+        path = os.path.join(self.tempdir.name, "first.safetensors")
+        _write_u8(path, [64 * MIB] * 64, fill=False)
+        before = self._fill_device_at(512 * MIB)
+        with self.assertRaisesRegex(SafetensorError, "cannot allocate") as failure:
+            safe_open(path, framework="pt").prefetch(device="cuda:0")
+        self.assertIsInstance(failure.exception.__cause__, torch.OutOfMemoryError)
+        self.assertEqual(torch.cuda.memory_allocated(0), before)
+
+    def test_allocation_failure_ends_the_load(self):
+        # the device fills after the first batch: tensors taken before stay, later
+        # takes raise with torch's error as the cause once the loader released the
+        # tensors not taken, without waiting for close
+        path = os.path.join(self.tempdir.name, "fill.safetensors")
+        _write_u8(path, [64 * MIB] * 64, fill=False)
+        before = self._fill_device_at(2 * GIB)
+        loader = safe_open(path, framework="pt").prefetch(device="cuda:0")
+        taken = []
+        with self.assertRaisesRegex(SafetensorError, "cannot allocate") as failure:
+            for name in loader.names():
+                taken.append(loader.take(name))
+        self.assertIsInstance(failure.exception.__cause__, torch.OutOfMemoryError)
+        self.assertGreater(len(taken), 0)
+        held = before + len(taken) * 64 * MIB
+        self.assertEqual(torch.cuda.memory_allocated(0), held)
+        with self.assertRaises(SafetensorError) as again:
+            dict(loader)
+        self.assertIsInstance(again.exception.__cause__, torch.OutOfMemoryError)
+        loader.close()
+        self.assertEqual(torch.cuda.memory_allocated(0), held)
 
 
 if __name__ == "__main__":

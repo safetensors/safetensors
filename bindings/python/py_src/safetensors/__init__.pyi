@@ -254,10 +254,11 @@ class safe_open:
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
         iterating it as `(name, tensor)` pairs in readiness order, as tensors torch allocates
-        at the call. The handle itself is unchanged: its header queries and `get_slice`
-        keep working, and several loaders can be started from one handle (for instance one
-        per device). Requires `framework="pt"`; works with either backend. Each loader runs
-        `threads` reader threads; all loaders in the process share one pinned staging pool.
+        as the load advances, at most about 1 GiB ahead of the reads. The handle itself is
+        unchanged: its header queries and `get_slice` keep working, and several loaders can be
+        started from one handle (for instance one per device). Requires `framework="pt"`; works
+        with either backend. Each loader runs `threads` reader threads; all loaders in the
+        process share one pinned staging pool.
 
         Args:
             plan (`Dict[str, Optional[slice]]`, *optional*):
@@ -272,7 +273,9 @@ class safe_open:
 
         Raises if a planned tensor has a dtype torch cannot represent (F6), if a
         slice has a step other than 1, if a sliced tensor is 0-d, or if torch can't
-        allocate the planned tensors.
+        allocate the first 1 GiB. A later allocation failure ends the load: `take`
+        and iteration raise, and the tensors not taken are released at once; after
+        any other failure they are released at `close`.
         """
         pass
 
