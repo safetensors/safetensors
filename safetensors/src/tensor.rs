@@ -364,7 +364,6 @@ fn buffered_write_to_file<V: View>(
     n: u64,
     header_bytes: &[u8],
     tensors: &[V],
-    total_size: usize,
 ) -> Result<(), SafeTensorError> {
     let path = path.as_ref();
     let write = |file: &std::fs::File| -> std::io::Result<()> {
@@ -389,8 +388,7 @@ fn buffered_write_to_file<V: View>(
         f.flush()
     };
 
-    // A new file is written in place: object store mounts refuse renames. It
-    // is not preallocated, so that a save cut short leaves a file too short to load.
+    // A new file is written in place: object store mounts refuse renames.
     match std::fs::File::options()
         .write(true)
         .create_new(true)
@@ -410,8 +408,6 @@ fn buffered_write_to_file<V: View>(
     // truncated under any mmap of it (e.g. tensors returned by `load_file`).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let (file, temp) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
-    // A hint: some filesystems refuse it.
-    let _ = file.set_len(total_size as u64);
     let written = write(&file);
     // Closed before `temp` is renamed or removed: some filesystems can't remove
     // an open file.
@@ -438,17 +434,12 @@ where
 {
     let (
         PreparedData {
-            n,
-            header_bytes,
-            offset,
-            ..
+            n, header_bytes, ..
         },
         tensors,
     ) = prepare(data, data_info)?;
 
-    let total_size = N_LEN + header_bytes.len() + offset;
-
-    buffered_write_to_file(filename, n, &header_bytes, &tensors, total_size)?;
+    buffered_write_to_file(filename, n, &header_bytes, &tensors)?;
 
     Ok(())
 }
