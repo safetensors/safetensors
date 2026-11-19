@@ -61,6 +61,10 @@ impl<D> Feed<D> {
 
     pub fn fail(&self, _reason: String) {}
 
+    pub fn wait_scheduled(&self, _scheduled: usize) {}
+
+    pub fn stop(&self) {}
+
     pub fn halt(&self) {}
 
     pub fn close(&self) -> Vec<D> {

@@ -655,14 +655,28 @@ struct LoaderInner<D> {
     plan: Arc<LoadPlan>,
     sink: Sink<D>,
     next_chunk: AtomicUsize,
+    /// guards `next_chunk` advancing and the load stopping, so neither is missed
+    /// by a waiter on `schedule`
+    schedule_lock: Mutex<()>,
+    schedule: Condvar,
     error: OnceLock<LoaderError>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl<D> LoaderInner<D> {
+    fn signal_stop(&self) {
+        self.sink.signal_stop();
+        self.notify_schedule();
+    }
+
+    fn notify_schedule(&self) {
+        drop(self.schedule_lock.lock().unwrap());
+        self.schedule.notify_all();
+    }
+
     /// Signals the workers and joins them; the owners stay in the sink.
     fn halt(&self) {
-        self.sink.signal_stop();
+        self.signal_stop();
         // held while joining: a concurrent halt returns once the workers are gone
         let mut workers = self.workers.lock().unwrap();
         for h in workers.drain(..) {
@@ -729,7 +743,20 @@ impl<D> Feed<D> {
             return;
         }
         let _ = self.inner.error.set(LoaderError::WorkerFailed(reason));
-        self.inner.sink.signal_stop();
+        self.inner.signal_stop();
+    }
+
+    /// Waits until the read schedule is past `scheduled` spans or the load stopped
+    pub fn wait_scheduled(&self, scheduled: usize) {
+        let mut g = self.inner.schedule_lock.lock().unwrap();
+        while self.scheduled() == scheduled && !self.stopped() {
+            g = self.inner.schedule.wait(g).unwrap();
+        }
+    }
+
+    /// Stops the load without joining the workers
+    pub fn stop(&self) {
+        self.inner.signal_stop();
     }
 
     /// Stops the load and joins the workers; the owners stay until `close`.
@@ -777,6 +804,8 @@ impl<D: Send + 'static> Loader<D> {
             plan: plan.clone(),
             sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
             next_chunk: AtomicUsize::new(0),
+            schedule_lock: Mutex::new(()),
+            schedule: Condvar::new(),
             workers: Mutex::new(Vec::with_capacity(threads)),
         });
         let workers = (0..threads)
@@ -880,6 +909,7 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
             return;
         }
         let chunk_idx = loader.next_chunk.fetch_add(1, Ordering::Relaxed);
+        loader.notify_schedule();
         if chunk_idx >= loader.plan.chunks.len() {
             return;
         }
@@ -890,7 +920,7 @@ fn worker<D>(loader: Arc<LoaderInner<D>>) {
             if !matches!(err, LoaderError::Closed) {
                 let _ = loader.error.set(err);
             }
-            loader.sink.signal_stop();
+            loader.signal_stop();
             return;
         }
     }

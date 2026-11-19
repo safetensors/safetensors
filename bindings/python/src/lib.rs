@@ -30,7 +30,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -812,7 +811,8 @@ struct Background {
 }
 
 impl Background {
-    /// Stops and joins the allocator thread, then the workers, without the GIL.
+    /// Stops the load and joins the allocator thread, then the workers, without
+    /// the GIL.
     /// The tensors not taken stay with the loader.
     fn halt(&self, py: Python<'_>) {
         self.stop.store(true, Ordering::Release);
@@ -821,6 +821,8 @@ impl Background {
         // returns on its own once it sees `stop`
         let thread = thread.filter(|t| t.thread().id() != std::thread::current().id());
         py.detach(|| {
+            // wakes the allocator thread
+            self.feed.stop();
             if let Some(thread) = thread {
                 let _ = thread.join();
             }
@@ -886,9 +888,10 @@ fn allocate_ahead(background: Arc<Background>, mut alloc: Allocation) {
         if bg.stop.load(Ordering::Acquire) || bg.feed.stopped() {
             return;
         }
-        let target = alloc.before[bg.feed.scheduled()] + ALLOC_AHEAD;
+        let scheduled = bg.feed.scheduled();
+        let target = alloc.before[scheduled] + ALLOC_AHEAD;
         if alloc.before[bg.feed.provided()] >= target {
-            std::thread::sleep(Duration::from_millis(1));
+            bg.feed.wait_scheduled(scheduled);
             continue;
         }
         let more = Python::attach(|py| {
