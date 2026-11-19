@@ -40,6 +40,8 @@ pub enum InvalidSlice {
         /// The rank of the dimension
         dim_index: usize,
     },
+    /// The size in bits of the tensor given to [`slice_layout`] overflows `usize`
+    ShapeOverflow,
 }
 
 impl Display for InvalidSlice {
@@ -69,6 +71,9 @@ impl Display for InvalidSlice {
             }
             InvalidSlice::SteppedSlice { dim_index } => {
                 write!(f, "the slice of tensor dimension #{dim_index} has a step, which slice layouts do not support")
+            }
+            InvalidSlice::ShapeOverflow => {
+                write!(f, "the size of the tensor in bits overflows usize")
             }
         }
     }
@@ -575,6 +580,10 @@ pub fn slice_layout(
             gather: None,
         });
     }
+    // no dimension is empty here, so every offset below is at most the tensor's size in bits
+    dims.iter()
+        .try_fold(dtype.bitsize(), |bits, (dim, _)| bits.checked_mul(*dim))
+        .ok_or(InvalidSlice::ShapeOverflow)?;
 
     for i in (1..dims.len()).rev() {
         if matches!(dims[i].1.as_slice(), [r] if r.start == 0 && r.end == dims[i].0) {
@@ -950,6 +959,15 @@ mod layout_tests {
             slice_layout(u8, &[260, 260], &[every_other.clone(), every_other]),
             Err(InvalidSlice::TooFragmented { copies: 16_900 })
         );
+        assert_eq!(
+            slice_layout(
+                u8,
+                &[2, usize::MAX / 8, 16],
+                &[vec![(0..1).into()], vec![(0..1).into(), (2..3).into()]]
+            ),
+            Err(InvalidSlice::ShapeOverflow)
+        );
+        assert!(slice_layout(u8, &[0, usize::MAX, usize::MAX], &[]).is_ok());
     }
 
     fn arbitrary_slice() -> impl Strategy<Value = (Dtype, Vec<usize>, Vec<Vec<TensorIndexer>>)> {
