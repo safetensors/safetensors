@@ -367,24 +367,20 @@ fn buffered_write_to_file<V: View>(
     total_size: usize,
 ) -> Result<(), SafeTensorError> {
     let path = path.as_ref();
-    // Write to a sibling tempfile then rename, so an existing `path` is never
-    // truncated under any mmap of it (e.g. tensors returned by `load_file`).
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    let write = |file: &std::fs::File| -> std::io::Result<()> {
+        // A hint: some filesystems refuse it, object store mounts among them.
+        let _ = file.set_len(total_size as u64);
 
-    temp.as_file().set_len(total_size as u64)?;
+        // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
+        // This yields ~30% performance improvement.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use std::os::fd::AsRawFd;
 
-    // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
-    // This yields ~30% performance improvement.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        use std::os::fd::AsRawFd;
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
 
-        libc::fcntl(temp.as_file().as_raw_fd(), libc::F_NOCACHE, 1);
-    }
-
-    {
-        let mut f = std::io::BufWriter::with_capacity(1024 * 1024, temp.as_file());
+        let mut f = std::io::BufWriter::with_capacity(1024 * 1024, file);
 
         f.write_all(n.to_le_bytes().as_ref())?;
         f.write_all(header_bytes)?;
@@ -393,9 +389,34 @@ fn buffered_write_to_file<V: View>(
             f.write_all(tensor.data().as_ref())?;
         }
 
-        f.flush()?;
+        f.flush()
+    };
+
+    // A new file is written in place: object store mounts refuse renames.
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            return write(&file).map_err(|e| {
+                let _ = std::fs::remove_file(path);
+                e.into()
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
     }
 
+    // An existing `path` is replaced by a sibling tempfile, so it is never
+    // truncated under any mmap of it (e.g. tensors returned by `load_file`).
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (file, temp) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
+    let written = write(&file);
+    // Closed before `temp` is renamed or removed: some filesystems can't remove
+    // an open file.
+    drop(file);
+    written?;
     temp.persist(path).map_err(|e| e.error)?;
 
     Ok(())
