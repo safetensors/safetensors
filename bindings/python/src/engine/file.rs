@@ -127,15 +127,15 @@ impl Sink for DirectFile {
 /// removed if dropped before
 #[cfg(target_os = "linux")]
 struct TempFile {
-    file: Arc<File>,
     path: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl TempFile {
     /// `.tmp` and 6 random letters or digits, in the directory of `path`,
-    /// readable and writable by its owner only
-    fn beside(path: &Path) -> std::io::Result<Self> {
+    /// readable and writable by its owner only. Some filesystems can't remove an
+    /// open file: drop the file first.
+    fn beside(path: &Path) -> std::io::Result<(Self, Arc<File>)> {
         use std::{hash::BuildHasher, os::unix::fs::OpenOptionsExt};
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let dir = match path.parent() {
@@ -160,12 +160,7 @@ impl TempFile {
                 .mode(0o600)
                 .open(&temp);
             match opened {
-                Ok(file) => {
-                    return Ok(Self {
-                        file: Arc::new(file),
-                        path: Some(temp),
-                    })
-                }
+                Ok(file) => return Ok((Self { path: Some(temp) }, Arc::new(file))),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 1 << 16 => {
                     attempts += 1;
                 }
@@ -192,6 +187,7 @@ impl Drop for TempFile {
 
 /// Writes the `size` bytes `from` holds to a new file, which replaces `path`
 /// once complete: a mapping of a previous `path` keeps its bytes.
+/// Writes `size` bytes from `from` to `path`, replacing it once complete.
 #[cfg(target_os = "linux")]
 pub(super) fn write_file(
     path: &Path,
@@ -200,17 +196,45 @@ pub(super) fn write_file(
     pool: &Arc<SlabPool>,
     threads: usize,
 ) -> Result<(), Error> {
-    let temp = TempFile::beside(path)?;
-    let to = DirectFile::create(temp.file.clone(), size)?;
     let chunk = CHUNK_SIZE.get() as u64;
-    let chunks = (0..size.div_ceil(chunk))
-        .map(|c| c * chunk..((c + 1) * chunk).min(size))
-        .collect();
-    transfer(Plan::new(chunks), from, &to, pool, threads)?;
-    // drops the padding of a direct write
-    temp.file.set_len(size)?;
-    temp.persist(path)?;
-    Ok(())
+    let chunks = || -> Box<[Range<u64>]> {
+        (0..size.div_ceil(chunk))
+            .map(|c| c * chunk..((c + 1) * chunk).min(size))
+            .collect()
+    };
+    let replaced = (|| {
+        let (temp, file) = TempFile::beside(path)?;
+        let to = DirectFile::create(file.clone(), size)?;
+        transfer(Plan::new(chunks()), from, &to, pool, threads)?;
+        // drops the padding of a direct write
+        file.set_len(size)?;
+        temp.persist(path)?;
+        Ok(())
+    })();
+    match replaced {
+        // Object store mounts only take a new file written front to back: no
+        // truncation, rename or write at an offset.
+        Err(Error::Io(e)) if refused(&e) && !path.exists() => {
+            let file = File::options().write(true).create_new(true).open(path)?;
+            let to = DirectFile {
+                file: Arc::new(file),
+                direct: None,
+                size,
+            };
+            transfer(Plan::new(chunks()), from, &to, pool, 1).inspect_err(|_| {
+                let _ = std::fs::remove_file(path);
+            })
+        }
+        replaced => replaced,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refused(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM | libc::EINVAL)
+    )
 }
 
 impl Source for DirectFile {
