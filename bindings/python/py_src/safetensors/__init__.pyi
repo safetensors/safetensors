@@ -43,17 +43,10 @@ def serialize(
     """
     Serializes raw data.
 
-    NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
-    and stays alive for the duration of the serialization.
-    We will remove the need for the caller to hold references themselves when we drop support for
-    python versions prior to 3.11 where the `PyBuffer` API is available.
-    Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
-    increasing its ref count preventing the gc from collecting it while we serialize.
-
     Args:
         tensor_dict (`Dict[str, TensorSpec]`):
             Mapping of tensor name to its `TensorSpec`, e.g.:
-                {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
+                {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data=array)}
         metadata (`Dict[str, str]`, *optional*):
             The optional purely text annotations
 
@@ -72,17 +65,10 @@ def serialize_file(
     """
     Serializes raw data into file.
 
-    NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
-    and stays alive for the duration of the serialization.
-    We will remove the need for the caller to hold references themselves when we drop support for
-    python versions prior to 3.11 where the `PyBuffer` API is available.
-    Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
-    increasing its ref count preventing the gc from collecting it while we serialize.
-
     Args:
         tensor_dict (`Dict[str, TensorSpec]`):
             Mapping of tensor name to its `TensorSpec`, e.g.:
-                {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
+                {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data=array)}
         filename (`str`, or `os.PathLike`):
             The name of the file to write into.
         metadata (`Dict[str, str]`, *optional*):
@@ -98,7 +84,7 @@ class TensorSpec:
     """
     Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 
-    Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
+    Constructed from Python as `TensorSpec(dtype, shape, data)`.
     The dtype string is validated at construction; an unknown dtype raises
     immediately rather than failing further inside the serializer.
 
@@ -109,17 +95,17 @@ class TensorSpec:
     transparently doubles the last dimension so `spec.shape` always reflects
     the logical element count.
 
-    SAFETY: `data_ptr` is a raw memory address. The caller must ensure the
-    underlying buffer stays alive for the duration of every `serialize` /
-    `serialize_file` call that consumes this spec.
+    `data` is an object exposing the tensor's bytes through the buffer protocol
+    (e.g. a numpy array, `bytes` or a `memoryview`): C-contiguous, in
+    little-endian order, as many bytes as `dtype` and `shape` take. The spec
+    holds the buffer, which keeps the memory alive until the spec is dropped.
     """
     def __init__(
         self,
         *,
         dtype: str,
         shape: Sequence[int],
-        data_ptr: int,
-        data_len: int,
+        data: Any,
     ) -> None:
         pass
 
@@ -127,13 +113,6 @@ class TensorSpec:
     def data_len(self) -> int:
         """
         The length of the tensor's buffer in bytes.
-        """
-        pass
-
-    @property
-    def data_ptr(self) -> int:
-        """
-        The raw memory address of the tensor's contiguous buffer.
         """
         pass
 
