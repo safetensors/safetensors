@@ -368,9 +368,6 @@ fn buffered_write_to_file<V: View>(
 ) -> Result<(), SafeTensorError> {
     let path = path.as_ref();
     let write = |file: &std::fs::File| -> std::io::Result<()> {
-        // A hint: some filesystems refuse it, object store mounts among them.
-        let _ = file.set_len(total_size as u64);
-
         // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
         // This yields ~30% performance improvement.
         #[cfg(target_os = "macos")]
@@ -392,7 +389,8 @@ fn buffered_write_to_file<V: View>(
         f.flush()
     };
 
-    // A new file is written in place: object store mounts refuse renames.
+    // A new file is written in place: object store mounts refuse renames. It
+    // is not preallocated, so that a save cut short leaves a file too short to load.
     match std::fs::File::options()
         .write(true)
         .create_new(true)
@@ -412,6 +410,8 @@ fn buffered_write_to_file<V: View>(
     // truncated under any mmap of it (e.g. tensors returned by `load_file`).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let (file, temp) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
+    // A hint: some filesystems refuse it.
+    let _ = file.set_len(total_size as u64);
     let written = write(&file);
     // Closed before `temp` is renamed or removed: some filesystems can't remove
     // an open file.
