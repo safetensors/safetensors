@@ -388,6 +388,101 @@ class PrefetchCudaTests(unittest.TestCase):
         torch.cuda.empty_cache()
         self.assertEqual(torch.cuda.memory_reserved(0), reserved)
 
+    def test_one_device_allocation_per_load(self):
+        # 16 tensors over 10 MiB would be 16 cudaMallocs; the warm-up makes it one
+        mib = 2**20
+        path = os.path.join(self.tempdir.name, "many.safetensors")
+        save_file({f"t{i}": torch.zeros(4 * mib) for i in range(16)}, path)
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_stats(0)["segment.all.allocated"]
+        with self._open(path) as loader:
+            held = dict(loader)
+            segments = torch.cuda.memory_stats(0)["segment.all.allocated"] - before
+        self.assertEqual(len(held), 16)
+        self.assertLessEqual(segments, 1)
+
+    def test_warm_pieces_are_bounded(self):
+        # 12 x 64 MiB warm up as 3 pieces of 256 MiB: a tensor kept pins one piece
+        path = os.path.join(self.tempdir.name, "pieces.safetensors")
+        _write_u8(path, [64 * MIB] * 12, fill=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        segments = torch.cuda.memory_stats(0)["segment.all.allocated"]
+        reserved = torch.cuda.memory_reserved(0)
+        with self._open(path) as loader:
+            sd = dict(loader)
+        self.assertEqual(
+            torch.cuda.memory_stats(0)["segment.all.allocated"] - segments, 3
+        )
+        kept = sd["t5"]
+        del sd
+        torch.cuda.empty_cache()
+        self.assertLessEqual(torch.cuda.memory_reserved(0) - reserved, 256 * MIB)
+        del kept
+
+    def test_no_warm_up_past_free_memory(self):
+        # the tensors fit in torch's cache, their warm block not on the device: torch
+        # would flush the cache to retry it
+        path = os.path.join(self.tempdir.name, "full.safetensors")
+        _write_u8(path, [16 * MIB] * 8, fill=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        cached = [
+            torch.empty(16 * MIB, dtype=torch.uint8, device="cuda:0") for _ in range(8)
+        ]
+        del cached
+        free = torch.cuda.mem_get_info(0)[0]
+        hog = torch.empty(free - 64 * MIB, dtype=torch.uint8, device="cuda:0")
+        retries = torch.cuda.memory_stats(0)["num_alloc_retries"]
+        with self._open(path) as loader:
+            sd = dict(loader)
+        self.assertEqual(torch.cuda.memory_stats(0)["num_alloc_retries"], retries)
+        self.assertEqual(len(sd), 8)
+        del sd, hog
+
+    def test_reload_on_a_used_cache(self):
+        # one warm block per load would reserve 1280 MiB here
+        a = os.path.join(self.tempdir.name, "a.safetensors")
+        b = os.path.join(self.tempdir.name, "b.safetensors")
+        _write_u8(a, [64 * MIB] * 8, fill=False)
+        _write_u8(b, [64 * MIB] * 12, fill=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved(0)
+        with self._open(a) as loader:
+            sd = dict(loader)
+        del sd
+        with self._open(b) as loader:
+            sd = dict(loader)
+        self.assertLessEqual(torch.cuda.memory_reserved(0) - reserved, GIB)
+
+    def _in_a_fresh_process(self, check, env=None):
+        # torch reads its allocator settings once per process
+        path = os.path.join(self.tempdir.name, "fresh.safetensors")
+        _write_u8(path, [16 * MIB] * 16, fill=False)
+        script = (
+            "import sys, torch\n"
+            "from safetensors import safe_open\n"
+            "with safe_open(sys.argv[1], framework='pt') as f:\n"
+            "    with f.prefetch(device='cuda:0') as loader:\n"
+            "        sd = dict(loader)\n" + check
+        )
+        subprocess.run([sys.executable, "-c", script, path], check=True, env=env)
+
+    def test_warm_up_in_a_fresh_process(self):
+        self._in_a_fresh_process(
+            "n = torch.cuda.memory_stats(0)['segment.all.allocated']\n"
+            "assert n <= 2, n\n"
+        )
+
+    def test_max_split_size(self):
+        conf = "max_split_size_mb:64"
+        self._in_a_fresh_process(
+            "gap = torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)\n"
+            "assert gap < 16 * 2**20, gap\n",
+            dict(os.environ, PYTORCH_CUDA_ALLOC_CONF=conf, PYTORCH_ALLOC_CONF=conf),
+        )
+
     def test_plan_empty_rows(self):
         with self._open(plan={"fp32_2d": slice(2, 2)}) as loader:
             t = loader.take("fp32_2d")
