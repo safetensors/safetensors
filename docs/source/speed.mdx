@@ -57,6 +57,8 @@ The currently shown speedup was gotten on:
 * OS: Ubuntu 18.04.6 LTS
 * CPU: Intel(R) Xeon(R) CPU @ 2.00GHz
 
+On Linux, `load_file(filename, backend="pread")` reads the file into new CPU tensors with several threads. Setting up the tensors' memory page by page then becomes a large part of the time, which transparent huge pages cut down. If `/sys/kernel/mm/transparent_hugepage/enabled` is `always` or `madvise`, starting Python with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` gives large tensors huge pages: loading a 32 GiB file this way went from 23 GB/s to 34 GB/s with the file not in the page cache, and from 20 GB/s to 27 GB/s with it cached.
+
 
 ### GPU benchmark
 
