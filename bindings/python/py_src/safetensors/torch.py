@@ -218,7 +218,7 @@ def _tensors_overlap(t1: torch.Tensor, t2: torch.Tensor, max_exact_numel: int = 
         return _solve_1d_byte_overlap(o1, n1, s1, w1, o2, n2, s2, w2)
 
     # Tier 4: Exact element byte-address checking for small bounded tensors
-    if min(t1.numel(), t2.numel()) <= max_exact_numel:
+    if max(t1.numel(), t2.numel()) <= max_exact_numel:
         if t1.numel() <= t2.numel():
             small_t, small_o, small_w = t1, o1, w1
             large_t, large_o, large_w = t2, o2, w2

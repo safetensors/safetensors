@@ -588,3 +588,77 @@ class TorchModelTestCase(unittest.TestCase):
                 metadata = f.metadata()
                 self.assertEqual(metadata.get("even"), "base")
                 self.assertEqual(metadata.get("odd"), "base")
+
+    def test_exact_overlap_work_budget_and_bounds(self):
+        import safetensors.torch as st_module
+
+        def count_product_iterations(fn, *args, **kwargs):
+            orig_product = st_module.itertools.product
+            visited = 0
+
+            def counted(*p_args, **p_kwargs):
+                nonlocal visited
+                for item in orig_product(*p_args, **p_kwargs):
+                    visited += 1
+                    yield item
+
+            st_module.itertools.product = counted
+            try:
+                res = fn(*args, **kwargs)
+            finally:
+                st_module.itertools.product = orig_product
+            return res, visited
+
+        # 1. Reviewer-identified unbounded-work scenario (256x256 non-flattenable vs 1-element slice)
+        raw = torch.empty(131326, dtype=torch.uint8)
+        large = raw.as_strided((256, 256), (513, 2))  # 65,536 elements, cannot flatten to 1D
+
+        for offset in [511, 131325]:
+            small = raw[offset : offset + 1]  # 1 element
+            for reverse in [False, True]:
+                left, right = (large, small) if reverse else (small, large)
+                # With max(numel1, numel2) <= max_exact_numel, large tensor exceeds 5000,
+                # so Tier 4 is bypassed entirely (0 product iterations), falling back to Tier 5 conservative True.
+                overlap, visited = count_product_iterations(_tensors_overlap, left, right, max_exact_numel=5000)
+                self.assertLessEqual(visited, 10000)
+                self.assertEqual(visited, 0)
+                self.assertTrue(overlap)
+
+        # 2. Inputs below exact-check bound (both tensors <= max_exact_numel)
+        raw_50 = torch.empty(50, dtype=torch.uint8)
+        t1 = raw_50.as_strided((2, 2), (5, 2))
+        t2_disjoint = raw_50[1:].as_strided((2, 2), (5, 2))
+        t2_overlap = raw_50[2:].as_strided((2, 2), (5, 2))
+        o_d, v_d = count_product_iterations(_tensors_overlap, t1, t2_disjoint, max_exact_numel=10)
+        self.assertFalse(o_d)
+        self.assertEqual(v_d, 8)
+        o_o, v_o = count_product_iterations(_tensors_overlap, t1, t2_overlap, max_exact_numel=10)
+        self.assertTrue(o_o)
+        self.assertEqual(v_o, 5)
+
+        # 3. Inputs at the boundary (numel == max_exact_numel)
+        o_at, v_at = count_product_iterations(_tensors_overlap, t1, t2_disjoint, max_exact_numel=4)
+        self.assertFalse(o_at)
+        self.assertEqual(v_at, 8)
+
+        # 4. Inputs exceeding the bound (numel == max_exact_numel + 1)
+        o_ex, v_ex = count_product_iterations(_tensors_overlap, t1, t2_disjoint, max_exact_numel=3)
+        self.assertTrue(o_ex)
+        self.assertEqual(v_ex, 0)
+
+        # 5. Unequal tensor sizes (both below bound vs one exceeding bound)
+        t_large10 = raw_50.as_strided((2, 5), (7, 2))
+        _, v_u_below = count_product_iterations(_tensors_overlap, t1, t_large10, max_exact_numel=15)
+        self.assertGreater(v_u_below, 0)
+        o_u_ex, v_u_ex = count_product_iterations(_tensors_overlap, t1, t_large10, max_exact_numel=8)
+        self.assertTrue(o_u_ex)
+        self.assertEqual(v_u_ex, 0)
+
+        # 6. Zero-sized tensors (numel == 0 returns False before Tier 1 without product iterations)
+        t_zero = raw_50[:0]
+        o_z1, v_z1 = count_product_iterations(_tensors_overlap, t_zero, t1, max_exact_numel=100)
+        self.assertFalse(o_z1)
+        self.assertEqual(v_z1, 0)
+        o_z2, v_z2 = count_product_iterations(_tensors_overlap, t1, t_zero, max_exact_numel=100)
+        self.assertFalse(o_z2)
+        self.assertEqual(v_z2, 0)
