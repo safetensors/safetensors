@@ -79,6 +79,7 @@ impl<D> Loader<D> {
         _device: i32,
         _threads: usize,
         _spans: Vec<Span>,
+        _gathers: Vec<Option<safetensors::slice::Gather>>,
     ) -> Result<Self, LoaderError> {
         Err(LoaderError)
     }
