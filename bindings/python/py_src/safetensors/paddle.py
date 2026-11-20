@@ -301,7 +301,6 @@ def _flatten(
         flattened[k] = TensorSpec(
             dtype=str(v.dtype).split(".")[-1],
             shape=v.shape,
-            data_ptr=arr.ctypes.data,
-            data_len=arr.nbytes,
+            data=arr.view(np.uint8),
         )
     return flattened

@@ -9,6 +9,7 @@ mod engine;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
+use pyo3::buffer::PyUntypedBuffer;
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::{OnceLockExt, PyOnceLock};
@@ -42,7 +43,7 @@ static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
 
 /// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 ///
-/// Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
+/// Constructed from Python as `TensorSpec(dtype, shape, data)`.
 /// The dtype string is validated at construction; an unknown dtype raises
 /// immediately rather than failing further inside the serializer.
 ///
@@ -53,23 +54,22 @@ static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
 /// transparently doubles the last dimension so `spec.shape` always reflects
 /// the logical element count.
 ///
-/// SAFETY: `data_ptr` is a raw memory address. The caller must ensure the
-/// underlying buffer stays alive for the duration of every `serialize` /
-/// `serialize_file` call that consumes this spec.
-#[pyclass(frozen, from_py_object)]
-#[derive(Clone, Debug)]
+/// `data` is an object exposing the tensor's bytes through the buffer protocol
+/// (e.g. a numpy array, `bytes` or a `memoryview`): C-contiguous, in
+/// little-endian order, as many bytes as `dtype` and `shape` take. The spec
+/// holds the buffer, which keeps the memory alive until the spec is dropped.
+#[pyclass(frozen)]
 struct TensorSpec {
     dtype: Dtype,
     shape: Vec<usize>,
-    data_ptr: u64,
-    data_len: usize,
+    data: PyUntypedBuffer,
 }
 
 #[pymethods]
 impl TensorSpec {
     #[new]
-    #[pyo3(signature = (*, dtype, shape, data_ptr, data_len))]
-    fn new(dtype: &str, shape: Vec<usize>, data_ptr: u64, data_len: usize) -> PyResult<Self> {
+    #[pyo3(signature = (*, dtype, shape, data))]
+    fn new(dtype: &str, shape: Vec<usize>, data: &PyBound<'_, PyAny>) -> PyResult<Self> {
         let dtype = parse_dtype_str(dtype)?;
         let mut shape = shape;
         // F4 packs two elements per byte; the safetensors header records the
@@ -83,12 +83,21 @@ impl TensorSpec {
                 ))
             })?;
         }
-        Ok(Self {
-            dtype,
-            shape,
-            data_ptr,
-            data_len,
-        })
+        let data = PyUntypedBuffer::get(data)?;
+        if !data.is_c_contiguous() {
+            return Err(SafetensorError::new_err("data is not C-contiguous"));
+        }
+        let expected = shape
+            .iter()
+            .try_fold(dtype.bitsize(), |bits, dim| bits.checked_mul(*dim))
+            .map(|bits| bits.div_ceil(8));
+        if expected != Some(data.len_bytes()) {
+            return Err(SafetensorError::new_err(format!(
+                "data is {} bytes, which {dtype} of shape {shape:?} is not",
+                data.len_bytes()
+            )));
+        }
+        Ok(Self { dtype, shape, data })
     }
 
     /// The tensor's dtype as its safetensors format code (e.g. `"F32"`, `"BF16"`,
@@ -107,25 +116,18 @@ impl TensorSpec {
         self.shape.clone()
     }
 
-    /// The raw memory address of the tensor's contiguous buffer.
-    #[getter]
-    fn data_ptr(&self) -> u64 {
-        self.data_ptr
-    }
-
     /// The length of the tensor's buffer in bytes.
     #[getter]
     fn data_len(&self) -> usize {
-        self.data_len
+        self.data.len_bytes()
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "TensorSpec(dtype='{}', shape={:?}, data_ptr={}, data_len={})",
+            "TensorSpec(dtype='{}', shape={:?}, data_len={})",
             self.dtype(),
             self.shape,
-            self.data_ptr,
-            self.data_len
+            self.data_len()
         )
     }
 }
@@ -140,16 +142,17 @@ impl View for &TensorSpec {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        let p = self.data_ptr as *const u8;
-        // SAFETY: validated by the caller; see the struct-level safety note.
-        unsafe {
-            let slice = slice::from_raw_parts(p, self.data_len);
-            Cow::Borrowed(slice)
+        let len = self.data.len_bytes();
+        if len == 0 {
+            return Cow::Borrowed(&[]);
         }
+        // SAFETY: the buffer `self` holds keeps `len` contiguous bytes alive at
+        // this address
+        Cow::Borrowed(unsafe { slice::from_raw_parts(self.data.buf_ptr() as *const u8, len) })
     }
 
     fn data_len(&self) -> usize {
-        self.data_len
+        self.data.len_bytes()
     }
 }
 
@@ -188,17 +191,10 @@ fn parse_dtype_str(dtype: &str) -> PyResult<Dtype> {
 
 /// Serializes raw data.
 ///
-/// NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
-/// and stays alive for the duration of the serialization.
-/// We will remove the need for the caller to hold references themselves when we drop support for
-/// python versions prior to 3.11 where the `PyBuffer` API is available.
-/// Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
-/// increasing its ref count preventing the gc from collecting it while we serialize.
-///
 /// Args:
 ///     tensor_dict (`Dict[str, TensorSpec]`):
 ///         Mapping of tensor name to its `TensorSpec`, e.g.:
-///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
+///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data=array)}
 ///     metadata (`Dict[str, str]`, *optional*):
 ///         The optional purely text annotations
 ///
@@ -226,17 +222,10 @@ fn serialize<'b>(
 
 /// Serializes raw data into file.
 ///
-/// NOTE: the caller is required to ensure any pointer passed via `TensorSpec.data_ptr` is valid
-/// and stays alive for the duration of the serialization.
-/// We will remove the need for the caller to hold references themselves when we drop support for
-/// python versions prior to 3.11 where the `PyBuffer` API is available.
-/// Creating a `PyBuffer` will enable us to hold a reference to each passed in data array,
-/// increasing its ref count preventing the gc from collecting it while we serialize.
-///
 /// Args:
 ///     tensor_dict (`Dict[str, TensorSpec]`):
 ///         Mapping of tensor name to its `TensorSpec`, e.g.:
-///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data_ptr=1234, data_len=24)}
+///             {"tensor_name": TensorSpec(dtype="float32", shape=[2, 3], data=array)}
 ///     filename (`str`, or `os.PathLike`):
 ///         The name of the file to write into.
 ///     metadata (`Dict[str, str]`, *optional*):

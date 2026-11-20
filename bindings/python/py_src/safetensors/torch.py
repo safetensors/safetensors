@@ -1,7 +1,7 @@
 import os
 import sys
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from safetensors import (
@@ -277,10 +277,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
-    keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
-    serialized = serialize(
-        _flatten_as_ptr(tensors, keep_references_alive), metadata=metadata
-    )
+    serialized = serialize(_flatten(tensors), metadata=metadata)
     result = bytes(serialized)
     return result
 
@@ -319,10 +316,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    keep_references_alive = []  # to avoid garbage collection of temporary numpy arrays while we write to disk
-    serialize_file(
-        _flatten_as_ptr(tensors, keep_references_alive), filename, metadata=metadata
-    )
+    serialize_file(_flatten(tensors), filename, metadata=metadata)
 
 
 def load_file(
@@ -462,29 +456,15 @@ def _view2torch(safeview) -> Dict[str, torch.Tensor]:
 
 
 def _to_ndarray(tensor: torch.Tensor):
+    """The tensor's bytes as a numpy array, which keeps the tensor alive"""
     if tensor.device.type != "cpu":
         # Moving tensor to cpu before saving
         tensor = tensor.to("cpu")
-
-    import ctypes
-
-    import numpy as np
-
-    # When shape is empty (scalar), np.prod returns a float
-    # we need a int for the following calculations
-    length = int(np.prod(tensor.shape).item())
-    bytes_per_item = _SIZE[tensor.dtype]
-
-    total_bytes = length * bytes_per_item
-
-    ptr = tensor.data_ptr()
-    if ptr == 0:
-        return np.empty(
-            0
-        ), 0  # XXX: bogus value we don't really care if we return a tensor here
-    newptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
-    data = np.ctypeslib.as_array(newptr, (total_bytes,))  # no internal copy
+    tensor = tensor.detach().resolve_conj().resolve_neg()
+    data = tensor.reshape(-1).view(torch.uint8).numpy()
     if sys.byteorder == "big":
+        import numpy as np
+
         NPDTYPES = {
             torch.int64: np.int64,
             torch.float32: np.float32,
@@ -506,10 +486,9 @@ def _to_ndarray(tensor: torch.Tensor):
             _float4_e2m1_x2: np.uint8,
             torch.complex64: np.complex64,
         }
-        npdtype = NPDTYPES[tensor.dtype]
         # Not in place as that would potentially modify a live running model
-        data = data.view(npdtype).byteswap(inplace=False)
-    return data, tensor
+        data = data.view(NPDTYPES[tensor.dtype]).byteswap(inplace=False).view(np.uint8)
+    return data
 
 
 def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
@@ -551,9 +530,7 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
         )
 
 
-def _flatten_as_ptr(
-    tensors: Dict[str, torch.Tensor], keep_alive_buffer: List
-) -> Dict[str, Dict[str, Any]]:
+def _flatten(tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorSpec]:
     _evaluate_tensors_for_save(tensors)
     flattened = {}
     for k, v in tensors.items():
@@ -567,12 +544,9 @@ def _flatten_as_ptr(
                 " only the full tensors, and reslice at load time, or simply call `.contiguous()` on your tensor to"
                 " pack it before saving."
             )
-        arr, tensor_ref = _to_ndarray(v)
-        keep_alive_buffer.append((arr, tensor_ref))
         flattened[k] = TensorSpec(
             dtype=str(v.dtype).split(".")[-1],
             shape=v.shape,
-            data_ptr=arr.ctypes.data,
-            data_len=arr.nbytes,
+            data=_to_ndarray(v),
         )
     return flattened
