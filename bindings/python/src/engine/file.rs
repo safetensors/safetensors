@@ -187,7 +187,6 @@ impl Drop for TempFile {
 
 /// Writes the `size` bytes `from` holds to a new file, which replaces `path`
 /// once complete: a mapping of a previous `path` keeps its bytes.
-/// Writes `size` bytes from `from` to `path`, replacing it once complete.
 #[cfg(target_os = "linux")]
 pub(super) fn write_file(
     path: &Path,
@@ -202,13 +201,17 @@ pub(super) fn write_file(
             .map(|c| c * chunk..((c + 1) * chunk).min(size))
             .collect()
     };
-    let replaced = (|| {
+    let temp = || -> std::io::Result<(TempFile, Arc<File>)> {
         let (temp, file) = TempFile::beside(path)?;
         // The file keeps the permissions of the one it replaces, where the
         // filesystem has any.
         if let Ok(replaced) = std::fs::metadata(path) {
             let _ = file.set_permissions(replaced.permissions());
         }
+        Ok((temp, file))
+    };
+    let replaced = (|| {
+        let (temp, file) = temp()?;
         let to = DirectFile::create(file.clone(), size)?;
         transfer(Plan::new(chunks()), from, &to, pool, threads)?;
         // drops the padding of a direct write
@@ -217,18 +220,28 @@ pub(super) fn write_file(
         Ok(())
     })();
     match replaced {
-        // Object store mounts only take a new file written front to back: no
-        // truncation, rename or write at an offset.
-        Err(Error::Io(e)) if refused(&e) && !path.exists() => {
-            let file = File::options().write(true).create_new(true).open(path)?;
-            let to = DirectFile {
-                file: Arc::new(file),
-                direct: None,
-                size,
+        // Object store mounts only take a file written front to back, with no
+        // truncation or write at an offset; some have no rename either, and
+        // then only take a new file.
+        Err(Error::Io(e)) if refused(&e) => {
+            let front_to_back = |file: Arc<File>| {
+                let to = DirectFile {
+                    file,
+                    direct: None,
+                    size,
+                };
+                transfer(Plan::new(chunks()), from, &to, pool, 1)
             };
-            transfer(Plan::new(chunks()), from, &to, pool, 1).inspect_err(|_| {
-                let _ = std::fs::remove_file(path);
-            })
+            if path.exists() {
+                let (temp, file) = temp()?;
+                front_to_back(file)?;
+                Ok(temp.persist(path)?)
+            } else {
+                let file = File::options().write(true).create_new(true).open(path)?;
+                front_to_back(Arc::new(file)).inspect_err(|_| {
+                    let _ = std::fs::remove_file(path);
+                })
+            }
         }
         replaced => replaced,
     }
