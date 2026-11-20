@@ -681,12 +681,23 @@ pub struct PrefetchLoader {
     loader: Loader<Py<PyAny>>,
     /// per span, aligned with the spans given to `loader`
     names: Vec<String>,
-    /// tensor name -> span index
-    index_map: HashMap<String, usize>,
+    /// per span, its position in the plan's list of slices for that tensor (`None`: not planned as a list)
+    positions: Vec<Option<usize>>,
+    /// tensor name -> span indices, in plan order
+    index_map: HashMap<String, Vec<usize>>,
     device: i32,
     /// the stream torch allocated the tensors on
     alloc_stream: u64,
     background: Arc<Background>,
+}
+
+/// What a prefetch plan loads of one tensor
+#[derive(Clone)]
+enum PlannedRows {
+    Whole,
+    One(Range<usize>),
+    /// several row ranges (no overlap), handed out separately, in plan order
+    Many(Vec<Range<usize>>),
 }
 
 /// Bytes of the plan torch allocates ahead of the read schedule
@@ -1090,14 +1101,40 @@ impl PrefetchLoader {
     ///
     /// Each tensor can be taken once, by [`Self::take`] or by iterating the
     /// loader; asking again raises. Rows planned as a slice come back as that slice.
-    pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let &idx = self.index_map.get(name).ok_or_else(|| {
+    /// A tensor planned as a list of slices comes back as the list of their tensors,
+    /// in plan order, or, with `index`, as the tensor of the `index`-th slice alone.
+    #[pyo3(signature = (name, index=None))]
+    pub fn take(&self, py: Python<'_>, name: &str, index: Option<usize>) -> PyResult<Py<PyAny>> {
+        let spans = self.index_map.get(name).ok_or_else(|| {
             SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
         })?;
-        let current = current_stream(py, self.device)?;
-        let taken = py.detach(|| self.loader.take_tensor(idx));
-        let tensor = taken.map_err(|e| self.background.error(py, &e, format!("{name}: {e}")))?;
-        hand_out(py, tensor, current, self.alloc_stream)
+        let listed = self.positions[spans[0]].is_some();
+        let take_one = |idx: usize| -> PyResult<Py<PyAny>> {
+            let current = current_stream(py, self.device)?;
+            let taken = py.detach(|| self.loader.take_tensor(idx));
+            let tensor =
+                taken.map_err(|e| self.background.error(py, &e, format!("{name}: {e}")))?;
+            hand_out(py, tensor, current, self.alloc_stream)
+        };
+        match (listed, index) {
+            (false, None) => take_one(spans[0]),
+            (false, Some(_)) => Err(SafetensorError::new_err(format!(
+                "{name} was not planned as a list of slices: take it without an index"
+            ))),
+            (true, Some(i)) => {
+                let &idx = spans.get(i).ok_or_else(|| {
+                    SafetensorError::new_err(format!(
+                        "index {i} is out of range for the {} slices planned for {name}",
+                        spans.len()
+                    ))
+                })?;
+                take_one(idx)
+            }
+            (true, None) => {
+                let tensors = spans.iter().map(|&idx| take_one(idx)).collect::<PyResult<Vec<_>>>()?;
+                Ok(PyList::new(py, tensors)?.into_any().unbind())
+            }
+        }
     }
 
     /// `(name, tensor)` pairs as their bytes land, so the order is unspecified;
@@ -1108,6 +1145,7 @@ impl PrefetchLoader {
         TensorStream {
             iter,
             names,
+            positions: slf.positions.clone(),
             device: slf.device,
             alloc_stream: slf.alloc_stream,
             background: slf.background.clone(),
@@ -1382,10 +1420,11 @@ impl Open {
         let torch = get_module(py, &TORCH_MODULE)?;
         let mut spans = Vec::new();
         let mut metas = Vec::new();
-        let mut index_map = HashMap::new();
+        let mut positions = Vec::new();
+        let mut index_map: HashMap<String, Vec<usize>> = HashMap::new();
         for name in self.metadata.offset_keys() {
-            let rows = match &rows_of {
-                None => None,
+            let planned = match &rows_of {
+                None => PlannedRows::Whole,
                 Some(rows_of) => match rows_of.get(&name) {
                     None => continue,
                     Some(rows) => rows.clone(),
@@ -1406,26 +1445,35 @@ impl Open {
             })?;
 
             let (start, end) = info.data_offsets;
-            let mut shape = info.shape.clone();
-            let span = match rows {
-                None => Span { start, end },
-                Some(rows) => {
-                    // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
-                    let row_bytes = (end - start).checked_div(shape[0]).unwrap_or(0);
-                    shape[0] = rows.len();
-                    Span {
-                        start: start + rows.start * row_bytes,
-                        end: start + rows.end * row_bytes,
-                    }
-                }
+            // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
+            let row_bytes = (end - start).checked_div(info.shape.first().copied().unwrap_or(1)).unwrap_or(0);
+            let pieces: Vec<(Option<Range<usize>>, Option<usize>)> = match planned {
+                PlannedRows::Whole => vec![(None, None)],
+                PlannedRows::One(rows) => vec![(Some(rows), None)],
+                PlannedRows::Many(list) => list.into_iter().enumerate().map(|(i, r)| (Some(r), Some(i))).collect(),
             };
-            index_map.insert(name.clone(), spans.len());
-            spans.push(span);
-            metas.push(SpanMeta {
-                name,
-                dtype,
-                storage_shape: torch_storage_shape(info.dtype, &shape)?,
-            });
+            let entry = index_map.entry(name.clone()).or_default();
+            for (rows, position) in pieces {
+                let mut shape = info.shape.clone();
+                let span = match rows {
+                    None => Span { start, end },
+                    Some(rows) => {
+                        shape[0] = rows.len();
+                        Span {
+                            start: start + rows.start * row_bytes,
+                            end: start + rows.end * row_bytes,
+                        }
+                    }
+                };
+                entry.push(spans.len());
+                spans.push(span);
+                positions.push(position);
+                metas.push(SpanMeta {
+                    name: name.clone(),
+                    dtype: dtype.clone_ref(py),
+                    storage_shape: torch_storage_shape(info.dtype, &shape)?,
+                });
+            }
         }
 
         if rows_of.is_some() && spans.is_empty() {
@@ -1498,6 +1546,7 @@ impl Open {
         Ok(PrefetchLoader {
             loader,
             names,
+            positions,
             index_map,
             device: device_idx,
             alloc_stream,
@@ -1505,29 +1554,58 @@ impl Open {
         })
     }
 
-    /// Validates a prefetch plan into `name -> rows`, `None` meaning the whole tensor.
-    fn parse_plan(
-        &self,
-        plan: &PyBound<'_, PyDict>,
-    ) -> PyResult<HashMap<String, Option<Range<usize>>>> {
+    /// Validates a prefetch plan into `name -> rows`: the whole tensor, one slice of rows,
+    /// or a list of them (several row ranges of one tensor, e.g. experts of a stacked bank).
+    fn parse_plan(&self, plan: &PyBound<'_, PyDict>) -> PyResult<HashMap<String, PlannedRows>> {
         let mut rows_of = HashMap::with_capacity(plan.len());
         for (key, value) in plan.iter() {
             let name: String = key
                 .extract()
                 .map_err(|_| SafetensorError::new_err("prefetch plan keys must be tensor names"))?;
 
-            let info = self.metadata.info(&name).ok_or_else(|| {
-                SafetensorError::new_err(format!("File does not contain tensor {name}"))
-            })?;
-
             if value.is_none() {
-                rows_of.insert(name, None);
+                self.metadata.info(&name).ok_or_else(|| {
+                    SafetensorError::new_err(format!("File does not contain tensor {name}"))
+                })?;
+                rows_of.insert(name, PlannedRows::Whole);
                 continue;
             }
+            if let Ok(list) = value.cast::<PyList>() {
+                let mut ranges: Vec<Range<usize>> = Vec::with_capacity(list.len());
+                for item in list.iter() {
+                    ranges.push(self.parse_rows(&name, &item)?);
+                }
+                if ranges.is_empty() {
+                    return Err(SafetensorError::new_err(format!(
+                        "prefetch plan list of slices for {name} is empty"
+                    )));
+                }
+                let mut sorted = ranges.clone();
+                sorted.sort_by_key(|r| r.start);
+                if sorted.windows(2).any(|w| w[0].end > w[1].start) {
+                    return Err(SafetensorError::new_err(format!(
+                        "prefetch plan slices for {name} overlap"
+                    )));
+                }
+                rows_of.insert(name, PlannedRows::Many(ranges));
+                continue;
+            }
+            let rows = self.parse_rows(&name, &value)?;
+            rows_of.insert(name, PlannedRows::One(rows));
+        }
 
+        Ok(rows_of)
+    }
+
+    /// One plan slice of `name`'s rows, validated.
+    fn parse_rows(&self, name: &str, value: &PyBound<'_, PyAny>) -> PyResult<Range<usize>> {
+        {
+            let info = self.metadata.info(name).ok_or_else(|| {
+                SafetensorError::new_err(format!("File does not contain tensor {name}"))
+            })?;
             let slice = value.cast::<PySlice>().map_err(|_| {
                 SafetensorError::new_err(format!(
-                    "prefetch plan values must be None or a slice, got {} for {name}",
+                    "prefetch plan values must be None, a slice or a list of slices, got {} for {name}",
                     value.get_type()
                 ))
             })?;
@@ -1574,10 +1652,8 @@ impl Open {
             }
 
             let start = idx.start as usize;
-            rows_of.insert(name, Some(start..start + idx.slicelength));
+            Ok(start..start + idx.slicelength)
         }
-
-        Ok(rows_of)
     }
 
     /// Returns a full tensor
@@ -2118,6 +2194,8 @@ pub struct TensorStream {
     iter: TensorIter<Py<PyAny>>,
     /// per span, aligned with the loader's spans
     names: Vec<String>,
+    /// per span, its position in the plan's list of slices (keys `(name, position)`)
+    positions: Vec<Option<usize>>,
     device: i32,
     alloc_stream: u64,
     background: Arc<Background>,
@@ -2130,14 +2208,19 @@ impl TensorStream {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(String, Py<PyAny>)>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
         let current = current_stream(py, self.device)?;
         match py.detach(|| self.iter.next()) {
             None => Ok(None),
             Some(Err(e)) => Err(self.background.error(py, &e, e.to_string())),
             Some(Ok((idx, tensor))) => {
                 let tensor = hand_out(py, tensor, current, self.alloc_stream)?;
-                Ok(Some((std::mem::take(&mut self.names[idx]), tensor)))
+                let name = std::mem::take(&mut self.names[idx]);
+                let key = match self.positions[idx] {
+                    None => name.into_pyobject(py)?.into_any().unbind(),
+                    Some(position) => (name, position).into_pyobject(py)?.into_any().unbind(),
+                };
+                Ok(Some((key, tensor)))
             }
         }
     }
@@ -2211,9 +2294,12 @@ impl safe_open {
     /// (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
     ///
     /// Args:
-    ///     plan (`Dict[str, Optional[slice]]`, *optional*):
+    ///     plan (`Dict[str, Optional[Union[slice, List[slice]]]]`, *optional*):
     ///         Which tensors to load: keys are tensor names, values `None` for
-    ///         the whole tensor or a step-1 `slice` along its first dimension.
+    ///         the whole tensor, a step-1 `slice` along its first dimension, or a
+    ///         list of such slices (not overlapping), each loaded and handed out as
+    ///         its own tensor: `take(name)` returns them as a list in plan order,
+    ///         `take(name, i)` the `i`-th, and iterating yields `((name, i), tensor)`.
     ///         Tensors absent from the plan are not loaded by this loader.
     ///         `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
