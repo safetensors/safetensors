@@ -232,6 +232,23 @@ class TorchTestCase(unittest.TestCase):
     def test_save_file_on_tmpfs(self):
         self.assertSavedAsSave({"a": torch.randn(3 << 20)}, directory="/dev/shm")
 
+    @unittest.skipUnless(sys.platform == "linux", "the parallel save is Linux only")
+    def test_save_file_permissions(self):
+        def mode(path):
+            return os.stat(path).st_mode & 0o777
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "model.safetensors")
+            plain = os.path.join(d, "plain")
+            open(plain, "w").close()
+
+            save_file({"w": torch.zeros(4)}, path)
+            self.assertEqual(mode(path), mode(plain))
+
+            os.chmod(path, 0o640)
+            save_file({"w": torch.ones(4)}, path)
+            self.assertEqual(mode(path), 0o640)
+
     def test_save_file_over_a_mapped_file(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "out.safetensors")

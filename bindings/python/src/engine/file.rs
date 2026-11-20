@@ -132,9 +132,9 @@ struct TempFile {
 
 #[cfg(target_os = "linux")]
 impl TempFile {
-    /// `.tmp` and 6 random letters or digits, in the directory of `path`,
-    /// readable and writable by its owner only. Some filesystems can't remove an
-    /// open file: drop the file first.
+    /// `.tmp` and 6 random letters or digits, in the directory of `path`, with
+    /// the permissions of a new file. Some filesystems can't remove an open
+    /// file: drop the file first.
     fn beside(path: &Path) -> std::io::Result<(Self, Arc<File>)> {
         use std::{hash::BuildHasher, os::unix::fs::OpenOptionsExt};
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -157,7 +157,7 @@ impl TempFile {
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(0o666)
                 .open(&temp);
             match opened {
                 Ok(file) => return Ok((Self { path: Some(temp) }, Arc::new(file))),
@@ -204,6 +204,11 @@ pub(super) fn write_file(
     };
     let replaced = (|| {
         let (temp, file) = TempFile::beside(path)?;
+        // The file keeps the permissions of the one it replaces, where the
+        // filesystem has any.
+        if let Ok(replaced) = std::fs::metadata(path) {
+            let _ = file.set_permissions(replaced.permissions());
+        }
         let to = DirectFile::create(file.clone(), size)?;
         transfer(Plan::new(chunks()), from, &to, pool, threads)?;
         // drops the padding of a direct write
