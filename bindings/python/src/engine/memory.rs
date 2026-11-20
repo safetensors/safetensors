@@ -302,6 +302,38 @@ pub trait Scatter: Send + Sync {
     fn allocation_end(&self, _addr: u64) -> Option<u64> {
         None
     }
+
+    /// A fence for the work queued so far on `stream` of this memory: its
+    /// allocator may hand out bytes that work still uses. `None` when there
+    /// is nothing to wait for.
+    fn queued(&self, _stream: u64) -> Result<Option<Arc<dyn Fence>>, Error> {
+        Ok(None)
+    }
+
+    /// Prepares the calling thread to scatter.
+    fn enter(&self) {}
+}
+
+impl<S: Scatter + ?Sized> Scatter for Box<S> {
+    fn scatter(
+        &self,
+        staged: Staged,
+        copies: &[StridedCopy],
+    ) -> Result<Option<Arc<dyn Fence>>, Error> {
+        (**self).scatter(staged, copies)
+    }
+
+    fn allocation_end(&self, addr: u64) -> Option<u64> {
+        (**self).allocation_end(addr)
+    }
+
+    fn queued(&self, stream: u64) -> Result<Option<Arc<dyn Fence>>, Error> {
+        (**self).queued(stream)
+    }
+
+    fn enter(&self) {
+        (**self).enter()
+    }
 }
 
 /// Copies chunks out of the memory a [`Memory`]'s destinations are in
@@ -391,6 +423,10 @@ impl<S> Memory<S> {
             plan,
             space,
         }
+    }
+
+    pub fn space(&self) -> &S {
+        &self.space
     }
 
     /// How many spans the plan has
