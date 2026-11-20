@@ -1,18 +1,23 @@
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{fs::File, os::unix::fs::FileExt, sync::Arc};
+use std::{fs::File, ops::Range, os::unix::fs::FileExt, sync::Arc};
+
+use super::{
+    pool::Slab,
+    transfer::{Error, Source, Staged},
+};
 
 /// The largest alignment of offset, length and buffer a direct read may need
 pub(super) const DIRECT_ALIGN: usize = 4096;
 
-/// The file the workers read chunks from
-pub(super) struct Source {
+/// A file read with `O_DIRECT` where the filesystem allows it
+pub(super) struct DirectFile {
     file: Arc<File>,
     #[cfg(target_os = "linux")]
     direct: Option<Direct>,
 }
 
-impl Source {
+impl DirectFile {
     /// `direct` as in [`Loader::load`]. Direct reads need `aligned_slabs` and a
     /// filesystem that supports them; reads go through the page cache otherwise.
     pub(super) fn new(file: Arc<File>, direct: Option<bool>, aligned_slabs: bool) -> Self {
@@ -61,6 +66,13 @@ impl Source {
         }
         self.file.read_exact_at(&mut slab[..len], offset)?;
         Ok(0)
+    }
+}
+
+impl Source for DirectFile {
+    fn fill(&self, file: Range<u64>, mut slab: Slab) -> Result<Staged, Error> {
+        let head = self.read(&mut slab, file.start, (file.end - file.start) as usize)?;
+        Ok(Staged::new(slab, head, file))
     }
 }
 
@@ -167,7 +179,7 @@ pub(super) mod tests {
     use super::DIRECT_ALIGN;
     #[cfg(target_os = "linux")]
     use {
-        super::Source,
+        super::DirectFile,
         crate::engine::pool::SLAB_SIZE,
         std::{fs::File, sync::Arc},
     };
@@ -225,7 +237,7 @@ pub(super) mod tests {
         ];
         let (mut buf, at) = slab_buf(SLAB_SIZE, 0);
         for direct in [None, Some(true), Some(false)] {
-            let source = Source::new(file.clone(), direct, true);
+            let source = DirectFile::new(file.clone(), direct, true);
             for cold in [true, false] {
                 for (offset, len) in cases {
                     if cold {
@@ -251,7 +263,7 @@ pub(super) mod tests {
         // a direct read into a misaligned buffer fails with EINVAL
         let (path, file, data) = random_file("einval", 3 * DIRECT_ALIGN);
         let (mut buf, at) = slab_buf(SLAB_SIZE, 1);
-        let source = Source::new(file.clone(), Some(true), true);
+        let source = DirectFile::new(file.clone(), Some(true), true);
         if let Some(direct) = &source.direct {
             evict(&file);
             let head = source.read(&mut buf[at.clone()], 5, 5000).unwrap();
