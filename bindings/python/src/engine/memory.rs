@@ -29,7 +29,7 @@ use std::{
 
 use super::{
     pool::Slab,
-    transfer::{Error, Fence, Sink, Source, Staged},
+    transfer::{Error, Fence, ReadAt, Sink, Source, Staged},
 };
 use safetensors::slice::{self, StridedCopy};
 
@@ -312,6 +312,18 @@ pub trait Scatter: Send + Sync {
 
     /// Prepares the calling thread to scatter.
     fn enter(&self) {}
+
+    /// Reads a chunk straight to its destinations as `copies` say, sources being
+    /// offsets from `start` in `from`, if this memory takes reads: `false` when
+    /// the chunk has to be staged.
+    fn pull(
+        &self,
+        _from: &dyn ReadAt,
+        _start: u64,
+        _copies: &[StridedCopy],
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 impl<S: Scatter + ?Sized> Scatter for Box<S> {
@@ -333,6 +345,10 @@ impl<S: Scatter + ?Sized> Scatter for Box<S> {
 
     fn enter(&self) {
         (**self).enter()
+    }
+
+    fn pull(&self, from: &dyn ReadAt, start: u64, copies: &[StridedCopy]) -> Result<bool, Error> {
+        (**self).pull(from, start, copies)
     }
 }
 
@@ -380,7 +396,25 @@ impl Scatter for Host {
         }
         Ok(None)
     }
+
+    fn pull(&self, from: &dyn ReadAt, start: u64, copies: &[StridedCopy]) -> Result<bool, Error> {
+        // a read per row of a gather, or per small tensor, costs more than a copy
+        if copies.len() > MAX_READS || copies.iter().any(|c| c.height != 1) {
+            return Ok(false);
+        }
+        for c in copies {
+            // SAFETY: `Memory::provide` requires the address writable for its
+            // span's bytes, which `c` is within
+            let dst = unsafe { std::slice::from_raw_parts_mut(c.dst as *mut u8, c.width) };
+            from.read_at(start + c.src as u64, dst)?;
+        }
+        Ok(true)
+    }
 }
+
+/// The most reads [`Host`] makes for a chunk in place of staging it
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+const MAX_READS: usize = 16;
 
 /// A chunk's copies once issued: their fence, `None` when they completed
 /// in [`Scatter::scatter`]
@@ -546,6 +580,23 @@ impl<S> Memory<S> {
     }
 }
 
+impl<S: Scatter> Memory<S> {
+    /// The copies that land chunk `chunk`, whose spans have their destinations
+    fn copies(&self, chunk: usize) -> Result<Vec<StridedCopy>, Error> {
+        let mut copies = Vec::new();
+        self.plan.chunk_copies(
+            chunk,
+            |s| self.dest(s).addr,
+            |addr| self.space.allocation_end(addr),
+            |copy| {
+                copies.push(copy);
+                Ok::<_, Error>(())
+            },
+        )?;
+        Ok(copies)
+    }
+}
+
 impl<S: Gather> Memory<S> {
     /// Copies the bytes of `file` its spans hold to `dst`, leaving the rest.
     pub fn gather_into(&self, file: &Range<u64>, dst: &mut [u8]) -> Result<(), Error> {
@@ -585,19 +636,18 @@ impl<S: Scatter> Sink for Memory<S> {
 
     fn drain(&self, staged: Staged) -> Result<(), Error> {
         let chunk = self.plan.chunk_at(staged.file());
-        let mut copies = Vec::new();
-        self.plan.chunk_copies(
-            chunk,
-            |s| self.dest(s).addr,
-            |addr| self.space.allocation_end(addr),
-            |copy| {
-                copies.push(copy);
-                Ok::<_, Error>(())
-            },
-        )?;
-        let fence = self.space.scatter(staged, &copies)?;
+        let fence = self.space.scatter(staged, &self.copies(chunk)?)?;
         let _ = self.landed[chunk].set(fence);
         Ok(())
+    }
+
+    fn pull(&self, file: &Range<u64>, from: &dyn ReadAt) -> Result<bool, Error> {
+        let chunk = self.plan.chunk_at(file);
+        let pulled = self.space.pull(from, file.start, &self.copies(chunk)?)?;
+        if pulled {
+            let _ = self.landed[chunk].set(None);
+        }
+        Ok(pulled)
     }
 
     fn stop(&self) {

@@ -93,6 +93,17 @@ impl Staged {
 pub trait Source: Send + Sync {
     /// Fills `slab` with the bytes of `file`.
     fn fill(&self, file: Range<u64>, slab: Slab) -> Result<Staged, Error>;
+
+    /// A way to read bytes straight to where they go, when staging them in a
+    /// slab first would only add a copy.
+    fn unstaged(&self) -> Option<&dyn ReadAt> {
+        None
+    }
+}
+
+/// Bytes read from an offset into memory the caller picks
+pub trait ReadAt: Sync {
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()>;
 }
 
 /// Where a transfer writes chunks to
@@ -105,6 +116,12 @@ pub trait Sink: Send + Sync {
 
     /// Writes a staged chunk, keeping its slab as long as it reads from it.
     fn drain(&self, staged: Staged) -> Result<(), Error>;
+
+    /// Reads the chunk at `file` from `from` straight to where it goes, if this
+    /// sink can: `false` when the chunk has to be staged.
+    fn pull(&self, _file: &Range<u64>, _from: &dyn ReadAt) -> Result<bool, Error> {
+        Ok(false)
+    }
 
     /// The transfer stopped: a worker in [`Self::wait_ready`] returns
     /// [`Error::Stopped`].
@@ -189,11 +206,14 @@ pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &Arc<SlabPool
         let Some(file) = plan.chunks.get(c) else {
             return;
         };
-        let moved = to
-            .wait_ready(file)
-            .and_then(|()| pool.acquire())
-            .and_then(|slab| from.fill(file.clone(), slab))
-            .and_then(|staged| to.drain(staged));
+        let moved = to.wait_ready(file).and_then(|()| {
+            if let Some(reader) = from.unstaged() {
+                if to.pull(file, reader)? {
+                    return Ok(());
+                }
+            }
+            to.drain(from.fill(file.clone(), pool.acquire()?)?)
+        });
         match moved {
             Ok(()) => {}
             Err(Error::Stopped) => return,
