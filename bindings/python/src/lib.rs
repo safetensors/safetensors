@@ -1131,7 +1131,10 @@ impl PrefetchLoader {
                 take_one(idx)
             }
             (true, None) => {
-                let tensors = spans.iter().map(|&idx| take_one(idx)).collect::<PyResult<Vec<_>>>()?;
+                let tensors = spans
+                    .iter()
+                    .map(|&idx| take_one(idx))
+                    .collect::<PyResult<Vec<_>>>()?;
                 Ok(PyList::new(py, tensors)?.into_any().unbind())
             }
         }
@@ -1446,13 +1449,22 @@ impl Open {
 
             let (start, end) = info.data_offsets;
             // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
-            let row_bytes = (end - start).checked_div(info.shape.first().copied().unwrap_or(1)).unwrap_or(0);
-            let pieces: Vec<(Option<Range<usize>>, Option<usize>)> = match planned {
+            let row_bytes = (end - start)
+                .checked_div(info.shape.first().copied().unwrap_or(1))
+                .unwrap_or(0);
+            let mut pieces: Vec<(Option<Range<usize>>, Option<usize>)> = match planned {
                 PlannedRows::Whole => vec![(None, None)],
                 PlannedRows::One(rows) => vec![(Some(rows), None)],
-                PlannedRows::Many(list) => list.into_iter().enumerate().map(|(i, r)| (Some(r), Some(i))).collect(),
+                PlannedRows::Many(list) => list
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (Some(r), Some(i)))
+                    .collect(),
             };
+            // the loader reads spans in file order: a list of slices is laid out by row, handed out by plan position
+            pieces.sort_by_key(|(rows, _)| rows.as_ref().map_or(0, |r| r.start));
             let entry = index_map.entry(name.clone()).or_default();
+            entry.resize(pieces.len(), 0);
             for (rows, position) in pieces {
                 let mut shape = info.shape.clone();
                 let span = match rows {
@@ -1465,7 +1477,7 @@ impl Open {
                         }
                     }
                 };
-                entry.push(spans.len());
+                entry[position.unwrap_or(0)] = spans.len();
                 spans.push(span);
                 positions.push(position);
                 metas.push(SpanMeta {
