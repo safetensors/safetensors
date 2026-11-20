@@ -15,9 +15,7 @@ use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use pyo3::types::PyCapsule;
-use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyString, PyTuple,
-};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -823,7 +821,15 @@ impl Allocation {
             reason: "torch is not imported".into(),
             cause,
         })?;
-        let device = PyString::new(py, &format!("cuda:{}", self.device)).into_any();
+        // one device object for the batch: torch parses a device string at every call
+        let kwargs = torch
+            .getattr(intern!(py, "device"))
+            .and_then(|device| device.call1(("cuda", self.device)))
+            .and_then(|device| [(intern!(py, "device"), device)].into_py_dict(py))
+            .map_err(|cause| AllocFailure {
+                reason: format!("cannot allocate on cuda:{}: {cause}", self.device),
+                cause,
+            })?;
         let mut dsts = Vec::new();
         let first = self.before[self.next];
         while !self.done()
@@ -845,14 +851,14 @@ impl Allocation {
                 if free().is_ok_and(|free| free >= self.warm[i]) {
                     self.warming = get_pydtype(torch, Dtype::U8, false)
                         .and_then(|uint8| {
-                            torch_empty_cuda(py, torch, &uint8, &[self.warm[i]], &device)
+                            torch_empty_cuda(py, torch, &uint8, &[self.warm[i]], &kwargs)
                         })
                         .is_ok();
                 }
             }
             let tensor = (|| -> PyResult<(u64, Py<PyAny>)> {
                 let tensor =
-                    torch_empty_cuda(py, torch, &meta.dtype, &meta.storage_shape, &device)?;
+                    torch_empty_cuda(py, torch, &meta.dtype, &meta.storage_shape, &kwargs)?;
                 let tensor = tensor.bind(py);
                 let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
                 if nbytes != size {
@@ -2909,21 +2915,18 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
     Ok(shape)
 }
 
+/// `torch.empty(storage_shape, dtype=dtype, **kwargs)`; sets `dtype` in `kwargs`
 fn torch_empty_cuda(
     py: Python<'_>,
     torch: &PyBound<PyModule>,
     dtype: &Py<PyAny>,
     storage_shape: &[usize],
-    device: &PyBound<PyAny>,
+    kwargs: &PyBound<PyDict>,
 ) -> PyResult<Py<PyAny>> {
     let shape: Py<PyAny> = storage_shape.to_vec().into_pyobject(py)?.into();
-    let kwargs = [
-        (intern!(py, "dtype"), dtype.bind(py)),
-        (intern!(py, "device"), device),
-    ]
-    .into_py_dict(py)?;
+    kwargs.set_item(intern!(py, "dtype"), dtype)?;
     Ok(torch
-        .call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?
+        .call_method(intern!(py, "empty"), (shape,), Some(kwargs))?
         .unbind())
 }
 
