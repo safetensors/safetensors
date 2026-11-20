@@ -101,7 +101,10 @@ def load(data: bytes) -> Dict[str, mx.array]:
 
 
 def load_file(
-    filename: Union[str, os.PathLike], *, backend: str = "mmap"
+    filename: Union[str, os.PathLike],
+    *,
+    device: Optional[str] = None,
+    backend: str = "mmap",
 ) -> Dict[str, mx.array]:
     """
     Loads a safetensors file into MLX format.
@@ -109,6 +112,12 @@ def load_file(
     Args:
         filename (`str`, or `os.PathLike`)):
             The name of the file which contains the tensors
+        device (`str`, *optional*):
+            The device where the tensors need to be located after load.
+            `"mps"` loads them onto the GPU: on Apple silicon with
+            `mlx >= 0.32` this aliases a shared `MTLBuffer` per tensor via
+            DLPack with no extra copy (older mlx or unsupported dtypes
+            gracefully fall back to the copying CPU path).
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
             and `"pread"` uses `pread(2)` to read tensor bytes.
@@ -119,13 +128,13 @@ def load_file(
     Example:
 
     ```python
-    from safetensors.flax import load_file
+    from safetensors.mlx import load_file
 
     file_path = "./my_folder/bert.safetensors"
     loaded = load_file(file_path)
     ```
     """
-    with safe_open(filename, framework="mlx", backend=backend) as f:
+    with safe_open(filename, framework="mlx", device=device, backend=backend) as f:
         return f.get_tensors()
 
 
