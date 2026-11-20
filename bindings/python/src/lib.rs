@@ -18,14 +18,14 @@ use pyo3::types::PyCapsule;
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
-use safetensors::slice::TensorIndexer;
+use safetensors::slice::{slice_layout, InvalidSlice, TensorIndexer};
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::num::NonZeroUsize;
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -660,7 +660,7 @@ impl Version {
 }
 
 /// What one span is handed out as: its tensor's name and torch dtype, and the
-/// shape torch allocates after row slicing.
+/// shape torch allocates for its planned part.
 struct SpanMeta {
     name: String,
     dtype: Py<PyAny>,
@@ -1089,7 +1089,7 @@ impl PrefetchLoader {
     /// Takes `name`'s tensor, waiting if its bytes have not landed yet.
     ///
     /// Each tensor can be taken once, by [`Self::take`] or by iterating the
-    /// loader; asking again raises. Rows planned as a slice come back as that slice.
+    /// loader; asking again raises. A tensor planned as a slice comes back as that slice.
     pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         let &idx = self.index_map.get(name).ok_or_else(|| {
             SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
@@ -1374,21 +1374,23 @@ impl Open {
                 )))
             }
         };
-        let rows_of = match plan {
+        let slices = match plan {
             Some(plan) => Some(self.parse_plan(plan)?),
             None => None,
         };
 
         let torch = get_module(py, &TORCH_MODULE)?;
         let mut spans = Vec::new();
+        let mut gathers = Vec::new();
+        let mut sizes = Vec::new();
         let mut metas = Vec::new();
         let mut index_map = HashMap::new();
         for name in self.metadata.offset_keys() {
-            let rows = match &rows_of {
-                None => None,
-                Some(rows_of) => match rows_of.get(&name) {
+            let indexers = match &slices {
+                None => &[][..],
+                Some(slices) => match slices.get(&name) {
                     None => continue,
-                    Some(rows) => rows.clone(),
+                    Some(indexers) => indexers.as_slice(),
                 },
             };
 
@@ -1406,21 +1408,31 @@ impl Open {
             })?;
 
             let (start, end) = info.data_offsets;
-            let mut shape = info.shape.clone();
-            let span = match rows {
-                None => Span { start, end },
-                Some(rows) => {
-                    // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
-                    let row_bytes = (end - start).checked_div(shape[0]).unwrap_or(0);
-                    shape[0] = rows.len();
-                    Span {
-                        start: start + rows.start * row_bytes,
-                        end: start + rows.end * row_bytes,
-                    }
-                }
+            let (read, shape, gather) = if indexers.is_empty() {
+                (0..end - start, info.shape.clone(), None)
+            } else {
+                let layout = slice_layout(info.dtype, &info.shape, indexers).map_err(|e| {
+                    SafetensorError::new_err(match e {
+                        InvalidSlice::SteppedSlice { dim_index } => format!(
+                            "prefetch plan slices must have step 1, got a step on \
+                             dimension {dim_index} of {name}"
+                        ),
+                        InvalidSlice::TooFragmented { .. } => format!(
+                            "invalid prefetch plan slice for {name}: {e}; load the tensor \
+                             whole and index it on the device instead"
+                        ),
+                        e => format!("invalid prefetch plan slice for {name}: {e}"),
+                    })
+                })?;
+                (layout.read, layout.shape, layout.gather)
             };
             index_map.insert(name.clone(), spans.len());
-            spans.push(span);
+            spans.push(Span {
+                start: start + read.start,
+                end: start + read.end,
+            });
+            sizes.push(gather.as_ref().map_or(read.len(), |g| g.len));
+            gathers.push(gather);
             metas.push(SpanMeta {
                 name,
                 dtype,
@@ -1428,16 +1440,14 @@ impl Open {
             });
         }
 
-        if rows_of.is_some() && spans.is_empty() {
+        if slices.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
 
         // torch allocates the tensors on the stream current here, as the load advances:
         // the first [`ALLOC_AHEAD`] bytes now, a batch at a time so the workers start on
         // the first, the rest from the allocator thread
-        let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
-        let gathers = vec![None; spans.len()];
         let loader = Loader::load(
             self.file.clone(),
             self.offset,
@@ -1513,12 +1523,13 @@ impl Open {
         })
     }
 
-    /// Validates a prefetch plan into `name -> rows`, `None` meaning the whole tensor.
+    /// Parses a prefetch plan into `name -> indexers`, a list per leading
+    /// dimension; none for a whole tensor.
     fn parse_plan(
         &self,
         plan: &PyBound<'_, PyDict>,
-    ) -> PyResult<HashMap<String, Option<Range<usize>>>> {
-        let mut rows_of = HashMap::with_capacity(plan.len());
+    ) -> PyResult<HashMap<String, Vec<Vec<TensorIndexer>>>> {
+        let mut slices = HashMap::with_capacity(plan.len());
         for (key, value) in plan.iter() {
             let name: String = key
                 .extract()
@@ -1529,63 +1540,67 @@ impl Open {
             })?;
 
             if value.is_none() {
-                rows_of.insert(name, None);
+                slices.insert(name, vec![]);
                 continue;
             }
 
-            let slice = value.cast::<PySlice>().map_err(|_| {
+            let invalid = |e: PyErr| {
                 SafetensorError::new_err(format!(
-                    "prefetch plan values must be None or a slice, got {} for {name}",
-                    value.get_type()
+                    "invalid prefetch plan slice for {name}: {}",
+                    e.value(value.py())
                 ))
-            })?;
-
-            let Some(&n_rows) = info.shape.first() else {
-                return Err(SafetensorError::new_err(format!(
-                    "cannot slice rows of the 0-d tensor {name}"
-                )));
             };
-
-            for attr in ["start", "stop"] {
-                let bound = slice.getattr(attr)?;
-                if bound.is_none() {
-                    continue;
+            // an int or a slice along the first dimension of `shape`
+            let one = |it: &PyBound<'_, PyAny>, shape: &[usize]| -> PyResult<TensorIndexer> {
+                if it.is_instance_of::<PyEllipsis>()
+                    || it.is_instance_of::<PyTuple>()
+                    || it.is_instance_of::<PyList>()
+                {
+                    return Err(SafetensorError::new_err(
+                        "next to a list, entries must be ints, slices or lists of those",
+                    ));
                 }
-                let v: isize = bound.extract().map_err(|_| {
-                    SafetensorError::new_err(format!(
-                        "prefetch plan slice bounds for {name} must be integers or None"
-                    ))
-                })?;
-                // Python would clamp silently; a plan that misses the tensor is a bug
-                if v > n_rows as isize || v < -(n_rows as isize) {
-                    return Err(SafetensorError::new_err(format!(
-                        "prefetch plan slice {attr} {v} for {name} is out of range for {n_rows} rows"
-                    )));
+                Ok(parse_indexers(it, shape)?.remove(0))
+            };
+            let indexers = match value.cast::<PyTuple>() {
+                Ok(tuple) if tuple.iter().any(|it| it.is_instance_of::<PyList>()) => {
+                    if tuple.len() > info.shape.len() {
+                        return Err(SafetensorError::new_err(format!(
+                            "invalid prefetch plan slice for {name}: {}",
+                            InvalidSlice::TooManySlices
+                        )));
+                    }
+                    tuple
+                        .iter()
+                        .enumerate()
+                        .map(|(dim, item)| match item.cast::<PyList>() {
+                            // an int in a list keeps its dimension, as in numpy
+                            Ok(list) => list
+                                .iter()
+                                .map(|it| match one(&it, &info.shape[dim..])? {
+                                    TensorIndexer::Select(i) => Ok(TensorIndexer::Narrow(
+                                        Bound::Included(i),
+                                        Bound::Excluded(i + 1),
+                                        NonZeroUsize::MIN,
+                                    )),
+                                    ix => Ok(ix),
+                                })
+                                .collect(),
+                            Err(_) => Ok(vec![one(&item, &info.shape[dim..])?]),
+                        })
+                        .collect::<PyResult<Vec<_>>>()
+                        .map_err(invalid)?
                 }
-            }
-            let idx = slice.indices(n_rows as isize).map_err(|e| {
-                SafetensorError::new_err(format!("invalid prefetch plan slice for {name}: {e}"))
-            })?;
-            if idx.step != 1 {
-                return Err(SafetensorError::new_err(format!(
-                    "prefetch plan slices must have step 1, got {} for {name}",
-                    idx.step
-                )));
-            }
-
-            let nbytes = info.data_offsets.1 - info.data_offsets.0;
-            let row_bytes = nbytes.checked_div(n_rows).unwrap_or(0);
-            if row_bytes * n_rows != nbytes {
-                return Err(SafetensorError::new_err(format!(
-                    "cannot slice rows of {name}: a row is not a whole number of bytes"
-                )));
-            }
-
-            let start = idx.start as usize;
-            rows_of.insert(name, Some(start..start + idx.slicelength));
+                _ => parse_indexers(&value, &info.shape)
+                    .map_err(invalid)?
+                    .into_iter()
+                    .map(|ix| vec![ix])
+                    .collect(),
+            };
+            slices.insert(name, indexers);
         }
 
-        Ok(rows_of)
+        Ok(slices)
     }
 
     /// Returns a full tensor
@@ -2219,9 +2234,13 @@ impl safe_open {
     /// (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
     ///
     /// Args:
-    ///     plan (`Dict[str, Optional[slice]]`, *optional*):
-    ///         Which tensors to load: keys are tensor names, values `None` for
-    ///         the whole tensor or a step-1 `slice` along its first dimension.
+    ///     plan (`Dict[str, Optional[Any]]`, *optional*):
+    ///         Which tensors to load, and which part of each: keys are tensor
+    ///         names, values `None` for the whole tensor or any index `get_slice`
+    ///         takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
+    ///         dimension's entry can also be a list of ints and slices, kept in
+    ///         order along that dimension (e.g. the two halves of a fused
+    ///         projection); an int in a list keeps its dimension, as in numpy.
     ///         Tensors absent from the plan are not loaded by this loader.
     ///         `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
@@ -2231,7 +2250,8 @@ impl safe_open {
     ///
     /// Raises if a planned tensor has a dtype the installed torch cannot represent
     /// (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
-    /// than 1, if a sliced tensor is 0-d, or if torch can't allocate the first 1 GiB.
+    /// than 1, if the entries of a dimension overlap or are out of order, if a part
+    /// is too fragmented to load, or if torch can't allocate the first 1 GiB.
     /// A later allocation failure ends the load: `take` and iteration raise, and the
     /// tensors not taken are released at once; after any other failure they are
     /// released at `close`.

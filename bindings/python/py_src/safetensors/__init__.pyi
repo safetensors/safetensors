@@ -15,7 +15,7 @@
 import os
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-PrefetchPlan = Dict[str, Optional[slice]]
+PrefetchPlan = Dict[str, Optional[Any]]
 
 __version__: str
 
@@ -195,8 +195,8 @@ class PrefetchLoader:
     def take(self, name: str) -> Any:
         """
         Takes `name`'s tensor, waiting if its bytes have not landed yet. Each tensor can be
-        taken once, by `take` or by iterating the loader; asking again raises. Rows planned
-        as a slice come back as that slice.
+        taken once, by `take` or by iterating the loader; asking again raises. A tensor
+        planned as a slice comes back as that slice.
         """
         pass
     def __iter__(self) -> Iterator[Tuple[str, Any]]:
@@ -266,9 +266,13 @@ class safe_open:
         (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
 
         Args:
-            plan (`Dict[str, Optional[slice]]`, *optional*):
-                Which tensors to load: keys are tensor names, values `None` for
-                the whole tensor or a step-1 `slice` along its first dimension.
+            plan (`Dict[str, Optional[Any]]`, *optional*):
+                Which tensors to load, and which part of each: keys are tensor
+                names, values `None` for the whole tensor or any index `get_slice`
+                takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
+                dimension's entry can also be a list of ints and slices, kept in
+                order along that dimension (e.g. the two halves of a fused
+                projection); an int in a list keeps its dimension, as in numpy.
                 Tensors absent from the plan are not loaded by this loader.
                 `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
@@ -278,7 +282,8 @@ class safe_open:
 
         Raises if a planned tensor has a dtype the installed torch cannot represent
         (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
-        than 1, if a sliced tensor is 0-d, or if torch can't allocate the first 1 GiB.
+        than 1, if the entries of a dimension overlap or are out of order, if a part
+        is too fragmented to load, or if torch can't allocate the first 1 GiB.
         A later allocation failure ends the load: `take` and iteration raise, and the
         tensors not taken are released at once; after any other failure they are
         released at `close`.
