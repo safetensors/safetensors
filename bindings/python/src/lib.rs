@@ -694,6 +694,11 @@ pub struct PrefetchLoader {
 /// Bytes of the plan torch allocates ahead of the read schedule
 const ALLOC_AHEAD: usize = 1 << 30;
 
+/// At most this many tensors, and about this many bytes, per batch: the workers
+/// copy one batch while torch allocates the next, and the GIL is held per batch
+const BATCH_TENSORS: usize = 256;
+const BATCH_BYTES: usize = 16 << 20;
+
 const ALLOCATOR_THREAD: &str = "safetensors-prefetch-alloc";
 
 /// Largest block warmed in torch's cache ahead of the tensors that split it: one
@@ -808,7 +813,7 @@ impl Allocation {
     }
 
     /// Allocates the next tensors, on the current stream, until the first `target`
-    /// planned bytes have a destination.
+    /// planned bytes have a destination or the batch is full.
     fn batch(
         &mut self,
         py: Python<'_>,
@@ -820,7 +825,12 @@ impl Allocation {
         })?;
         let device = PyString::new(py, &format!("cuda:{}", self.device)).into_any();
         let mut dsts = Vec::new();
-        while !self.done() && self.before[self.next] < target {
+        let first = self.before[self.next];
+        while !self.done()
+            && self.before[self.next] < target
+            && self.before[self.next] - first < BATCH_BYTES
+            && dsts.len() < BATCH_TENSORS
+        {
             let i = self.next;
             let (meta, size) = (&self.metas[i], self.sizes[i]);
             if self.warming && self.warm[i] > 0 {
@@ -964,22 +974,26 @@ fn halt_prefetch_loaders(py: Python<'_>) {
 }
 
 /// The allocator thread: keeps the destinations [`ALLOC_AHEAD`] bytes ahead of
-/// the read schedule, taking the GIL once per batch. A failure ends the load and
-/// releases the tensors not taken.
+/// the read schedule, taking the GIL once per batch. It tops up once the lead
+/// drops below half of that. A failure ends the load and releases the tensors not
+/// taken.
 fn allocate_ahead(background: Arc<Background>, mut alloc: Allocation) {
     let bg = &*background;
     let _exited = Exited(bg);
-    let (mut entered, mut failed) = (false, false);
+    let (mut entered, mut failed, mut filling) = (false, false, false);
     while !alloc.done() {
         if bg.stop.load(Ordering::Acquire) || bg.feed.stopped() {
             return;
         }
         let scheduled = bg.feed.scheduled();
-        let target = alloc.before[scheduled] + ALLOC_AHEAD;
-        if alloc.before[bg.feed.provided()] >= target {
+        let read = alloc.before[scheduled];
+        let lead = alloc.before[bg.feed.provided()].saturating_sub(read);
+        filling = lead < ALLOC_AHEAD && (filling || lead < ALLOC_AHEAD / 2);
+        if !filling {
             bg.feed.wait_scheduled(scheduled);
             continue;
         }
+        let target = read + ALLOC_AHEAD;
         let more = Python::attach(|py| {
             if bg.stop.load(Ordering::Acquire) {
                 return false;
@@ -1413,7 +1427,8 @@ impl Open {
         }
 
         // torch allocates the tensors on the stream current here, as the load advances:
-        // the first [`ALLOC_AHEAD`] bytes now, the rest from the allocator thread
+        // the first [`ALLOC_AHEAD`] bytes now, a batch at a time so the workers start on
+        // the first, the rest from the allocator thread
         let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
         let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
@@ -1421,10 +1436,12 @@ impl Open {
             let (stream, stream_raw) = current_stream(py, device_idx)?;
             let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
             let mut alloc = Allocation::new(metas, sizes, piece, device_idx);
-            let first = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
             let feed = loader.feed();
-            feed.provide(first, stream_raw)
-                .map_err(|(e, _)| PyErr::from(e))?;
+            while !alloc.done() && alloc.before[alloc.next] < ALLOC_AHEAD {
+                let dsts = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
+                feed.provide(dsts, stream_raw)
+                    .map_err(|(e, _)| PyErr::from(e))?;
+            }
             ATEXIT_HOOK.get_or_try_init(py, || -> PyResult<()> {
                 HOOK_PID.store(std::process::id(), Ordering::Relaxed);
                 let hook = wrap_pyfunction!(halt_prefetch_loaders, py)?;
