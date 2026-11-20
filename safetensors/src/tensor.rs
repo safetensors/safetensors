@@ -1,7 +1,8 @@
 //! Module Containing the most important structures
-use crate::lib::{Cow, HashMap, String, ToString, Vec};
+use crate::lib::{BTreeMap, Cow, HashMap, String, ToString, Vec};
 use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
 use core::fmt::Display;
+use core::ops::Range;
 use core::str::Utf8Error;
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "std")]
@@ -121,6 +122,7 @@ struct PreparedData {
     n: u64,
     header_bytes: Vec<u8>,
     offset: usize,
+    metadata: Metadata,
 }
 
 /// The trait necessary to enable safetensors to serialize a tensor
@@ -254,11 +256,16 @@ where
     let aligned_metadata_len = metadata_buf.len().next_multiple_of(N_LEN);
     metadata_buf.resize(aligned_metadata_len, b' ');
 
+    if aligned_metadata_len > MAX_HEADER_SIZE {
+        return Err(SafeTensorError::HeaderTooLarge);
+    }
+
     Ok((
         PreparedData {
             n: aligned_metadata_len as u64,
             header_bytes: metadata_buf,
             offset,
+            metadata,
         },
         tensors,
     ))
@@ -278,13 +285,10 @@ pub fn serialize<
             n,
             header_bytes,
             offset,
+            ..
         },
         tensors,
     ) = prepare(data, data_info)?;
-
-    if n > MAX_HEADER_SIZE as u64 {
-        return Err(SafeTensorError::HeaderTooLarge);
-    }
 
     let expected_size = N_LEN + header_bytes.len() + offset;
     let mut buffer: Vec<u8> = Vec::with_capacity(expected_size);
@@ -298,33 +302,81 @@ pub fn serialize<
     Ok(buffer)
 }
 
+/// Where [`serialize`] puts each part of the file.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLayout {
+    /// The bytes written before the tensor data: the 8-byte header length and the JSON header.
+    pub header: Vec<u8>,
+    /// Each tensor's name and byte range within the data section (which starts right
+    /// after `header`), in file order.
+    pub tensors: Vec<(String, Range<usize>)>,
+    /// The length of the data section in bytes.
+    pub data_len: usize,
+}
+
+/// Computes the [`FileLayout`] that [`serialize`] would produce for the same arguments,
+/// without reading any tensor data: only `dtype`, `shape` and `data_len` are used.
+/// The file is the header followed by each tensor's bytes at its range.
+pub fn file_layout<S, V, I>(
+    data: I,
+    data_info: Option<HashMap<String, String>>,
+) -> Result<FileLayout, SafeTensorError>
+where
+    S: AsRef<str> + Ord + Display,
+    V: View,
+    I: IntoIterator<Item = (S, V)>,
+{
+    let (
+        PreparedData {
+            n,
+            header_bytes,
+            offset,
+            metadata,
+        },
+        _,
+    ) = prepare(data, data_info)?;
+
+    let mut header = Vec::with_capacity(N_LEN + header_bytes.len());
+    header.extend(n.to_le_bytes());
+    header.extend(header_bytes);
+
+    let mut names = vec![String::new(); metadata.tensors.len()];
+    for (name, index) in metadata.index_map {
+        names[index] = name;
+    }
+    let tensors = names
+        .into_iter()
+        .zip(metadata.tensors)
+        .map(|(name, info)| (name, info.data_offsets.0..info.data_offsets.1))
+        .collect();
+
+    Ok(FileLayout {
+        header,
+        tensors,
+        data_len: offset,
+    })
+}
+
 #[cfg(feature = "std")]
 fn buffered_write_to_file<V: View>(
     path: impl AsRef<Path>,
     n: u64,
     header_bytes: &[u8],
     tensors: &[V],
-    total_size: usize,
 ) -> Result<(), SafeTensorError> {
     let path = path.as_ref();
-    // Write to a sibling tempfile then rename, so an existing `path` is never
-    // truncated under any mmap of it (e.g. tensors returned by `load_file`).
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    let write = |file: &std::fs::File| -> std::io::Result<()> {
+        // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
+        // This yields ~30% performance improvement.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use std::os::fd::AsRawFd;
 
-    temp.as_file().set_len(total_size as u64)?;
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
 
-    // Serialize tensors to a file using direct I/O (bypassing page cache) using F_NOCACHE.
-    // This yields ~30% performance improvement.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        use std::os::fd::AsRawFd;
-
-        libc::fcntl(temp.as_file().as_raw_fd(), libc::F_NOCACHE, 1);
-    }
-
-    {
-        let mut f = std::io::BufWriter::with_capacity(1024 * 1024, temp.as_file());
+        let mut f = std::io::BufWriter::with_capacity(1024 * 1024, file);
 
         f.write_all(n.to_le_bytes().as_ref())?;
         f.write_all(header_bytes)?;
@@ -333,9 +385,34 @@ fn buffered_write_to_file<V: View>(
             f.write_all(tensor.data().as_ref())?;
         }
 
-        f.flush()?;
+        f.flush()
+    };
+
+    // A new file is written in place: object store mounts refuse renames.
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            return write(&file).map_err(|e| {
+                let _ = std::fs::remove_file(path);
+                e.into()
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
     }
 
+    // An existing `path` is replaced by a sibling tempfile, so it is never
+    // truncated under any mmap of it (e.g. tensors returned by `load_file`).
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (file, temp) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
+    let written = write(&file);
+    // Closed before `temp` is renamed or removed: some filesystems can't remove
+    // an open file.
+    drop(file);
+    written?;
     temp.persist(path).map_err(|e| e.error)?;
 
     Ok(())
@@ -357,21 +434,12 @@ where
 {
     let (
         PreparedData {
-            n,
-            header_bytes,
-            offset,
-            ..
+            n, header_bytes, ..
         },
         tensors,
     ) = prepare(data, data_info)?;
 
-    if n > MAX_HEADER_SIZE as u64 {
-        return Err(SafeTensorError::HeaderTooLarge);
-    }
-
-    let total_size = N_LEN + header_bytes.len() + offset;
-
-    buffered_write_to_file(filename, n, &header_bytes, &tensors, total_size)?;
+    buffered_write_to_file(filename, n, &header_bytes, &tensors)?;
 
     Ok(())
 }
@@ -585,7 +653,8 @@ impl Serialize for Metadata {
         let mut map = serializer.serialize_map(Some(self.tensors.len() + length))?;
 
         if let Some(metadata) = &self.metadata {
-            map.serialize_entry("__metadata__", metadata)?;
+            let sorted: BTreeMap<&String, &String> = metadata.iter().collect();
+            map.serialize_entry("__metadata__", &sorted)?;
         }
 
         for (name, info) in names.iter().zip(&self.tensors) {
@@ -639,15 +708,15 @@ impl Metadata {
 
             start = e;
 
-            let nelements: usize = info
+            // Bound non-zero dims even when a zero dim makes the tensor empty:
+            // consumers still derive strides from them.
+            let nbits = info
                 .shape
                 .iter()
-                .copied()
-                .try_fold(1usize, usize::checked_mul)
+                .filter(|&&d| d != 0)
+                .try_fold(info.dtype.bitsize(), |acc, &d| acc.checked_mul(d))
                 .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbits = nelements
-                .checked_mul(info.dtype.bitsize())
-                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let nbits = if info.shape.contains(&0) { 0 } else { nbits };
 
             if nbits % 8 != 0 {
                 return Err(SafeTensorError::MisalignedSlice);
@@ -1591,6 +1660,15 @@ mod tests {
             }
             _ => panic!("This should not be able to be deserialized"),
         }
+        // Zero dim makes numel 0, but the other dims still overflow.
+        let header =
+            br#"{"test":{"dtype":"F32","shape":[0,4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        let mut serialized = (header.len() as u64).to_le_bytes().to_vec();
+        serialized.extend_from_slice(header);
+        assert!(matches!(
+            SafeTensors::deserialize(&serialized),
+            Err(SafeTensorError::ValidationOverflow)
+        ));
     }
 
     #[test]
@@ -1607,5 +1685,94 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
+    }
+
+    #[test]
+    fn test_metadata_keys_serialized_sorted() {
+        let tensors: HashMap<String, TensorView> = HashMap::new();
+        let keys = ["e", "b", "d", "a", "c"];
+        let forward: HashMap<String, String> = keys
+            .iter()
+            .map(|k| (k.to_string(), k.to_string()))
+            .collect();
+        let backward: HashMap<String, String> = keys
+            .iter()
+            .rev()
+            .map(|k| (k.to_string(), k.to_string()))
+            .collect();
+
+        let out = serialize(&tensors, Some(forward)).unwrap();
+        assert_eq!(out, serialize(&tensors, Some(backward)).unwrap());
+        let header = br#"{"__metadata__":{"a":"a","b":"b","c":"c","d":"d","e":"e"}}"#;
+        assert_eq!(&out[8..8 + header.len()], header);
+    }
+
+    struct NoDataView(TensorView<'static>);
+
+    impl View for NoDataView {
+        fn dtype(&self) -> Dtype {
+            self.0.dtype()
+        }
+        fn shape(&self) -> &[usize] {
+            self.0.shape()
+        }
+        fn data(&self) -> Cow<'_, [u8]> {
+            panic!("layout must not read tensor data")
+        }
+        fn data_len(&self) -> usize {
+            self.0.data_len()
+        }
+    }
+
+    fn check_layout(
+        tensors: &[(&str, TensorView<'static>)],
+        data_info: Option<HashMap<String, String>>,
+    ) {
+        let serialized =
+            serialize(tensors.iter().map(|(k, v)| (*k, v)), data_info.clone()).unwrap();
+        let no_data = tensors.iter().map(|(k, v)| (*k, NoDataView(v.clone())));
+        let layout = file_layout(no_data, data_info).unwrap();
+
+        let (n, metadata) = SafeTensors::read_metadata(&serialized).unwrap();
+        assert_eq!(layout.header, serialized[..N_LEN + n]);
+        assert_eq!(layout.data_len, serialized.len() - layout.header.len());
+        let expected: Vec<_> = metadata
+            .offset_keys()
+            .into_iter()
+            .map(|name| {
+                let (start, end) = metadata.info(&name).unwrap().data_offsets;
+                (name, start..end)
+            })
+            .collect();
+        assert_eq!(layout.tensors, expected);
+    }
+
+    #[test]
+    fn test_layout_matches_serialize() {
+        static F32: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        static U8: [u8; 3] = [9, 10, 11];
+        static F64: [u8; 16] = [12; 16];
+        static BF16: [u8; 4] = [13, 14, 15, 16];
+        let tensors = [
+            ("u8", TensorView::new(Dtype::U8, vec![3], &U8).unwrap()),
+            ("f32", TensorView::new(Dtype::F32, vec![2], &F32).unwrap()),
+            (
+                "bf16",
+                TensorView::new(Dtype::BF16, vec![2], &BF16).unwrap(),
+            ),
+            ("a_f64", TensorView::new(Dtype::F64, vec![2], &F64).unwrap()),
+            (
+                "empty",
+                TensorView::new(Dtype::F32, vec![0, 3], &[]).unwrap(),
+            ),
+        ];
+        check_layout(&tensors, None);
+        let data_info = HashMap::from([("format".to_string(), "pt".to_string())]);
+        check_layout(&tensors, Some(data_info));
+    }
+
+    #[test]
+    fn test_layout_no_tensors() {
+        check_layout(&[], None);
     }
 }

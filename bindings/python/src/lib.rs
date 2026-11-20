@@ -10,7 +10,7 @@ use core::slice;
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
-use pyo3::sync::OnceLockExt;
+use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use pyo3::types::PyCapsule;
@@ -21,13 +21,15 @@ use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -350,8 +352,13 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
                 dim_idx += 1;
             }
         } else if let Ok(slice) = it.cast::<PySlice>() {
-            let start: Option<usize> = slice.getattr(intern!(py, "start"))?.extract()?;
-            let stop: Option<usize> = slice.getattr(intern!(py, "stop"))?.extract()?;
+            let dim = shape.get(dim_idx).copied().unwrap_or(0);
+            // Negative bounds count from the end, clamped at 0 as in Python.
+            let resolve = |bound: Option<isize>| {
+                bound.map(|b| usize::try_from(b).unwrap_or_else(|_| dim.saturating_add_signed(b)))
+            };
+            let start = resolve(slice.getattr(intern!(py, "start"))?.extract()?);
+            let stop = resolve(slice.getattr(intern!(py, "stop"))?.extract()?);
             let step_raw: i64 = slice
                 .getattr(intern!(py, "step"))?
                 .extract::<Option<i64>>()?
@@ -652,43 +659,385 @@ impl Version {
 }
 
 /// What one span is handed out as: its tensor's name and dtype, and the
-/// shape after row slicing.
-#[derive(Clone)]
+/// shape torch allocates after row slicing.
 struct SpanMeta {
     name: String,
     dtype: Dtype,
-    shape: Vec<usize>,
+    storage_shape: Vec<usize>,
 }
 
 /// The tensors of one file loading to a CUDA device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
-/// by iterating, as a zero-copy view of device memory. An allocation's memory is
-/// freed once every tensor in it has been taken and dropped; allocations with
-/// untaken tensors are held until the loader is closed.
+/// by iterating. Tensors are allocated by torch on the CUDA stream current at
+/// `prefetch`, so torch accounts for them and frees each one when dropped;
+/// tensors not taken are released at `close`.
 ///
-/// Tensors are ready on any stream when handed out. The free is fenced on the
-/// CUDA stream that was current at hand-out; a consumer that reads a tensor on
-/// another stream must synchronize it before dropping the last reference.
+/// Tensors are ready on any stream when handed out. Their memory is kept for the
+/// stream current at hand-out too; reading one on yet another stream needs
+/// `record_stream`, as for any torch tensor.
 #[pyclass]
 pub struct PrefetchLoader {
-    loader: Loader,
+    loader: Loader<Py<PyAny>>,
     /// per span, aligned with the spans given to `loader`
-    spans: Vec<SpanMeta>,
+    names: Vec<String>,
     /// tensor name -> span index
     index_map: HashMap<String, usize>,
+    device: i32,
+    /// the stream torch allocated the tensors on
+    alloc_stream: u64,
+    background: Arc<Background>,
 }
 
-impl PrefetchLoader {
-    /// Takes the span loaded for `name`, once
-    fn take_buffer(&self, py: Python<'_>, name: &str) -> PyResult<(DeviceBuffer, &SpanMeta)> {
-        let &idx = self.index_map.get(name).ok_or_else(|| {
-            SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
-        })?;
-        let buffer = py
-            .detach(|| self.loader.take_tensor(idx))
-            .map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))?;
-        Ok((buffer, &self.spans[idx]))
+/// Bytes of the plan torch allocates ahead of the read schedule
+const ALLOC_AHEAD: usize = 1 << 30;
+
+const ALLOCATOR_THREAD: &str = "safetensors-prefetch-alloc";
+
+/// Largest block warmed in torch's cache ahead of the tensors that split it: one
+/// cudaMalloc for all of them, and a tensor kept alive pins no more than this.
+const WARM_PIECE: usize = 256 << 20;
+
+/// The largest cached block torch still splits for smaller requests on `device`:
+/// [`WARM_PIECE`], less when `max_split_size` is set, 0 when torch reports none.
+/// Call once torch's CUDA is initialised: the stats are empty before.
+/// The sizes here and in [`Allocation::new`] mirror torch's caching allocator.
+fn warm_piece(torch: &PyBound<'_, PyModule>, device: i32) -> usize {
+    let max_split = || -> PyResult<i64> {
+        let py = torch.py();
+        torch
+            .getattr(intern!(py, "cuda"))?
+            .call_method1(intern!(py, "memory_stats_as_nested_dict"), (device,))?
+            .get_item(intern!(py, "max_split_size"))?
+            .extract()
+    };
+    match max_split() {
+        Ok(n) if n < 0 => WARM_PIECE, // unlimited
+        // blocks of max_split_size or more are never split, and torch rounds segments up to 2 MiB
+        Ok(n) => WARM_PIECE.min((n as usize).saturating_sub(2 << 20)),
+        Err(_) => 0,
     }
+}
+
+/// The CUDA stream current on `device` in this thread, with its raw handle.
+fn current_stream<'py>(py: Python<'py>, device: i32) -> PyResult<(PyBound<'py, PyAny>, u64)> {
+    let stream = get_module(py, &TORCH_MODULE)?
+        .getattr(intern!(py, "cuda"))?
+        .call_method1(intern!(py, "current_stream"), (device,))?;
+    let raw = stream.getattr(intern!(py, "cuda_stream"))?.extract()?;
+    Ok((stream, raw))
+}
+
+/// A tensor torch could not allocate: `reason` names it, `cause` is torch's error.
+struct AllocFailure {
+    reason: String,
+    cause: PyErr,
+}
+
+impl AllocFailure {
+    fn into_pyerr(self, py: Python<'_>) -> PyErr {
+        let err = SafetensorError::new_err(self.reason);
+        err.set_cause(py, Some(self.cause));
+        err
+    }
+}
+
+/// The planned tensors still to allocate, in plan order.
+struct Allocation {
+    metas: Vec<SpanMeta>,
+    sizes: Vec<usize>,
+    /// per span, the planned bytes before it; one more entry for the total
+    before: Vec<usize>,
+    /// per span, the warm-up block allocated and dropped before it, 0 for none
+    warm: Vec<usize>,
+    /// off after the first warm-up that fails
+    warming: bool,
+    next: usize,
+    device: i32,
+}
+
+impl Allocation {
+    fn new(metas: Vec<SpanMeta>, sizes: Vec<usize>, piece: usize, device: i32) -> Self {
+        let before = std::iter::once(0)
+            .chain(sizes.iter().scan(0, |sum, &n| {
+                *sum += n;
+                Some(*sum)
+            }))
+            .collect();
+        // a piece is a run of tensors over 1 MiB (smaller ones come from torch's small
+        // pool and don't end a run) whose rounded sizes sum to at most `piece`
+        let split = |n: usize| n > 1 << 20;
+        let mut warm = vec![0; sizes.len()];
+        let mut warmed = 0; // tensors before `warmed` have their block
+        for i in 0..sizes.len() {
+            if piece == 0 || i < warmed || !split(sizes[i]) {
+                continue;
+            }
+            let (mut bytes, mut count, mut end) = (0, 0, i);
+            for (j, &n) in sizes.iter().enumerate().skip(i) {
+                if split(n) {
+                    let n = n.next_multiple_of(512);
+                    if bytes + n > piece {
+                        break;
+                    }
+                    bytes += n;
+                    count += 1;
+                }
+                end = j + 1;
+            }
+            warmed = end.max(i + 1);
+            if count > 1 {
+                warm[i] = bytes;
+            }
+        }
+        Self {
+            metas,
+            sizes,
+            before,
+            warm,
+            warming: true,
+            next: 0,
+            device,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.next == self.sizes.len()
+    }
+
+    /// Allocates the next tensors, on the current stream, until the first `target`
+    /// planned bytes have a destination.
+    fn batch(
+        &mut self,
+        py: Python<'_>,
+        target: usize,
+    ) -> Result<Vec<(u64, Py<PyAny>)>, AllocFailure> {
+        let torch = get_module(py, &TORCH_MODULE).map_err(|cause| AllocFailure {
+            reason: "torch is not imported".into(),
+            cause,
+        })?;
+        let mut dsts = Vec::new();
+        while !self.done() && self.before[self.next] < target {
+            let i = self.next;
+            let (meta, size) = (&self.metas[i], self.sizes[i]);
+            if self.warming && self.warm[i] > 0 {
+                // best effort: the tensors may still fit without it. Not past the free
+                // memory: torch would flush the caller's cache to retry
+                let free = || -> PyResult<usize> {
+                    let cuda = torch.getattr(intern!(py, "cuda"))?;
+                    cuda.call_method1(intern!(py, "mem_get_info"), (self.device,))?
+                        .get_item(0)?
+                        .extract()
+                };
+                if free().is_ok_and(|free| free >= self.warm[i]) {
+                    self.warming =
+                        torch_empty_cuda(py, torch, Dtype::U8, &[self.warm[i]], self.device)
+                            .is_ok();
+                }
+            }
+            let tensor = (|| -> PyResult<(u64, Py<PyAny>)> {
+                let tensor =
+                    torch_empty_cuda(py, torch, meta.dtype, &meta.storage_shape, self.device)?;
+                let tensor = tensor.bind(py);
+                let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
+                if nbytes != size {
+                    return Err(SafetensorError::new_err(format!(
+                        "torch allocated {nbytes} bytes for {size} bytes of data"
+                    )));
+                }
+                let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                Ok((ptr, tensor.clone().unbind()))
+            })();
+            match tensor {
+                Ok(dst) => dsts.push(dst),
+                Err(cause) => {
+                    return Err(AllocFailure {
+                        reason: format!(
+                            "cannot allocate {} ({size} bytes) on cuda:{}: {cause}",
+                            meta.name, self.device
+                        ),
+                        cause,
+                    })
+                }
+            }
+            self.next += 1;
+        }
+        Ok(dsts)
+    }
+}
+
+/// What a loader runs besides its workers: the thread that allocates as the load
+/// advances. Shared with that thread and, weakly, with the `atexit` hook.
+struct Background {
+    stop: AtomicBool,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    feed: Feed<Py<PyAny>>,
+    /// the stream current at `prefetch`, made current in the allocator thread
+    stream: Py<PyAny>,
+    stream_raw: u64,
+    /// torch's error, when the allocator thread failed to allocate
+    error: OnceLock<PyErr>,
+    /// set once the allocator thread ended, after releasing the tensors not taken
+    /// on `error`; set from the start when there is no such thread
+    exited: Mutex<bool>,
+    exit: Condvar,
+}
+
+impl Background {
+    /// Stops the load and joins the allocator thread, then the workers, without
+    /// the GIL.
+    /// The tensors not taken stay with the loader.
+    fn halt(&self, py: Python<'_>) {
+        self.stop.store(true, Ordering::Release);
+        let thread = self.thread.lock().unwrap().take();
+        // dropped from the allocator thread itself (a collection it triggered): it
+        // returns on its own once it sees `stop`
+        let thread = thread.filter(|t| t.thread().id() != std::thread::current().id());
+        py.detach(|| {
+            // wakes the allocator thread
+            self.feed.stop();
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+            self.feed.halt();
+        });
+    }
+
+    /// `msg` as a `SafetensorError`, caused by the allocation failure if any. That
+    /// failure is reported once the tensors not taken are released.
+    fn error(&self, py: Python<'_>, e: &LoaderError, msg: String) -> PyErr {
+        let err = SafetensorError::new_err(msg);
+        if let (true, Some(cause)) = (e.is_failure(), self.error.get()) {
+            // the allocator thread releases them: never wait for it from itself
+            if std::thread::current().name() != Some(ALLOCATOR_THREAD) {
+                py.detach(|| {
+                    let mut exited = self.exited.lock().unwrap();
+                    while !*exited {
+                        exited = self.exit.wait(exited).unwrap();
+                    }
+                });
+            }
+            err.set_cause(py, Some(cause.clone_ref(py)));
+        }
+        err
+    }
+}
+
+/// Every loader started in this process, for [`halt_prefetch_loaders`]; `None`
+/// once it ran
+static LIVE_LOADERS: Mutex<Option<Vec<Weak<Background>>>> = Mutex::new(Some(Vec::new()));
+static ATEXIT_HOOK: PyOnceLock<()> = PyOnceLock::new();
+static HOOK_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Registered with `atexit`: no allocator thread may reach for the GIL once the
+/// interpreter finalizes, so stop them, and the workers, before.
+#[pyfunction]
+fn halt_prefetch_loaders(py: Python<'_>) {
+    // a forked child has none of its parent's threads: nothing to halt
+    if std::process::id() != HOOK_PID.load(Ordering::Relaxed) {
+        return;
+    }
+    let live: Vec<_> = LIVE_LOADERS
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for background in live {
+        background.halt(py);
+    }
+}
+
+/// The allocator thread: keeps the destinations [`ALLOC_AHEAD`] bytes ahead of
+/// the read schedule, taking the GIL once per batch. A failure ends the load and
+/// releases the tensors not taken.
+fn allocate_ahead(background: Arc<Background>, mut alloc: Allocation) {
+    let bg = &*background;
+    let _exited = Exited(bg);
+    let (mut entered, mut failed) = (false, false);
+    while !alloc.done() {
+        if bg.stop.load(Ordering::Acquire) || bg.feed.stopped() {
+            return;
+        }
+        let scheduled = bg.feed.scheduled();
+        let target = alloc.before[scheduled] + ALLOC_AHEAD;
+        if alloc.before[bg.feed.provided()] >= target {
+            bg.feed.wait_scheduled(scheduled);
+            continue;
+        }
+        let more = Python::attach(|py| {
+            if bg.stop.load(Ordering::Acquire) {
+                return false;
+            }
+            if !entered {
+                // the current stream is per thread
+                entered = true;
+                let set = get_module(py, &TORCH_MODULE).and_then(|torch| {
+                    torch
+                        .getattr(intern!(py, "cuda"))?
+                        .call_method1(intern!(py, "set_stream"), (bg.stream.bind(py),))
+                });
+                if let Err(cause) = set {
+                    let reason = format!("cannot enter the allocating stream: {cause}");
+                    let _ = bg.error.set(cause);
+                    bg.feed.fail(reason);
+                    failed = true;
+                    return false;
+                }
+            }
+            match alloc.batch(py, target) {
+                Ok(dsts) => match bg.feed.provide(dsts, bg.stream_raw) {
+                    Ok(()) => true,
+                    Err((e, dsts)) => {
+                        drop(dsts);
+                        bg.feed.fail(e.to_string()); // no-op once closed
+                        failed = true;
+                        false
+                    }
+                },
+                Err(AllocFailure { reason, cause }) => {
+                    let _ = bg.error.set(cause);
+                    bg.feed.fail(reason);
+                    failed = true;
+                    false
+                }
+            }
+        });
+        if !more {
+            break;
+        }
+    }
+    if failed {
+        // joined without the GIL, dropped attached so torch frees them now
+        let untaken = bg.feed.close();
+        Python::attach(|_| drop(untaken));
+    }
+}
+
+/// Sets [`Background::exited`] however the allocator thread ends, panics included.
+struct Exited<'a>(&'a Background);
+
+impl Drop for Exited<'_> {
+    fn drop(&mut self) {
+        *self.0.exited.lock().unwrap() = true;
+        self.0.exit.notify_all();
+    }
+}
+
+/// Hands `tensor` out on the consumer's current stream, resolved before the take
+/// so it can't fail with the tensor in hand: when that isn't the allocating
+/// stream, torch must not reuse its memory before that stream is done with it.
+fn hand_out(
+    py: Python<'_>,
+    tensor: Py<PyAny>,
+    (current, raw): (PyBound<'_, PyAny>, u64),
+    alloc_stream: u64,
+) -> PyResult<Py<PyAny>> {
+    if raw != alloc_stream {
+        tensor.call_method1(py, intern!(py, "record_stream"), (current,))?;
+    }
+    Ok(tensor)
 }
 
 #[pymethods]
@@ -696,11 +1045,11 @@ impl PrefetchLoader {
     /// The names this loader hands out, in file order. (Not `keys`: a loader is
     /// not a mapping, each tensor is taken once, and `dict(loader)` must iterate.)
     pub fn names(&self) -> Vec<String> {
-        self.spans.iter().map(|span| span.name.clone()).collect()
+        self.names.clone()
     }
 
     fn __len__(&self) -> usize {
-        self.spans.len()
+        self.names.len()
     }
 
     /// Takes `name`'s tensor, waiting if its bytes have not landed yet.
@@ -708,22 +1057,26 @@ impl PrefetchLoader {
     /// Each tensor can be taken once, by [`Self::take`] or by iterating the
     /// loader; asking again raises. Rows planned as a slice come back as that slice.
     pub fn take(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let (buffer, meta) = self.take_buffer(py, name)?;
-        match buffer {
-            DeviceBuffer::Cuda(buffer) => {
-                cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)
-            }
-        }
+        let &idx = self.index_map.get(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
+        })?;
+        let current = current_stream(py, self.device)?;
+        let taken = py.detach(|| self.loader.take_tensor(idx));
+        let tensor = taken.map_err(|e| self.background.error(py, &e, format!("{name}: {e}")))?;
+        hand_out(py, tensor, current, self.alloc_stream)
     }
 
     /// `(name, tensor)` pairs as their bytes land, so the order is unspecified;
     /// tensors already taken are skipped.
     fn __iter__(slf: PyRef<'_, Self>) -> TensorStream {
         let iter = slf.loader.iter();
-        let entries = slf.spans.clone();
+        let names = slf.names.clone();
         TensorStream {
             iter,
-            entries,
+            names,
+            device: slf.device,
+            alloc_stream: slf.alloc_stream,
+            background: slf.background.clone(),
             _keepalive: Some(Py::from(slf).into_any()),
         }
     }
@@ -731,7 +1084,10 @@ impl PrefetchLoader {
     /// Stops the background load and releases every tensor not taken yet.
     /// Tensors already handed out keep their memory.
     pub fn close(&mut self, py: Python<'_>) {
-        py.detach(|| self.loader.close());
+        self.background.halt(py);
+        // dropped attached, so torch frees them now
+        let untaken = py.detach(|| self.loader.close());
+        drop(untaken);
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -746,6 +1102,12 @@ impl PrefetchLoader {
         _traceback: Py<PyAny>,
     ) {
         self.close(py);
+    }
+}
+
+impl Drop for PrefetchLoader {
+    fn drop(&mut self) {
+        Python::attach(|py| self.close(py));
     }
 }
 
@@ -931,8 +1293,8 @@ impl Open {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> Option<HashMap<String, String>> {
-        self.metadata.metadata().clone()
+    pub fn metadata(&self) -> Option<BTreeMap<String, String>> {
+        self.metadata.metadata().clone().map(BTreeMap::from_iter)
     }
 
     /// Returns the names of the tensors in the file.
@@ -958,6 +1320,7 @@ impl Open {
     /// Start loading tensors to the device in the background; see `safe_open.prefetch`.
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
@@ -1026,18 +1389,81 @@ impl Open {
             metas.push(SpanMeta {
                 name,
                 dtype: info.dtype,
-                shape,
+                storage_shape: torch_storage_shape(info.dtype, &shape)?,
             });
         }
 
         if rows_of.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+
+        // torch allocates the tensors on the stream current here, as the load advances:
+        // the first [`ALLOC_AHEAD`] bytes now, the rest from the allocator thread
+        let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
+        let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
+        let mut loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        let started = (|| -> PyResult<_> {
+            let (stream, stream_raw) = current_stream(py, device_idx)?;
+            let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
+            let mut alloc = Allocation::new(metas, sizes, piece, device_idx);
+            let first = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
+            let feed = loader.feed();
+            feed.provide(first, stream_raw)
+                .map_err(|(e, _)| PyErr::from(e))?;
+            ATEXIT_HOOK.get_or_try_init(py, || -> PyResult<()> {
+                HOOK_PID.store(std::process::id(), Ordering::Relaxed);
+                let hook = wrap_pyfunction!(halt_prefetch_loaders, py)?;
+                PyModule::import(py, intern!(py, "atexit"))?
+                    .call_method1(intern!(py, "register"), (hook,))?;
+                Ok(())
+            })?;
+            let background = Arc::new(Background {
+                stop: AtomicBool::new(false),
+                thread: Mutex::new(None),
+                feed,
+                stream: stream.unbind(),
+                stream_raw,
+                error: OnceLock::new(),
+                exited: Mutex::new(alloc.done()),
+                exit: Condvar::new(),
+            });
+            {
+                let mut live = LIVE_LOADERS.lock().unwrap();
+                // a thread started now would outlive the hook into finalization
+                let live = live.as_mut().ok_or_else(|| {
+                    SafetensorError::new_err("cannot prefetch once the interpreter exits")
+                })?;
+                live.retain(|w| w.strong_count() > 0);
+                live.push(Arc::downgrade(&background));
+            }
+            if !alloc.done() {
+                let thread = std::thread::Builder::new()
+                    .name(ALLOCATOR_THREAD.into())
+                    .spawn({
+                        let background = background.clone();
+                        move || allocate_ahead(background, alloc)
+                    })
+                    // the hook may already wait on it
+                    .inspect_err(|_| drop(Exited(&background)))?;
+                *background.thread.lock().unwrap() = Some(thread);
+            }
+            Ok((background, stream_raw))
+        })();
+        let (background, alloc_stream) = match started {
+            Ok(started) => started,
+            Err(err) => {
+                let untaken = py.detach(|| loader.close());
+                drop(untaken);
+                return Err(err);
+            }
+        };
         Ok(PrefetchLoader {
             loader,
-            spans: metas,
+            names,
             index_map,
+            device: device_idx,
+            alloc_stream,
+            background,
         })
     }
 
@@ -1651,9 +2077,12 @@ impl From<LoaderError> for PyErr {
 /// order, each tensor delivered once.
 #[pyclass]
 pub struct TensorStream {
-    iter: TensorIter,
+    iter: TensorIter<Py<PyAny>>,
     /// per span, aligned with the loader's spans
-    entries: Vec<SpanMeta>,
+    names: Vec<String>,
+    device: i32,
+    alloc_stream: u64,
+    background: Arc<Background>,
     _keepalive: Option<Py<PyAny>>,
 }
 
@@ -1664,17 +2093,13 @@ impl TensorStream {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(String, Py<PyAny>)>> {
+        let current = current_stream(py, self.device)?;
         match py.detach(|| self.iter.next()) {
             None => Ok(None),
-            Some(Err(e)) => Err(e.into()),
-            Some(Ok((idx, buffer))) => {
-                let meta = &mut self.entries[idx];
-                let tensor = match buffer {
-                    DeviceBuffer::Cuda(buffer) => {
-                        cuda_tensor_from_buffer(py, meta.dtype, &meta.shape, buffer)?
-                    }
-                };
-                Ok(Some((std::mem::take(&mut meta.name), tensor)))
+            Some(Err(e)) => Err(self.background.error(py, &e, e.to_string())),
+            Some(Ok((idx, tensor))) => {
+                let tensor = hand_out(py, tensor, current, self.alloc_stream)?;
+                Ok(Some((std::mem::take(&mut self.names[idx]), tensor)))
             }
         }
     }
@@ -1699,19 +2124,18 @@ impl TensorStream {
 ///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
 ///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
 ///         loads a full model several times faster than `"mmap"`.
-#[pyclass]
+#[pyclass(frozen)]
 #[allow(non_camel_case_types)]
 struct safe_open {
-    inner: Option<Open>,
+    /// `None` once closed. Each call works on its own reference, so closing never
+    /// waits for one: the file closes when the last call returns.
+    inner: Mutex<Option<Arc<Open>>>,
 }
 
 impl safe_open {
-    fn inner(&self) -> PyResult<&Open> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
-        Ok(inner)
+    fn inner(&self) -> PyResult<Arc<Open>> {
+        let inner = self.inner.lock().unwrap().clone();
+        inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
 
@@ -1725,15 +2149,18 @@ impl safe_open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend)?);
-        Ok(Self { inner })
+        let open = Open::new(filename, framework, device, backend)?;
+        Ok(Self {
+            inner: Mutex::new(Some(Arc::new(open))),
+        })
     }
 
     /// Start loading the file's tensors to a CUDA device in the background.
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
-    /// readiness order, as zero-copy views of device memory. The handle itself
+    /// readiness order, as tensors torch allocates as the load advances, at most
+    /// about 1 GiB ahead of the reads. The handle itself
     /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
     /// started from one handle (for instance one per device). Requires
     /// `framework="pt"`; works with either backend. Each loader runs `threads`
@@ -1752,7 +2179,10 @@ impl safe_open {
     ///         Reader threads for this loader.
     ///
     /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
-    /// slice has a step other than 1, or if a sliced tensor is 0-d.
+    /// slice has a step other than 1, if a sliced tensor is 0-d, or if torch can't
+    /// allocate the first 1 GiB. A later allocation failure ends the load: `take`
+    /// and iteration raise, and the tensors not taken are released at once; after
+    /// any other failure they are released at `close`.
     ///
     /// Example:
     /// ```python
@@ -1766,11 +2196,12 @@ impl safe_open {
     #[pyo3(signature = (plan=None, *, device=None, threads=8))]
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads)
     }
 
     /// Return the special non tensor information in the header
@@ -1778,7 +2209,7 @@ impl safe_open {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
+    pub fn metadata(&self) -> PyResult<Option<BTreeMap<String, String>>> {
         Ok(self.inner()?.metadata())
     }
 
@@ -1882,8 +2313,9 @@ impl safe_open {
     }
 
     /// Exits the context manager
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
-        self.inner = None;
+    pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
+        // dropped once the lock is released
+        let _open = self.inner.lock().unwrap().take();
     }
 }
 
@@ -1915,7 +2347,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, Span, TensorIter};
+use crate::engine::{Feed, Loader, LoaderError, Span, TensorIter};
 
 struct Disp(Vec<TensorIndexer>);
 
@@ -2429,7 +2861,7 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
     let mut shape = logical_shape.to_vec();
     if dtype == Dtype::F4 {
         let n = shape.len();
-        if n == 0 || shape[n - 1] % 2 != 0 {
+        if n == 0 || !shape[n - 1].is_multiple_of(2) {
             return Err(SafetensorError::new_err(format!(
                 "f4_x2 dtype requires the last dim be divisible by 2 in torch: got {logical_shape:?}",
             )));
@@ -2457,64 +2889,6 @@ fn torch_empty_cuda(
     Ok(torch
         .call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?
         .unbind())
-}
-
-fn cuda_tensor_from_buffer(
-    py: Python<'_>,
-    dtype: Dtype,
-    logical_shape: &[usize],
-    buffer: CudaBuffer,
-) -> PyResult<Py<PyAny>> {
-    let torch = get_module(py, &TORCH_MODULE)?;
-    let storage_shape = torch_storage_shape(dtype, logical_shape)?;
-
-    if buffer.len() == 0 {
-        return torch_empty_cuda(py, torch, dtype, &storage_shape, buffer.device());
-    }
-
-    let stream: u64 = torch
-        .getattr(intern!(py, "_C"))?
-        .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (buffer.device(),))?
-        .extract()?;
-    buffer.consumed_on(stream);
-    let device = dlpack::cuda_device(buffer.device());
-    // Tensors are views at their packed file offset inside a shared allocation,
-    // which may be misaligned for the element type: stage through a flat uint8
-    // view and let torch's aligned clone fix it
-    if buffer.ptr() % (dtype.bitsize() / 8).max(1) as u64 != 0 {
-        let nbytes = buffer.len() as i64;
-        let capsule = dlpack::to_capsule(py, buffer, vec![nbytes], dlpack::uint8_dlpack(), device)?;
-        let shape: Py<PyAny> = storage_shape.into_pyobject(py)?.into();
-        return Ok(torch
-            .call_method1(intern!(py, "from_dlpack"), (capsule,))?
-            .call_method0(intern!(py, "clone"))?
-            .call_method1(intern!(py, "view"), (get_pydtype(torch, dtype, false)?,))?
-            .call_method1(intern!(py, "reshape"), (shape,))?
-            .unbind());
-    }
-    let shape_i64 = storage_shape.iter().map(|&n| n as i64).collect();
-    let view_target = if dlpack::dlpack_supported_native(dtype) {
-        None
-    } else {
-        dlpack::torch_view_target(dtype)
-    };
-    let dl_dtype = if view_target.is_some() {
-        dlpack::uint8_dlpack()
-    } else {
-        dlpack::dtype_to_dlpack(dtype)
-    };
-
-    let capsule = dlpack::to_capsule(py, buffer, shape_i64, dl_dtype, device)?;
-    let tensor = torch.call_method1(intern!(py, "from_dlpack"), (capsule,))?;
-    match view_target {
-        Some(name) => {
-            let target = torch.getattr(name)?;
-            Ok(tensor
-                .call_method1(intern!(py, "view"), (target,))?
-                .unbind())
-        }
-        None => Ok(tensor.unbind()),
-    }
 }
 
 /// Hand a filled `MTLBuffer` to the framework as a tensor via DLPack.
@@ -2567,7 +2941,7 @@ fn mps_tensor_from_buf(
 }
 
 /// Whether torch's `from_dlpack` accepts an MPS-device capsule, added in
-/// torch 2.9. We advertise support back to 2.4, so older torch takes the
+/// torch 2.9. We advertise support back to 2.6, so older torch takes the
 /// generic CPU-tensor + `.to("mps")` path instead: correct on every version,
 /// but it copies host->device rather than aliasing the `MTLBuffer`.
 ///
@@ -2865,19 +3239,18 @@ pyo3::create_exception!(
     "Custom Python Exception for Safetensor errors."
 );
 
-#[pyclass]
+#[pyclass(frozen)]
 #[allow(non_camel_case_types)]
 struct _safe_open_handle {
-    inner: Option<Open>,
+    /// `None` once closed. Each call works on its own reference, so closing never
+    /// waits for one: the file closes when the last call returns.
+    inner: Mutex<Option<Arc<Open>>>,
 }
 
 impl _safe_open_handle {
-    fn inner(&self) -> PyResult<&Open> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
-        Ok(inner)
+    fn inner(&self) -> PyResult<Arc<Open>> {
+        let inner = self.inner.lock().unwrap().clone();
+        inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
 
@@ -2897,19 +3270,22 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend)?);
-        Ok(Self { inner })
+        let open = Open::new(filename, framework, device, backend)?;
+        Ok(Self {
+            inner: Mutex::new(Some(Arc::new(open))),
+        })
     }
 
     /// See [`safe_open::prefetch`].
     #[pyo3(signature = (plan=None, *, device=None, threads=8))]
     pub fn prefetch(
         &self,
+        py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads)
     }
 
     /// Return the special non tensor information in the header
@@ -2917,7 +3293,7 @@ impl _safe_open_handle {
     /// Returns:
     ///     (`Dict[str, str]`):
     ///         The freeform metadata.
-    pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
+    pub fn metadata(&self) -> PyResult<Option<BTreeMap<String, String>>> {
         Ok(self.inner()?.metadata())
     }
 
@@ -3007,8 +3383,9 @@ impl _safe_open_handle {
     }
 
     /// Exits the context manager
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
-        self.inner = None;
+    pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
+        // dropped once the lock is released
+        let _open = self.inner.lock().unwrap().take();
     }
 }
 

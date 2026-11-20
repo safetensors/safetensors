@@ -21,7 +21,7 @@ recommendations below help keep your runtime and local environment safe.
 ### Remote artefacts
 
 Models uploaded on the Hugging Face Hub come in different formats. We heavily recommend uploading and downloading
-models in the [`safetensors`](https://github.com/huggingface/safetensors) format, which cannot execute arbitrary code when loaded.
+models in the [`safetensors`](https://github.com/safetensors/safetensors) format, which cannot execute arbitrary code when loaded.
 
 When loading a model through a downstream library that supports multiple formats (e.g. `transformers`, `diffusers`),
 prefer the option that forces the use of safetensors (such as `use_safetensors=True` in `transformers`) so that

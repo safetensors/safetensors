@@ -28,11 +28,11 @@ However you choose to contribute, please be mindful and respect our [code of con
 
 There are many ways to contribute to Safetensors:
 
-- **Fix outstanding issues** in the [issue tracker](https://github.com/huggingface/safetensors/issues), especially those tagged [`good first issue`](https://github.com/huggingface/safetensors/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22) or [`help wanted`](https://github.com/huggingface/safetensors/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22).
-- **Submit bug reports or feature requests** by [opening a new issue](https://github.com/huggingface/safetensors/issues/new/choose).
+- **Fix outstanding issues** in the [issue tracker](https://github.com/safetensors/safetensors/issues), especially those tagged [`good first issue`](https://github.com/safetensors/safetensors/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22) or [`help wanted`](https://github.com/safetensors/safetensors/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22).
+- **Submit bug reports or feature requests** by [opening a new issue](https://github.com/safetensors/safetensors/issues/new/choose).
 - **Improve documentation** — if anything is unclear, incomplete, or missing, a PR is always appreciated.
 - **Write tests** — more test coverage means more confidence in correctness.
-- **Help others** by answering questions in [issues](https://github.com/huggingface/safetensors/issues).
+- **Help others** by answering questions in [issues](https://github.com/safetensors/safetensors/issues).
 
 ---
 
@@ -77,7 +77,7 @@ For **spec-level changes** (new dtypes, changes to the header format, etc.), ple
 
 Don't hesitate to ask questions! You can:
 
-- Open a [GitHub Discussion](https://github.com/huggingface/safetensors/discussions)
+- Open a [GitHub Discussion](https://github.com/safetensors/safetensors/discussions)
 - Tag your StackOverflow question with `safetensors`
 
 ---
@@ -99,7 +99,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update
 
 # Clone the repo
-git clone https://github.com/huggingface/safetensors.git
+git clone https://github.com/safetensors/safetensors.git
 cd safetensors
 ```
 

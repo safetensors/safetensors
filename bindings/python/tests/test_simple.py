@@ -81,6 +81,36 @@ class TestCase(unittest.TestCase):
         out2 = save({"test2": data, "test1": data})
         self.assertEqual(out1, out2)
 
+    def test_serialization_non_contiguous(self):
+        data = np.arange(6, dtype=np.int32).reshape(2, 3)
+        views = {"transposed": data.T, "strided": data[:, ::2], "reversed": data[::-1]}
+        copies = {name: view.copy() for name, view in views.items()}
+        self.assertEqual(save(views), save(copies))
+
+    def test_load_keeps_values(self):
+        tensors = {
+            "i32": np.arange(6, dtype=np.int32).reshape(2, 3),
+            "f64": np.linspace(0.5, 3.0, 6),
+        }
+        for name, tensor in load(save(tensors)).items():
+            np.testing.assert_array_equal(tensor, tensors[name])
+
+    def test_serialization_metadata_deterministic(self):
+        tensors = {"test": np.zeros((2, 2), dtype=np.int32)}
+        metadata = {k: k for k in ["e", "b", "d", "a", "c"]}
+        out = save(tensors, metadata=metadata)
+        self.assertIn(b'{"a":"a","b":"b","c":"c","d":"d","e":"e"}', out)
+        for _ in range(5):
+            self.assertEqual(save(tensors, metadata=dict(metadata)), out)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(5):
+                filename = os.path.join(tmpdir, f"out_{i}.safetensors")
+                save_file(tensors, filename, metadata=dict(metadata))
+                self.assertEqual(Path(filename).read_bytes(), out)
+            with safe_open(filename, framework="np") as f:
+                self.assertEqual(list(f.metadata()), ["a", "b", "c", "d", "e"])
+
     def test_serialization_forces_alignment(self):
         data = np.zeros((2, 2), dtype=np.int32)
         data2 = np.zeros((2, 2), dtype=np.float16)
@@ -392,3 +422,25 @@ class ReadmeTestCase(unittest.TestCase):
                 str(cm.exception),
                 "Error during slicing [:, :20] with shape [10, 5]: index 19 out of bounds for tensor dimension #1 of size 5",
             )
+
+    def test_numpy_slice_negative_bounds(self):
+        A = np.random.rand(10, 5)
+        filename = f"./slice_neg_{threading.get_ident()}.safetensors"
+        save_file({"a": A}, filename)
+
+        with safe_open(filename, framework="np", device="cpu") as f:
+            slice_ = f.get_slice("a")
+            for index in [
+                np.s_[-3:],
+                np.s_[:-1],
+                np.s_[-4:-2],
+                np.s_[:, -2:],
+                np.s_[2:, :-3],
+                np.s_[-20:],
+                np.s_[:-20],
+                np.s_[-2:-5],
+                np.s_[-1, -3:],
+            ]:
+                tensor = slice_[index]
+                self.assertEqual(tensor.shape, A[index].shape, index)
+                self.assertTrue(np.array_equal(tensor, A[index]), index)

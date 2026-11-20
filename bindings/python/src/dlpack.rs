@@ -1,14 +1,20 @@
 //! DLPack v0 producer + Python capsule wrapping.
+// The producer only serves Metal buffers; the dtype helpers are used everywhere.
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
-use crate::engine::CudaBuffer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
 
@@ -22,7 +28,6 @@ use crate::metal::MTLBuffer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DLDeviceType {
     Cpu = 1,
-    Cuda = 2,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Metal = 8,
 }
@@ -103,17 +108,13 @@ impl AsDevicePtr for MTLBuffer {
     }
 }
 
-impl AsDevicePtr for CudaBuffer {
-    fn as_device_ptr(&self) -> *mut c_void {
-        self.ptr() as *mut c_void
-    }
-}
-
 struct ManagedCtx<B: AsDevicePtr> {
     _device_buf: B,
     /// Boxed slice (not `Vec`) so the pointer + length stay stable without
     /// tracking capacity; `DLTensor.shape` points into this.
     shape: Box<[i64]>,
+    /// Shared with the capsule context, which outlives this ctx.
+    deleted: Arc<AtomicBool>,
 }
 
 /// # Safety
@@ -126,7 +127,8 @@ unsafe extern "C" fn managed_tensor_deleter<B: AsDevicePtr>(self_ptr: *mut DLMan
     }
     let ctx_ptr = unsafe { (*self_ptr).manager_ctx as *mut ManagedCtx<B> };
     if !ctx_ptr.is_null() {
-        unsafe { drop(Box::from_raw(ctx_ptr)) };
+        let ctx = unsafe { Box::from_raw(ctx_ptr) };
+        ctx.deleted.store(true, Ordering::Release);
     }
     unsafe { drop(Box::from_raw(self_ptr)) };
 }
@@ -213,13 +215,6 @@ pub(crate) fn cpu_device() -> DLDevice {
     }
 }
 
-pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
-    DLDevice {
-        device_type: DLDeviceType::Cuda,
-        device_id: ordinal,
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn metal_device() -> DLDevice {
     DLDevice {
@@ -240,9 +235,11 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
     let ndim = shape.len() as i32;
     let data = device_buf.as_device_ptr();
 
+    let deleted = Arc::new(AtomicBool::new(false));
     let ctx = Box::new(ManagedCtx {
         _device_buf: device_buf,
         shape: shape.into_boxed_slice(),
+        deleted: deleted.clone(),
     });
 
     let shape_ptr = ctx.shape.as_ptr() as *mut i64;
@@ -282,10 +279,28 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
     let capsule = capsule.inspect_err(|_| {
         unsafe { managed_tensor_deleter::<B>(managed) };
     })?;
+    // The capsule owns one reference to `deleted`, released in `capsule_destructor`.
+    let ctx = Arc::into_raw(deleted).cast_mut().cast::<c_void>();
+    if let Err(e) = capsule.set_context(ctx) {
+        // The capsule never took this reference; reclaim it. The capsule drops
+        // with a null context and deletes the tensor.
+        drop(unsafe { Arc::from_raw(ctx.cast::<AtomicBool>()) });
+        return Err(e);
+    }
     Ok(capsule.unbind())
 }
 
 unsafe extern "C" fn capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
+    // torch only renames the capsule once `from_dlpack` succeeds; if it throws
+    // after its storage took ownership, the tensor is already freed.
+    let ctx = unsafe { pyo3::ffi::PyCapsule_GetContext(capsule) }.cast::<AtomicBool>();
+    if !ctx.is_null() {
+        // Take back the capsule's reference to the flag; it drops at the end of this block.
+        let deleted = unsafe { Arc::from_raw(ctx) };
+        if deleted.load(Ordering::Acquire) {
+            return;
+        }
+    }
     let name_ptr = CAPSULE_NAME.as_ptr();
     if unsafe { pyo3::ffi::PyCapsule_IsValid(capsule, name_ptr) } == 0 {
         return;
