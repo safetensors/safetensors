@@ -1,20 +1,31 @@
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs::File, ops::Range, os::unix::fs::FileExt, sync::Arc};
+#[cfg(target_os = "linux")]
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use super::{
     pool::Slab,
     transfer::{Error, Source, Staged},
 };
+#[cfg(target_os = "linux")]
+use super::{
+    pool::SlabPool,
+    transfer::{transfer, Plan, Sink, CHUNK_SIZE},
+};
 
 /// The largest alignment of offset, length and buffer a direct read may need
 pub(super) const DIRECT_ALIGN: usize = 4096;
 
-/// A file read with `O_DIRECT` where the filesystem allows it
+/// A file read or written with `O_DIRECT` where the filesystem allows it
 pub(super) struct DirectFile {
     file: Arc<File>,
     #[cfg(target_os = "linux")]
     direct: Option<Direct>,
+    /// of a file written: a direct write pads the chunk that ends there
+    #[cfg(target_os = "linux")]
+    size: u64,
 }
 
 impl DirectFile {
@@ -25,7 +36,7 @@ impl DirectFile {
         {
             use std::os::fd::AsRawFd;
             let direct = match direct {
-                Some(true) | None if aligned_slabs => Direct::open(&file, direct.is_none()),
+                Some(true) | None if aligned_slabs => Direct::open(&file, false, direct.is_none()),
                 _ => None,
             };
             if direct.is_none() {
@@ -36,7 +47,11 @@ impl DirectFile {
                 let _ =
                     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
             }
-            Self { file, direct }
+            Self {
+                file,
+                direct,
+                size: 0,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -67,6 +82,182 @@ impl DirectFile {
         self.file.read_exact_at(&mut slab[..len], offset)?;
         Ok(0)
     }
+
+    /// `file`, empty, to write `size` bytes to; the bytes are allocated now.
+    #[cfg(target_os = "linux")]
+    pub(super) fn create(file: Arc<File>, size: u64) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` holds an open descriptor for the call's duration
+        let allocated = libc::off_t::try_from(size)
+            .is_ok_and(|len| unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len) } == 0);
+        if !allocated {
+            file.set_len(size)?;
+        }
+        Ok(Self {
+            direct: Direct::open(&file, true, false),
+            file,
+            size,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Sink for DirectFile {
+    fn drain(&self, mut staged: Staged) -> Result<(), Error> {
+        let offset = staged.file().start;
+        if let Some(direct) = self
+            .direct
+            .as_ref()
+            .filter(|d| d.ok.load(Ordering::Relaxed))
+        {
+            match direct.write(&mut staged, self.size) {
+                Some(Err(e)) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    direct.ok.store(false, Ordering::Relaxed);
+                }
+                Some(written) => return Ok(written?),
+                None => {}
+            }
+        }
+        self.file.write_all_at(staged.bytes(), offset)?;
+        Ok(())
+    }
+}
+
+/// A new file beside a path, renamed over it by [`Self::persist`] and
+/// removed if dropped before
+#[cfg(target_os = "linux")]
+struct TempFile {
+    path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl TempFile {
+    /// `.tmp` and 6 random letters or digits, in the directory of `path`, with
+    /// the permissions of a new file. Some filesystems can't remove an open
+    /// file: drop the file first.
+    fn beside(path: &Path) -> std::io::Result<(Self, Arc<File>)> {
+        use std::{hash::BuildHasher, os::unix::fs::OpenOptionsExt};
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let mut attempts = 0u32;
+        loop {
+            let mut n = std::collections::hash_map::RandomState::new().hash_one(attempts);
+            let name: String = (0..6)
+                .map(|_| {
+                    let c = CHARS[(n % CHARS.len() as u64) as usize];
+                    n /= CHARS.len() as u64;
+                    c as char
+                })
+                .collect();
+            let temp = dir.join(format!(".tmp{name}"));
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(&temp);
+            match opened {
+                Ok(file) => return Ok((Self { path: Some(temp) }, Arc::new(file))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 1 << 16 => {
+                    attempts += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn persist(mut self, path: &Path) -> std::io::Result<()> {
+        std::fs::rename(self.path.as_ref().unwrap(), path)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Writes the `size` bytes `from` holds to a new file, which replaces `path`
+/// once complete: a mapping of a previous `path` keeps its bytes.
+#[cfg(target_os = "linux")]
+pub(super) fn write_file(
+    path: &Path,
+    size: u64,
+    from: &impl Source,
+    pool: &Arc<SlabPool>,
+    threads: usize,
+) -> Result<(), Error> {
+    let chunk = CHUNK_SIZE.get() as u64;
+    let chunks = || -> Box<[Range<u64>]> {
+        (0..size.div_ceil(chunk))
+            .map(|c| c * chunk..((c + 1) * chunk).min(size))
+            .collect()
+    };
+    let temp = || -> std::io::Result<(TempFile, Arc<File>)> {
+        let (temp, file) = TempFile::beside(path)?;
+        // The file keeps the permissions of the one it replaces, where the
+        // filesystem has any.
+        if let Ok(replaced) = std::fs::metadata(path) {
+            let _ = file.set_permissions(replaced.permissions());
+        }
+        Ok((temp, file))
+    };
+    let replaced = (|| {
+        let (temp, file) = temp()?;
+        let to = DirectFile::create(file.clone(), size)?;
+        // The last chunk goes first: a filesystem that only takes a file front
+        // to back refuses it before any byte is written.
+        let mut chunks = chunks().into_vec();
+        let last = chunks.pop().into_iter().collect();
+        transfer(Plan::new(last), from, &to, pool, 1)?;
+        transfer(Plan::new(chunks.into()), from, &to, pool, threads)?;
+        // drops the padding of a direct write
+        file.set_len(size)?;
+        temp.persist(path)?;
+        Ok(())
+    })();
+    match replaced {
+        // Object store mounts only take a file written front to back, with no
+        // truncation or write at an offset; some have no rename either, and
+        // then only take a new file.
+        Err(Error::Io(e)) if refused(&e) => {
+            let front_to_back = |file: Arc<File>| {
+                let to = DirectFile {
+                    file,
+                    direct: None,
+                    size,
+                };
+                transfer(Plan::new(chunks()), from, &to, pool, 1)
+            };
+            if path.exists() {
+                let (temp, file) = temp()?;
+                front_to_back(file)?;
+                Ok(temp.persist(path)?)
+            } else {
+                let file = File::options().write(true).create_new(true).open(path)?;
+                front_to_back(Arc::new(file)).inspect_err(|_| {
+                    let _ = std::fs::remove_file(path);
+                })
+            }
+        }
+        replaced => replaced,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refused(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM | libc::EINVAL)
+    )
 }
 
 impl Source for DirectFile {
@@ -84,17 +275,18 @@ struct Direct {
     align: usize,
     /// whether a chunk the page cache holds is read from it
     cached_first: bool,
-    /// cleared when a direct read fails with `EINVAL`
+    /// cleared when a direct read or write fails with `EINVAL`
     ok: AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
 impl Direct {
-    fn open(file: &File, cached_first: bool) -> Option<Self> {
+    fn open(file: &File, write: bool, cached_first: bool) -> Option<Self> {
         use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
         let align = direct_align(file)?;
         let file = std::fs::OpenOptions::new()
-            .read(true)
+            .read(!write)
+            .write(write)
             .custom_flags(libc::O_DIRECT)
             .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .ok()?;
@@ -123,6 +315,22 @@ impl Direct {
             }
         }
         Ok(head)
+    }
+
+    /// Writes `staged` at its offset in a file of `size` bytes, the chunk that
+    /// ends the file padded with zeros up to the alignment; `None` when the
+    /// offset, length or bytes are not aligned.
+    fn write(&self, staged: &mut Staged, size: u64) -> Option<std::io::Result<()>> {
+        let (offset, len) = (staged.file().start, staged.bytes().len());
+        let len = match staged.file().end == size {
+            true => len.next_multiple_of(self.align),
+            false => len,
+        };
+        let buf = staged.padded(len)?;
+        let aligned = offset % self.align as u64 == 0
+            && len.is_multiple_of(self.align)
+            && buf.as_ptr().addr().is_multiple_of(self.align);
+        aligned.then(|| self.file.write_all_at(buf, offset))
     }
 }
 
@@ -172,6 +380,7 @@ fn read_cached(file: &File, buf: &mut [u8], offset: u64) -> usize {
     let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
     n.max(0) as usize
 }
+
 #[cfg(test)]
 pub(super) mod tests {
     use std::ops::Range;

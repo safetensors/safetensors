@@ -74,6 +74,15 @@ impl Staged {
         &self.slab[self.head..self.head + len]
     }
 
+    /// The bytes followed by zeros, `len` in all, if the slab holds them
+    #[cfg(target_os = "linux")]
+    pub fn padded(&mut self, len: usize) -> Option<&[u8]> {
+        let bytes = (self.file.end - self.file.start) as usize;
+        let padded = self.slab.get_mut(self.head..self.head + len)?;
+        padded[bytes.min(len)..].fill(0);
+        Some(padded)
+    }
+
     /// The slab, to keep until the bytes are no longer read
     pub fn into_slab(self) -> Slab {
         self.slab
@@ -195,4 +204,29 @@ pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &Arc<SlabPool
             }
         }
     }
+}
+
+/// Moves every chunk of `plan` from `from` to `to` on up to `threads` workers,
+/// and returns once they are done, with the first error.
+#[cfg(target_os = "linux")]
+pub fn transfer(
+    plan: Plan,
+    from: &impl Source,
+    to: &impl Sink,
+    pool: &Arc<SlabPool>,
+    threads: usize,
+) -> Result<(), Error> {
+    let threads = threads.clamp(1, plan.chunks.len().max(1));
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let spawned =
+                std::thread::Builder::new().spawn_scoped(s, || work(&plan, from, to, pool));
+            if let Err(e) = spawned {
+                plan.fail(e.into());
+                to.stop();
+                break;
+            }
+        }
+    });
+    plan.error.into_inner().map_or(Ok(()), Err)
 }
