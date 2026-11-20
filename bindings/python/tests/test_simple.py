@@ -313,7 +313,7 @@ class ReadmeTestCase(unittest.TestCase):
 
         # the spec keeps the memory it describes alive
         spec = TensorSpec(
-            dtype="int64", shape=[4], data=np.arange(4, dtype=np.int64).view(np.uint8)
+            dtype="int64", shape=[4], data=np.arange(4, dtype="<i8").view(np.uint8)
         )
         self.assertEqual(spec.data_len, 32)
         loaded = load(serialize({"test": spec}))
