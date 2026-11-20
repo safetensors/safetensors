@@ -803,6 +803,14 @@ class PrefetchCudaTests(unittest.TestCase):
         save_file(sd, out)
         self._assert_matches_source(load_file_pt(out, device="cuda:0"))
 
+    def test_load_file_to_cuda(self):
+        # through prefetch, onto the handle's device, from either backend
+        for i in range(min(2, torch.cuda.device_count())):
+            for backend in ("mmap", "pread"):
+                sd = load_file_pt(self.path, device=f"cuda:{i}", backend=backend)
+                self._assert_matches_source(sd)
+                self.assertTrue(all(t.device.index == i for t in sd.values()))
+
     def test_take_from_threads(self):
         # how transformers calls it: takes from a thread pool
         with self._open() as loader:
