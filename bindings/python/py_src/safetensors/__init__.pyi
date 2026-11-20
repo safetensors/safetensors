@@ -249,9 +249,8 @@ class safe_open:
         backend (`str`, *keyword-only*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (the default)
             memory-maps the file; `"pread"` reads tensor bytes with `pread(2)`.
-            On Apple-silicon MPS, prefer `"pread"`: it reads straight into the
-            shared `MTLBuffer` (1x model memory, no page-cache duplication) and
-            loads a full model several times faster than `"mmap"`.
+            On Apple-silicon MPS, `get_tensor` with `"pread"` reads straight into
+            the tensor's Metal buffer.
     """
     def __init__(
         self,
@@ -386,12 +385,9 @@ class safe_open:
 
         Equivalent to iterating `offset_keys()` and calling `get_tensor` on
         each, but specific `framework` + `device` combinations take an internal
-        fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
-        it bulk-allocates shared `MTLBuffer`s, fills them with parallel
-        `pread(2)`, and hands them to torch via DLPack with no extra copy. On a
-        CUDA device with PyTorch, it loads through `prefetch`. On the CPU with
-        PyTorch and the `"pread"` backend, on Linux, it reads the file in
-        parallel.
+        fast path. On a CUDA device with PyTorch, and on Apple-silicon MPS with
+        torch 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
+        and the `"pread"` backend, on Linux, it reads the file in parallel.
 
         Returns:
             (`Dict[str, Tensor]`):
