@@ -150,6 +150,15 @@ impl Scatter for CudaDevice {
     fn allocation_end(&self, addr: u64) -> Option<u64> {
         self.api.allocation_end(addr)
     }
+
+    fn queued(&self, stream: u64) -> Result<Option<Arc<dyn Fence>>, Error> {
+        let event = CudaEvent::record(self.api, self.device, stream as _)?;
+        Ok(Some(Arc::new(event)))
+    }
+
+    fn enter(&self) {
+        let _ = self.api.set_device(self.device);
+    }
 }
 
 impl Gather for CudaDevice {
