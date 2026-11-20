@@ -408,6 +408,11 @@ fn buffered_write_to_file<V: View>(
     // truncated under any mmap of it (e.g. tensors returned by `load_file`).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let (file, temp) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
+    // The tempfile is private to its owner: the new file keeps the permissions
+    // of the one it replaces, where the filesystem has any.
+    if let Ok(replaced) = std::fs::metadata(path) {
+        let _ = file.set_permissions(replaced.permissions());
+    }
     let written = write(&file);
     // Closed before `temp` is renamed or removed: some filesystems can't remove
     // an open file.
@@ -1433,6 +1438,29 @@ mod tests {
         let reloaded = SafeTensors::deserialize(&raw).unwrap();
         assert_eq!(reloaded.tensor("w").unwrap().data(), bytes.as_slice());
         std::fs::remove_file(&filename).unwrap();
+    }
+
+    #[cfg(all(feature = "std", unix))]
+    #[test]
+    fn test_serialize_to_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let filename = dir.path().join("model.safetensors");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let bytes = [0u8; 4];
+        let view = TensorView::new(Dtype::I32, vec![1], &bytes).unwrap();
+        let metadata: HashMap<String, TensorView> = [("w".to_string(), view)].into_iter().collect();
+
+        serialize_to_file(&metadata, None, &filename).unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::File::create(&plain).unwrap();
+        assert_eq!(mode(&filename), mode(&plain));
+
+        std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o640)).unwrap();
+        serialize_to_file(&metadata, None, &filename).unwrap();
+        assert_eq!(mode(&filename), 0o640);
     }
 
     #[test]
