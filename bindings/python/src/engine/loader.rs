@@ -47,6 +47,8 @@ use super::{
     pool::SlabPool,
     transfer::{self, Error, Plan, Sink, CHUNK_SIZE},
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::{memory::Host, pool::HostMemory, pool::SLAB_SIZE};
 use safetensors::slice::Gather;
 
 #[derive(Debug)]
@@ -305,6 +307,23 @@ impl<D: Send + 'static> Loader<D> {
         let space = Box::new(CudaDevice::new(cuda_api, device)?);
         let pool = cuda_api.with_device(device, |_| pinned_pool(cuda_api))?;
         Self::start(file, direct, threads, plan, space, pool)
+    }
+
+    /// As [`Self::load`], to host memory: destinations are host addresses, and
+    /// [`Feed::provide`] ignores its stream.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn load_host(
+        file: Arc<File>,
+        direct: Option<bool>,
+        in_file_offset: usize,
+        threads: usize,
+        spans: Vec<Span>,
+        gathers: Vec<Option<Gather>>,
+    ) -> Result<Self, LoaderError> {
+        let plan = LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE);
+        let slabs = threads.max(1) * SLAB_SIZE;
+        let pool = SlabPool::new(Box::new(HostMemory::new(slabs)), SLAB_SIZE);
+        Self::start(file, direct, threads, plan, Box::new(Host), pool)
     }
 
     /// Starts the workers of a load to `space`, which stage chunks in `pool`.

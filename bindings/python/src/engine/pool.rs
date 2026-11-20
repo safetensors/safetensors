@@ -28,7 +28,11 @@ pub unsafe trait Backing: Send + Sync {
 }
 
 /// Zeroed host memory, aligned to [`DIRECT_ALIGN`]
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 pub struct HostMemory {
     _bytes: Vec<u8>,
     /// of the aligned start in `_bytes`, taken with `as_mut_ptr`
@@ -36,7 +40,11 @@ pub struct HostMemory {
     size: usize,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 impl HostMemory {
     pub fn new(size: usize) -> Self {
         let mut bytes = vec![0; size + DIRECT_ALIGN];
@@ -52,7 +60,11 @@ impl HostMemory {
 
 // SAFETY: `size` bytes at `addr` in `_bytes`, which is neither resized nor
 // accessed otherwise until dropped
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 unsafe impl Backing for HostMemory {
     fn ptr(&self) -> *mut u8 {
         self.addr as *mut u8
