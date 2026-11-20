@@ -1,5 +1,6 @@
 #![deny(missing_docs)]
 //! Dummy doc
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dlpack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod metal;
