@@ -344,7 +344,7 @@ pub trait Gather: Send + Sync {
 }
 
 /// Host memory, copied by the worker
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub struct Host;
 
 #[cfg(target_os = "linux")]
@@ -361,7 +361,7 @@ impl Gather for Host {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 impl Scatter for Host {
     fn scatter(
         &self,

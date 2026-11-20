@@ -228,7 +228,7 @@ class PreadBackendTests(unittest.TestCase):
     def test_prefetch_works_from_any_backend(self):
         # the backend only decides how get_slice reads; a loader opens its own reads
         with safe_open(self.path, framework="pt", device="cpu", backend="mmap") as f:
-            with self.assertRaisesRegex(Exception, "cuda devices, not cpu"):
+            with self.assertRaisesRegex(Exception, "devices, not cpu"):
                 f.prefetch()
 
     def test_prefetch_requires_pt(self):
@@ -309,7 +309,7 @@ class PreadBackendTests(unittest.TestCase):
         with safe_open(
             self.path, framework="pt", device="cuda:0", backend="pread"
         ) as f:
-            with self.assertRaisesRegex(Exception, "cuda devices, not cpu"):
+            with self.assertRaisesRegex(Exception, "devices, not cpu"):
                 f.prefetch(device="cpu")
 
     def test_prefetch_loader_is_exported(self):
@@ -331,6 +331,81 @@ class PreadBackendTests(unittest.TestCase):
                 self.assertEqual(got.dtype, expected.dtype, k)
                 self.assertEqual(got.shape, expected.shape, k)
                 np.testing.assert_array_equal(got, expected)
+
+
+@unittest.skipUnless(
+    torch.backends.mps.is_available()
+    and tuple(int(n) for n in torch.__version__.split(".")[:2]) >= (2, 9),
+    "needs MPS and torch 2.9",
+)
+class PrefetchMpsTests(unittest.TestCase):
+    """`prefetch` to MPS: tensors on Metal buffers the loader fills."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tempdir.name, "tiny.safetensors")
+        save_file(SOURCE_TENSORS, self.path)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_tensors_match_source(self):
+        for backend in ("mmap", "pread"):
+            with safe_open(
+                self.path, framework="pt", device="mps", backend=backend
+            ) as f:
+                with f.prefetch() as loader:
+                    loaded = dict(loader)
+            self.assertEqual(set(loaded), set(SOURCE_TENSORS))
+            for name, expected in SOURCE_TENSORS.items():
+                self.assertEqual(loaded[name].device.type, "mps", name)
+                self.assertEqual(loaded[name].dtype, expected.dtype, name)
+                self.assertEqual(loaded[name].shape, expected.shape, name)
+                self.assertTrue(_tensors_equal(loaded[name].cpu(), expected), name)
+
+    def test_plan_rows_match_source(self):
+        plan = {
+            "fp32_2d": slice(1, 3),
+            "fp16_3d": (slice(None), [0, 2]),
+            "i64_1d": None,
+        }
+        with safe_open(self.path, framework="pt") as f:
+            with f.prefetch(plan, device="mps") as loader:
+                rows = loader.take("fp32_2d")
+                with self.assertRaisesRegex(Exception, "already delivered"):
+                    loader.take("fp32_2d")
+                with self.assertRaisesRegex(Exception, "not in the prefetch plan"):
+                    loader.take("bf16_2d")
+                rest = dict(loader)
+        self.assertTrue(torch.equal(rows.cpu(), SOURCE_TENSORS["fp32_2d"][1:3]))
+        self.assertEqual(set(rest), {"fp16_3d", "i64_1d"})
+        self.assertTrue(
+            torch.equal(rest["fp16_3d"].cpu(), SOURCE_TENSORS["fp16_3d"][:, [0, 2]])
+        )
+        self.assertTrue(torch.equal(rest["i64_1d"].cpu(), SOURCE_TENSORS["i64_1d"]))
+
+    def test_tensors_larger_than_a_chunk(self):
+        # several 16 MiB chunks per tensor, and chunks that span two tensors
+        big = os.path.join(self.tempdir.name, "big.safetensors")
+        source = {
+            f"t{i}": torch.arange((5 + i) << 20, dtype=torch.float32) + i
+            for i in range(4)
+        }
+        save_file(source, big)
+        with safe_open(big, framework="pt", device="mps") as f:
+            with f.prefetch(threads=4) as loader:
+                loaded = dict(loader)
+        for name, expected in source.items():
+            self.assertTrue(torch.equal(loaded[name].cpu(), expected), name)
+
+    def test_closing_releases_the_tensors_not_taken(self):
+        with safe_open(self.path, framework="pt", device="mps") as f:
+            loader = f.prefetch()
+            taken = loader.take("fp32_2d")
+            loader.close()
+            with self.assertRaisesRegex(Exception, "closed"):
+                loader.take("i64_1d")
+        self.assertTrue(torch.equal(taken.cpu(), SOURCE_TENSORS["fp32_2d"]))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")

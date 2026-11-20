@@ -188,14 +188,16 @@ class PySafeSlice:
 
 class PrefetchLoader:
     """
-    The tensors of one file loading to a CUDA device in the background, returned by
-    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating, as a
-    tensor torch allocated on the CUDA stream current at `prefetch`, so torch accounts for it and
-    frees it when dropped; tensors not taken are released at `close`.
+    The tensors of one file loading to a CUDA or MPS device in the background, returned by
+    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating; tensors not
+    taken are released at `close`.
 
-    Tensors are ready on any stream when handed out. Their memory is kept for the stream current
-    at hand-out too; reading one on yet another stream needs `record_stream`, as for any torch
-    tensor.
+    On CUDA, each one is a tensor torch allocated on the stream current at `prefetch`, so torch
+    accounts for it and frees it when dropped. Tensors are ready on any stream when handed out.
+    Their memory is kept for the stream current at hand-out too; reading one on yet another
+    stream needs `record_stream`, as for any torch tensor.
+
+    On MPS, each one wraps a Metal buffer allocated by safetensors, as with `get_tensor`.
     """
 
     def names(self) -> List[str]:
@@ -262,20 +264,24 @@ class safe_open:
         direct: Optional[bool] = None,
     ) -> "PrefetchLoader":
         """
-        Start loading the file's tensors to a CUDA device in the background.
+        Start loading the file's tensors to a CUDA device, or to MPS on Apple silicon, in
+        the background.
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
-        iterating it as `(name, tensor)` pairs in readiness order, as tensors torch allocates
+        iterating it as `(name, tensor)` pairs in readiness order, as tensors allocated
         as the load advances, at most about 1 GiB ahead of the reads. The handle itself is
         unchanged: its header queries and `get_slice` keep working, and several loaders can be
         started from one handle (for instance one per device). Requires `framework="pt"`; works
-        with either backend. Each loader runs `threads` reader threads; all loaders in the
-        process share one pinned staging pool.
+        with either backend. Each loader runs `threads` reader threads; all CUDA loaders in
+        the process share one pinned staging pool.
 
-        Tensors are allocated on the CUDA stream current at the call, and their copies
-        wait for the work queued on that stream when they are allocated. To load
+        On CUDA, torch allocates the tensors on the stream current at the call, and their
+        copies wait for the work queued on that stream when they are allocated. To load
         independently of that work, call `prefetch` under a side stream
         (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
+
+        On MPS, which needs torch 2.9 or later, each tensor wraps a Metal buffer allocated
+        by safetensors, as with `get_tensor`, and reads go through the page cache.
 
         Args:
             plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -288,7 +294,7 @@ class safe_open:
                 Tensors absent from the plan are not loaded by this loader.
                 `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
-                The CUDA device to load to; defaults to the handle's `device`.
+                The CUDA device to load to, or `"mps"`; defaults to the handle's `device`.
             threads (`int`, defaults to 16):
                 Reader threads for this loader.
             direct (`bool`, *optional*):
