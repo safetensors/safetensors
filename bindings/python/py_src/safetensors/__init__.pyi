@@ -310,7 +310,9 @@ class safe_open:
                 uncached for later loads. `None` (the default) reads the parts already
                 cached from the cache and the rest directly; `True` reads everything
                 directly; `False` reads everything through the cache. Filesystems that
-                do not support direct reads always go through the cache.
+                do not support direct reads always go through the cache. On macOS, `None`
+                reads through the cache too, and `True` still takes from the cache what it
+                holds.
 
         Raises if a planned tensor has a dtype the installed torch cannot represent
         (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
