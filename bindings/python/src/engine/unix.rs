@@ -674,6 +674,13 @@ impl<D> LoaderInner<D> {
         self.schedule.notify_all();
     }
 
+    /// Stops loading and returns the owners not taken. A `take_tensor` waiting in
+    /// another thread returns its owner or an error: `Closed`, or what failed the load.
+    fn close(&self) -> Vec<D> {
+        self.halt();
+        self.sink.release()
+    }
+
     /// Signals the workers and joins them; the owners stay in the sink.
     fn halt(&self) {
         self.signal_stop();
@@ -766,8 +773,7 @@ impl<D> Feed<D> {
 
     /// Stops the load, joins the workers and returns the owners not taken.
     pub fn close(&self) -> Vec<D> {
-        self.inner.halt();
-        self.inner.sink.release()
+        self.inner.close()
     }
 }
 
@@ -834,10 +840,9 @@ impl<D> Loader<D> {
         }
     }
 
-    /// Stops loading and returns the owners not taken.
-    pub fn close(&mut self) -> Vec<D> {
-        self.inner.halt();
-        self.inner.sink.release()
+    /// See [`LoaderInner::close`].
+    pub fn close(&self) -> Vec<D> {
+        self.inner.close()
     }
 
     pub fn iter(&self) -> TensorIter<D> {

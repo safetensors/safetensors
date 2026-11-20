@@ -678,7 +678,7 @@ struct SpanMeta {
 /// Tensors are ready on any stream when handed out. Their memory is kept for the
 /// stream current at hand-out too; reading one on yet another stream needs
 /// `record_stream`, as for any torch tensor.
-#[pyclass]
+#[pyclass(frozen)]
 pub struct PrefetchLoader {
     loader: Loader<Py<PyAny>>,
     /// per span, aligned with the spans given to `loader`
@@ -889,23 +889,38 @@ struct Background {
 }
 
 impl Background {
-    /// Stops the load and joins the allocator thread, then the workers, without
-    /// the GIL.
-    /// The tensors not taken stay with the loader.
+    /// Stops the allocator thread, then the workers, and returns once they exited;
+    /// waits without the GIL. The tensors not taken stay with the loader.
     fn halt(&self, py: Python<'_>) {
         self.stop.store(true, Ordering::Release);
         let thread = self.thread.lock().unwrap().take();
-        // dropped from the allocator thread itself (a collection it triggered): it
-        // returns on its own once it sees `stop`
-        let thread = thread.filter(|t| t.thread().id() != std::thread::current().id());
         py.detach(|| {
             // wakes the allocator thread
             self.feed.stop();
-            if let Some(thread) = thread {
-                let _ = thread.join();
+            match thread {
+                // dropped from the allocator thread itself (a collection it triggered):
+                // it returns on its own once it sees `stop`
+                Some(t) if t.thread().id() == std::thread::current().id() => {}
+                Some(t) => {
+                    let _ = t.join();
+                }
+                // another closer joins it
+                None => self.wait_exited(),
             }
             self.feed.halt();
         });
+    }
+
+    /// Waits until the allocator thread exited, or returns at once on an allocator
+    /// thread, which may be this one. Call without the GIL.
+    fn wait_exited(&self) {
+        if std::thread::current().name() == Some(ALLOCATOR_THREAD) {
+            return;
+        }
+        let mut exited = self.exited.lock().unwrap();
+        while !*exited {
+            exited = self.exit.wait(exited).unwrap();
+        }
     }
 
     /// `msg` as a `SafetensorError`, caused by the allocation failure if any. That
@@ -913,15 +928,8 @@ impl Background {
     fn error(&self, py: Python<'_>, e: &LoaderError, msg: String) -> PyErr {
         let err = SafetensorError::new_err(msg);
         if let (true, Some(cause)) = (e.is_failure(), self.error.get()) {
-            // the allocator thread releases them: never wait for it from itself
-            if std::thread::current().name() != Some(ALLOCATOR_THREAD) {
-                py.detach(|| {
-                    let mut exited = self.exited.lock().unwrap();
-                    while !*exited {
-                        exited = self.exit.wait(exited).unwrap();
-                    }
-                });
-            }
+            // the allocator thread releases them before it exits
+            py.detach(|| self.wait_exited());
             err.set_cause(py, Some(cause.clone_ref(py)));
         }
         err
@@ -1089,7 +1097,7 @@ impl PrefetchLoader {
 
     /// Stops the background load and releases every tensor not taken yet.
     /// Tensors already handed out keep their memory.
-    pub fn close(&mut self, py: Python<'_>) {
+    pub fn close(&self, py: Python<'_>) {
         self.background.halt(py);
         // dropped attached, so torch frees them now
         let untaken = py.detach(|| self.loader.close());
@@ -1101,7 +1109,7 @@ impl PrefetchLoader {
     }
 
     fn __exit__(
-        &mut self,
+        &self,
         py: Python<'_>,
         _exc_type: Py<PyAny>,
         _exc_value: Py<PyAny>,
@@ -1408,7 +1416,7 @@ impl Open {
         // the first [`ALLOC_AHEAD`] bytes now, the rest from the allocator thread
         let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
-        let mut loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
         let started = (|| -> PyResult<_> {
             let (stream, stream_raw) = current_stream(py, device_idx)?;
             let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
