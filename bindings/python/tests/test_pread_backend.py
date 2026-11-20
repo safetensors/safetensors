@@ -75,6 +75,17 @@ def _allocator_threads():
     return count
 
 
+def _matmul_seconds(x):
+    # how long one `x @ x` takes on the current stream
+    x @ x
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(5):
+        x @ x
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) / 5
+
+
 def _tensors_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     # torch.equal is not implemented for sub-byte / fp8 dtypes on some builds,
     # so reinterpret the underlying storage as uint8 and compare bytes.
@@ -688,6 +699,65 @@ class PrefetchCudaTests(unittest.TestCase):
                 sd = dict(zip(names, pool.map(loader.take, names)))
         self._assert_matches_source(sd)
 
+    def test_take_on_another_stream(self):
+        # handed out on a stream other than the allocating one: recorded on that stream
+        side = torch.cuda.Stream(device=0)
+        with (
+            self._open() as loader,
+            mock.patch.object(torch.Tensor, "record_stream") as record,
+        ):
+            a = loader.take("fp32_2d")
+            record.assert_not_called()
+            with torch.cuda.stream(side):
+                b = loader.take("i64_1d")
+            record.assert_called_once_with(side)
+        self.assertTrue(torch.equal(a.cpu(), SOURCE_TENSORS["fp32_2d"]))
+        self.assertTrue(torch.equal(b.cpu(), SOURCE_TENSORS["i64_1d"]))
+
+    def test_prefetch_on_a_side_stream(self):
+        # allocated on a side stream, handed out on the default one: every tensor is
+        # recorded for real, the empty and the 0-d one included
+        side = torch.cuda.Stream(device=0)
+        with torch.cuda.stream(side):
+            loader = self._open()
+        with loader:
+            sd = dict(loader)
+        torch.cuda.synchronize()
+        self._assert_matches_source(sd)
+
+    def test_waits_for_the_allocating_stream(self):
+        # in deterministic mode torch.empty fills new tensors with a kernel on the
+        # allocating stream, queued here behind about 1 s of matmuls: a copy that
+        # didn't wait for the fill would be overwritten
+        path = os.path.join(self.tempdir.name, "pattern.safetensors")
+        sizes = [64 * 1024 + i for i in range(16)]
+        _write_u8(path, sizes)
+        x = torch.randn(16384, 16384, device="cuda:0")
+        n = max(2, round(1.0 / _matmul_seconds(x)))
+        # the switch, the fill kernel and the staging pool are slow the first time
+        torch.use_deterministic_algorithms(True)
+        try:
+            with self._open(path) as loader:
+                dict(loader)
+        finally:
+            torch.use_deterministic_algorithms(False)
+        torch.cuda.synchronize()
+        for _ in range(n):
+            x @ x  # before the switch: cuBLAS refuses deterministic mode
+        torch.use_deterministic_algorithms(True)
+        try:
+            loader = self._open(path)
+        finally:
+            torch.use_deterministic_algorithms(False)
+        self.assertFalse(
+            torch.cuda.current_stream(0).query(), "the allocating stream is idle"
+        )
+        with loader:
+            sd = dict(loader)
+        torch.cuda.synchronize()
+        for i, size in enumerate(sizes):
+            self.assertTrue(torch.equal(sd[f"t{i}"], _pattern(i, size)), f"t{i}")
+
     def test_close_mid_stream(self):
         loader = self._open()
         stream = iter(loader)
@@ -852,6 +922,35 @@ class PrefetchAllocationTests(unittest.TestCase):
         self.assertEqual(streams, {side.cuda_stream})
         torch.cuda.synchronize()
         self._check(sd)
+
+    def test_side_stream_load_ignores_queued_work(self):
+        # started under a side stream, with at least 4 s of matmuls queued on the default
+        # stream as the tensors are taken: the takes return long before that work drains
+        path = os.path.join(self.tempdir.name, "side.safetensors")
+        _write_u8(path, [64 * MIB] * 32, fill=False)  # 2 GiB: past the first batch
+        x = torch.randn(16384, 16384, device="cuda:0")
+        per_take = -int(-4.0 // (32 * _matmul_seconds(x)))  # rounded up
+        side = torch.cuda.Stream(device=0)
+        with torch.cuda.stream(side):
+            loader = safe_open(path, framework="pt").prefetch(device="cuda:0")
+        with loader:
+            dict(loader)  # the allocator's blocks for the side stream
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.stream(side):
+            loader = safe_open(path, framework="pt").prefetch(device="cuda:0")
+        with loader:
+            taken = []
+            for name in loader.names():
+                taken.append(loader.take(name))
+                for _ in range(per_take):
+                    x @ x
+            takes = time.perf_counter() - start
+        torch.cuda.synchronize()
+        drained = time.perf_counter() - start
+        self.assertLess(
+            takes, drained / 4, f"takes {takes:.2f} s, work drained {drained:.2f} s"
+        )
 
     def test_footprint_follows_the_load(self):
         gc.collect()

@@ -260,6 +260,11 @@ class safe_open:
         with either backend. Each loader runs `threads` reader threads; all loaders in the
         process share one pinned staging pool.
 
+        Tensors are allocated on the CUDA stream current at the call, and their copies
+        wait for the work queued on that stream when they are allocated. To load
+        independently of that work, call `prefetch` under a side stream
+        (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
+
         Args:
             plan (`Dict[str, Optional[slice]]`, *optional*):
                 Which tensors to load: keys are tensor names, values `None` for
