@@ -2219,33 +2219,12 @@ impl Open {
 
     /// Returns every tensor in the file as a `{name: Tensor}` dict.
     ///
-    /// Default behavior is a sequential loop over `get_tensor`. Pytorch on
-    /// Apple-silicon MPS with the `pread` backend instead bulk-allocates
-    /// Shared `MTLBuffer`s, parallel-`pread`s into them, and hands them to
-    /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
-    /// The `mmap` backend uses the sequential loop, reading through the mmap.
-    /// Pytorch on a CUDA device loads through [`Open::prefetch`] when a CUDA
-    /// runtime is loaded. Pytorch on the CPU with the `pread` backend on Linux
-    /// reads the file in parallel, see [`Self::get_tensors_pread_cpu`].
+    /// Default behavior is a sequential loop over `get_tensor`. Pytorch loads
+    /// through [`Open::prefetch`] on a CUDA device when a CUDA runtime is loaded,
+    /// and on MPS when torch takes Metal buffers and the file's dtypes. Pytorch
+    /// on the CPU with the `pread` backend on Linux reads the file in parallel,
+    /// see [`Self::get_tensors_pread_cpu`].
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        // The bulk parallel-pread path is gated on the `pread` backend so the
-        // `backend` choice is honored: `mmap` falls through to the per-tensor
-        // loop below, which reads through the mmap via `get_tensor_mps`.
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if self.device == Device::Mps
-            && self.framework == Framework::Pytorch
-            && torch_supports_mps_dlpack()
-            && self
-                .metadata
-                .tensors()
-                .values()
-                .all(|info| dlpack::torch_mps_compatible(info.dtype))
-        {
-            if let Storage::Pread(file) = self.storage.as_ref() {
-                return self.get_tensors_mps(file);
-            }
-        }
-
         #[cfg(all(target_os = "linux", target_endian = "little"))]
         if self.framework == Framework::Pytorch && self.device == Device::Cpu {
             if let Storage::Pread(file) = self.storage.as_ref() {
@@ -2255,10 +2234,20 @@ impl Open {
             }
         }
 
-        if self.framework == Framework::Pytorch
-            && matches!(self.device, Device::Cuda(_))
-            && crate::engine::available()
-        {
+        let prefetched = match self.device {
+            Device::Cuda(_) => crate::engine::available(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Device::Mps => {
+                torch_supports_mps_dlpack()
+                    && self
+                        .metadata
+                        .tensors()
+                        .values()
+                        .all(|info| dlpack::torch_mps_compatible(info.dtype))
+            }
+            _ => false,
+        };
+        if self.framework == Framework::Pytorch && prefetched {
             return Python::attach(|py| -> PyResult<Py<PyDict>> {
                 let loader = self.prefetch(py, None, None, GET_TENSORS_THREADS, None)?;
                 let dict = PyDict::new(py);
@@ -2317,55 +2306,6 @@ impl Open {
                 SafetensorError::new_err(format!("Could not read tensors from file: {e}"))
             })?;
             Ok(Some(dict.into()))
-        })
-    }
-
-    /// Bulk-allocates Shared-mode `MTLBuffer`s, parallel-`pread`s straight
-    /// into each buffer's host-coherent contents pointer, then DLPack-hands
-    /// the buffers off to the framework. `file` is the `pread` backend's fd
-    /// (already `F_NOCACHE`d); the caller selects this path only for `Pread`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn get_tensors_mps(&self, file: &File) -> PyResult<Py<PyDict>> {
-        let keys = self.metadata.offset_keys();
-        let mut bufs: Vec<crate::metal::MTLBuffer> = Vec::with_capacity(keys.len());
-        let mut jobs: Vec<PreadJob> = Vec::with_capacity(keys.len());
-        let mut metas: Vec<(String, Dtype, Vec<usize>)> = Vec::with_capacity(keys.len());
-
-        for name in &keys {
-            let info = self.metadata.info(name).ok_or_else(|| {
-                SafetensorError::new_err(format!("Missing tensor info for {name}"))
-            })?;
-            let (begin, end) = info.data_offsets;
-            let nbytes = end - begin;
-            metas.push((name.clone(), info.dtype, info.shape.clone()));
-
-            let buf = crate::metal::MTLBuffer::alloc_shared(nbytes).map_err(|e| {
-                SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}"))
-            })?;
-            if nbytes > 0 {
-                jobs.push(PreadJob {
-                    name: name.clone(),
-                    file_offset: (self.offset + begin) as u64,
-                    nbytes,
-                    write_ptr: buf.contents_ptr() as usize,
-                });
-            }
-            bufs.push(buf);
-        }
-
-        Python::attach(|py| -> PyResult<Py<PyDict>> {
-            if let Err((name, e)) = parallel_pread(py, file, &jobs) {
-                return Err(SafetensorError::new_err(format!(
-                    "pread failed for tensor {name}: {e}"
-                )));
-            }
-
-            let dict = PyDict::new(py);
-            for ((name, dtype, shape), buf) in metas.into_iter().zip(bufs) {
-                let tensor = mps_tensor_from_buf(py, &self.framework, dtype, &shape, buf)?;
-                dict.set_item(&name, tensor)?;
-            }
-            Ok(dict.into())
         })
     }
 
@@ -2468,9 +2408,8 @@ impl TensorStream {
 ///     backend (`str`, *keyword-only*, defaults to `"mmap"`):
 ///         Storage backend used to serve tensor bytes. `"mmap"` (the default)
 ///         memory-maps the file; `"pread"` reads tensor bytes with `pread(2)`.
-///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
-///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
-///         loads a full model several times faster than `"mmap"`.
+///         On Apple-silicon MPS, `get_tensor` with `"pread"` reads straight into
+///         the tensor's Metal buffer.
 #[pyclass(frozen)]
 #[allow(non_camel_case_types)]
 struct safe_open {
@@ -2641,9 +2580,8 @@ impl safe_open {
     /// Returns every tensor in the file as a dict keyed by name.
     ///
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
-    /// each; for `device="mps"` it instead bulk-allocates Shared MTLBuffers,
-    /// parallel-`pread(2)`s into them, and hands them off via DLPack. On a CUDA
-    /// device with PyTorch, it loads through `prefetch`. On the CPU with PyTorch
+    /// each. On a CUDA device with PyTorch, and on Apple-silicon MPS with torch
+    /// 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
     /// and the `"pread"` backend, on Linux, it reads the file in parallel.
     ///
     /// Returns:
@@ -3108,15 +3046,6 @@ fn get_module<'a>(
     Ok(module)
 }
 
-/// One pread(2) job: read `nbytes` from `file_offset` into `write_ptr`.
-#[allow(dead_code)]
-struct PreadJob {
-    name: String,
-    file_offset: u64,
-    nbytes: usize,
-    write_ptr: usize,
-}
-
 /// Mark `file` to bypass the page cache for `read`/`pread` calls on macOS.
 ///
 /// `F_NOCACHE` only affects I/O syscalls on this fd; it has no effect on
@@ -3168,64 +3097,6 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         }
         Ok(())
     }
-}
-
-/// Run a set of pread(2) jobs in parallel without holding the GIL.
-///
-/// Caller must ensure each `(write_ptr, nbytes)` names a distinct, mutable,
-/// allocated buffer that outlives this call (the GIL is released for the
-/// duration). The number of workers is capped at 8: beyond that, NVMe and
-/// Apple SSD reads should be I/O-bound rather than CPU-bound.
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-fn parallel_pread(
-    py: Python<'_>,
-    file: &File,
-    jobs: &[PreadJob],
-) -> Result<(), (String, std::io::Error)> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    py.detach(|| {
-        let next = AtomicUsize::new(0);
-        const MAX_WORKERS: usize = 8;
-        let n_workers = std::thread::available_parallelism()
-            .map_or(4, |n| n.get())
-            .min(MAX_WORKERS)
-            .min(jobs.len().max(1));
-
-        std::thread::scope(|s| -> Result<(), (String, std::io::Error)> {
-            let mut handles = Vec::with_capacity(n_workers);
-            for _ in 0..n_workers {
-                let next = &next;
-                handles.push(s.spawn(move || -> Result<(), (String, std::io::Error)> {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= jobs.len() {
-                            return Ok(());
-                        }
-                        let job = &jobs[i];
-                        // SAFETY: caller contract (distinct, alive, mutable buffers).
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(job.write_ptr as *mut u8, job.nbytes)
-                        };
-                        read_exact_at(file, buf, job.file_offset)
-                            .map_err(|e| (job.name.clone(), e))?;
-                    }
-                }));
-            }
-            for h in handles {
-                h.join().map_err(|_| {
-                    (
-                        "<worker panic>".to_string(),
-                        std::io::Error::other("worker panicked"),
-                    )
-                })??;
-            }
-            Ok(())
-        })
-    })
 }
 
 /// Storage shape for torch tensors. F4 packs two elements per byte, so the
