@@ -14,7 +14,9 @@ use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use pyo3::types::PyCapsule;
-use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyString, PyTuple,
+};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -658,11 +660,11 @@ impl Version {
     }
 }
 
-/// What one span is handed out as: its tensor's name and dtype, and the
+/// What one span is handed out as: its tensor's name and torch dtype, and the
 /// shape torch allocates after row slicing.
 struct SpanMeta {
     name: String,
-    dtype: Dtype,
+    dtype: Py<PyAny>,
     storage_shape: Vec<usize>,
 }
 
@@ -815,6 +817,7 @@ impl Allocation {
             reason: "torch is not imported".into(),
             cause,
         })?;
+        let device = PyString::new(py, &format!("cuda:{}", self.device)).into_any();
         let mut dsts = Vec::new();
         while !self.done() && self.before[self.next] < target {
             let i = self.next;
@@ -829,14 +832,16 @@ impl Allocation {
                         .extract()
                 };
                 if free().is_ok_and(|free| free >= self.warm[i]) {
-                    self.warming =
-                        torch_empty_cuda(py, torch, Dtype::U8, &[self.warm[i]], self.device)
-                            .is_ok();
+                    self.warming = get_pydtype(torch, Dtype::U8, false)
+                        .and_then(|uint8| {
+                            torch_empty_cuda(py, torch, &uint8, &[self.warm[i]], &device)
+                        })
+                        .is_ok();
                 }
             }
             let tensor = (|| -> PyResult<(u64, Py<PyAny>)> {
                 let tensor =
-                    torch_empty_cuda(py, torch, meta.dtype, &meta.storage_shape, self.device)?;
+                    torch_empty_cuda(py, torch, &meta.dtype, &meta.storage_shape, &device)?;
                 let tensor = tensor.bind(py);
                 let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
                 if nbytes != size {
@@ -1345,6 +1350,7 @@ impl Open {
             None => None,
         };
 
+        let torch = get_module(py, &TORCH_MODULE)?;
         let mut spans = Vec::new();
         let mut metas = Vec::new();
         let mut index_map = HashMap::new();
@@ -1361,14 +1367,14 @@ impl Open {
                 SafetensorError::new_err(format!("File does not contain tensor {name}"))
             })?;
 
-            if !dlpack::dlpack_supported_native(info.dtype)
-                && dlpack::torch_view_target(info.dtype).is_none()
-            {
-                return Err(SafetensorError::new_err(format!(
+            // before anything is allocated: F6 has no torch dtype, and older torch
+            // lacks the newest ones
+            let dtype = get_pydtype(torch, info.dtype, false).map_err(|_| {
+                SafetensorError::new_err(format!(
                     "prefetch cannot hand out dtype {:?}: torch has no matching dtype",
                     info.dtype
-                )));
-            }
+                ))
+            })?;
 
             let (start, end) = info.data_offsets;
             let mut shape = info.shape.clone();
@@ -1388,7 +1394,7 @@ impl Open {
             spans.push(span);
             metas.push(SpanMeta {
                 name,
-                dtype: info.dtype,
+                dtype,
                 storage_shape: torch_storage_shape(info.dtype, &shape)?,
             });
         }
@@ -2178,11 +2184,12 @@ impl safe_open {
     ///     threads (`int`, defaults to 8):
     ///         Reader threads for this loader.
     ///
-    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
-    /// slice has a step other than 1, if a sliced tensor is 0-d, or if torch can't
-    /// allocate the first 1 GiB. A later allocation failure ends the load: `take`
-    /// and iteration raise, and the tensors not taken are released at once; after
-    /// any other failure they are released at `close`.
+    /// Raises if a planned tensor has a dtype the installed torch cannot represent
+    /// (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
+    /// than 1, if a sliced tensor is 0-d, or if torch can't allocate the first 1 GiB.
+    /// A later allocation failure ends the load: `take` and iteration raise, and the
+    /// tensors not taken are released at once; after any other failure they are
+    /// released at `close`.
     ///
     /// Example:
     /// ```python
@@ -2874,15 +2881,13 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
 fn torch_empty_cuda(
     py: Python<'_>,
     torch: &PyBound<PyModule>,
-    dtype: Dtype,
+    dtype: &Py<PyAny>,
     storage_shape: &[usize],
-    device: i32,
+    device: &PyBound<PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let dtype: Py<PyAny> = get_pydtype(torch, dtype, false)?;
     let shape: Py<PyAny> = storage_shape.to_vec().into_pyobject(py)?.into();
-    let device: Py<PyAny> = format!("cuda:{device}").into_pyobject(py)?.into();
     let kwargs = [
-        (intern!(py, "dtype"), dtype),
+        (intern!(py, "dtype"), dtype.bind(py)),
         (intern!(py, "device"), device),
     ]
     .into_py_dict(py)?;

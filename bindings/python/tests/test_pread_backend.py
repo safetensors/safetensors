@@ -234,6 +234,23 @@ class PreadBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "F6_E2M3"):
                 f.prefetch()
 
+    def test_prefetch_rejects_a_dtype_this_torch_lacks(self):
+        # stands in for an older torch (the package allows 2.6, float8_e8m0fnu came with 2.7):
+        # refused while planning, by name, before anything is allocated
+        path = os.path.join(self.tempdir.name, "e8m0.safetensors")
+        header = b'{"x":{"dtype":"F8_E8M0","shape":[4],"data_offsets":[0,4]}}'
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(bytes(4))
+        dtype = getattr(torch, "float8_e8m0fnu", None)
+        if dtype is not None:
+            del torch.float8_e8m0fnu
+            self.addCleanup(setattr, torch, "float8_e8m0fnu", dtype)
+        with safe_open(path, framework="pt", device="cuda:0", backend="pread") as f:
+            with self.assertRaisesRegex(SafetensorError, "F8_E8M0"):
+                f.prefetch()
+
     def test_get_tensor_meta_matches_header(self):
         with open(self.path, "rb") as fh:
             header = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
