@@ -4,14 +4,18 @@
 
 use std::{
     fmt::Display,
+    num::NonZeroUsize,
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
 };
 
 use super::pool::{Slab, SlabPool};
+
+/// The most bytes a worker moves at once
+pub const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
 
 /// Why a transfer failed
 #[derive(Debug)]
@@ -39,6 +43,12 @@ impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+/// Work in flight, such as asynchronous copies
+pub trait Fence: Send + Sync {
+    /// Returns once the work completed.
+    fn wait(&self) -> Result<(), Error>;
 }
 
 /// A chunk's bytes in a slab: the bytes of `file` start `head` bytes into it.
@@ -160,7 +170,7 @@ impl Plan {
 
 /// The worker loop: moves the next chunk of `plan` from `from` to `to`, until
 /// none is left or the plan stops. A failure fails the plan and stops `to`.
-pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &'static SlabPool) {
+pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &Arc<SlabPool>) {
     loop {
         if plan.stopped() {
             return;
