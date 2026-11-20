@@ -7,7 +7,7 @@ use std::{
 
 use super::{
     pool::Slab,
-    transfer::{Error, Source, Staged},
+    transfer::{Error, ReadAt, Source, Staged},
 };
 #[cfg(target_os = "linux")]
 use super::{
@@ -264,6 +264,21 @@ impl Source for DirectFile {
     fn fill(&self, file: Range<u64>, mut slab: Slab) -> Result<Staged, Error> {
         let head = self.read(&mut slab, file.start, (file.end - file.start) as usize)?;
         Ok(Staged::new(slab, head, file))
+    }
+
+    fn unstaged(&self) -> Option<&dyn ReadAt> {
+        // a direct read needs the alignment of a slab
+        #[cfg(target_os = "linux")]
+        if self.direct.is_some() {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+impl ReadAt for DirectFile {
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        self.file.read_exact_at(dst, offset)
     }
 }
 
