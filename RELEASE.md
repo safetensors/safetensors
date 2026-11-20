@@ -93,7 +93,7 @@ The Python version is not set in `pyproject.toml` directly — maturin reads it 
 
 ### 4. Create the release on GitHub
 
-Go to the [GitHub Releases page](https://github.com/huggingface/safetensors/releases) and draft a new release:
+Go to the [GitHub Releases page](https://github.com/safetensors/safetensors/releases) and draft a new release:
 
 - **Choose the release branch** (e.g. `git_v0.8.0`)
 - **Create a new tag** on publish: `v0.8.0`
@@ -120,7 +120,7 @@ Click **Publish release**. This creates the tag, which triggers the three releas
 
 ### 5. Monitor the CI
 
-The tag triggers two workflow runs in the [Actions tab](https://github.com/huggingface/safetensors/actions):
+The tag triggers two workflow runs in the [Actions tab](https://github.com/safetensors/safetensors/actions):
 
 - **CI** (Python release) — builds wheels for every platform × Python version, uploads to PyPI. Can take up to over 30 minutes.
 - **Rust Release** — `cargo publish` to crates.io. A few seconds to minutes.
@@ -169,7 +169,7 @@ Sometimes a release or RC has a problem that needs fixing before GA (e.g. a CI m
      git tag -d v0.8.0-rc.0
      git push origin :refs/tags/v0.8.0-rc.0
      ```
-     Go to the [Releases page](https://github.com/huggingface/safetensors/releases) — the previous release should appear as a draft. Re-publish it; this re-creates the tag on the latest commit and triggers the workflows.
+     Go to the [Releases page](https://github.com/safetensors/safetensors/releases) — the previous release should appear as a draft. Re-publish it; this re-creates the tag on the latest commit and triggers the workflows.
    - **Code change**: bump the RC number in both Cargo.toml files (`0.8.0-rc.0` → `0.8.0-rc.1`). Leave the old tag in place (it's correct for its commit) and create a new release on GitHub with the new tag (`v0.8.0-rc.1`) pointing at the release branch.
 3. **Cherry-pick to `main`.** Once the fix is validated on the release branch (CI green, artifacts published), cherry-pick it back to `main` via a feature branch:
    ```bash

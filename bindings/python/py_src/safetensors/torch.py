@@ -416,16 +416,10 @@ _SIZE = {
     _float8_e5m2fnuz: 1,
     _float8_e8m0: 1,
     _float4_e2m1_x2: 1,
+    torch.uint64: 8,
+    torch.uint32: 4,
+    torch.uint16: 2,
 }
-
-if hasattr(torch, "uint64"):  # Torch 2.3.0+
-    _SIZE.update(
-        {
-            torch.uint64: 8,
-            torch.uint32: 4,
-            torch.uint16: 2,
-        }
-    )
 
 _TYPES = {
     "F64": torch.float64,
@@ -443,16 +437,10 @@ _TYPES = {
     "F8_E5M2": _float8_e5m2,
     "F8_E5M2FNUZ": _float8_e5m2fnuz,
     "C64": torch.complex64,
+    "U64": torch.uint64,
+    "U32": torch.uint32,
+    "U16": torch.uint16,
 }
-
-if hasattr(torch, "uint64"):  # Torch 2.3.0+
-    _TYPES.update(
-        {
-            "U64": torch.uint64,
-            "U32": torch.uint32,
-            "U16": torch.uint16,
-        }
-    )
 
 
 def _getdtype(dtype_str: str) -> torch.dtype:

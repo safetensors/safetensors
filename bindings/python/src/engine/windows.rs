@@ -1,36 +1,12 @@
 use std::fmt::Display;
 use std::fs::File;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-pub enum CudaBuffer {}
+pub struct TensorIter<D>(PhantomData<D>);
 
-impl CudaBuffer {
-    pub(crate) fn ptr(&self) -> u64 {
-        match *self {}
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match *self {}
-    }
-
-    pub(crate) fn device(&self) -> i32 {
-        match *self {}
-    }
-
-    pub(crate) fn consumed_on(&self, _stream: u64) {
-        match *self {}
-    }
-}
-
-pub enum DeviceBuffer {
-    #[allow(dead_code)]
-    Cuda(CudaBuffer),
-}
-
-pub struct TensorIter;
-
-impl Iterator for TensorIter {
-    type Item = Result<(usize, DeviceBuffer), LoaderError>;
+impl<D> Iterator for TensorIter<D> {
+    type Item = Result<(usize, D), LoaderError>;
     fn next(&mut self) -> Option<Self::Item> {
         None
     }
@@ -45,15 +21,58 @@ impl Display for LoaderError {
     }
 }
 
+impl LoaderError {
+    pub fn is_failure(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
 }
 
-pub struct Loader;
+pub struct Loader<D>(PhantomData<D>);
 
-impl Loader {
+pub struct Feed<D>(PhantomData<D>);
+
+impl<D> Feed<D> {
+    #[allow(clippy::type_complexity)]
+    pub fn provide(
+        &self,
+        dsts: Vec<(u64, D)>,
+        _stream: u64,
+    ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
+        Err((LoaderError, dsts))
+    }
+
+    pub fn provided(&self) -> usize {
+        0
+    }
+
+    pub fn scheduled(&self) -> usize {
+        0
+    }
+
+    pub fn stopped(&self) -> bool {
+        true
+    }
+
+    pub fn fail(&self, _reason: String) {}
+
+    pub fn wait_scheduled(&self, _scheduled: usize) {}
+
+    pub fn stop(&self) {}
+
+    pub fn halt(&self) {}
+
+    pub fn close(&self) -> Vec<D> {
+        Vec::new()
+    }
+}
+
+impl<D> Loader<D> {
     pub fn load(
         _file: Arc<File>,
         _in_file_offset: usize,
@@ -64,13 +83,19 @@ impl Loader {
         Err(LoaderError)
     }
 
-    pub fn take_tensor(&self, _idx: usize) -> Result<DeviceBuffer, LoaderError> {
+    pub fn feed(&self) -> Feed<D> {
+        Feed(PhantomData)
+    }
+
+    pub fn take_tensor(&self, _idx: usize) -> Result<D, LoaderError> {
         Err(LoaderError)
     }
 
-    pub fn close(&mut self) {}
+    pub fn close(&mut self) -> Vec<D> {
+        Vec::new()
+    }
 
-    pub fn iter(&self) -> TensorIter {
-        TensorIter
+    pub fn iter(&self) -> TensorIter<D> {
+        TensorIter(PhantomData)
     }
 }

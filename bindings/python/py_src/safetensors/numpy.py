@@ -20,6 +20,9 @@ def _flatten(
     flattened = {}
     for k, v in tensor_dict.items():
         tensor = v
+        if not tensor.flags.c_contiguous:
+            tensor = np.ascontiguousarray(tensor)
+            keep_alive_buffer.append(tensor)
         if not _is_little_endian(tensor):
             tensor = tensor.byteswap(inplace=False)
             keep_alive_buffer.append(tensor)
@@ -60,7 +63,7 @@ def save(
     ```
     """
     _reject_metadata_tensor_name(tensor_dict)
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep copied tensors alive
     serialized = serialize(_flatten(tensor_dict, keep_alive_buffer), metadata=metadata)
     result = bytes(serialized)
     return result
@@ -98,7 +101,7 @@ def save_file(
     ```
     """
     _reject_metadata_tensor_name(tensor_dict)
-    keep_alive_buffer = []  # to keep byteswapped tensors alive
+    keep_alive_buffer = []  # to keep copied tensors alive
     serialize_file(
         _flatten(tensor_dict, keep_alive_buffer), filename, metadata=metadata
     )
@@ -186,6 +189,8 @@ def _view2np(safeview) -> Dict[str, np.ndarray]:
     for k, v in safeview:
         dtype = _getdtype(v["dtype"])
         arr = np.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])
+        if sys.byteorder == "big":
+            arr = arr.byteswap(inplace=False)
         result[k] = arr
     return result
 

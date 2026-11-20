@@ -2,6 +2,17 @@ name: Python
 
 on:
   pull_request:
+    paths:
+      - "safetensors/**"
+      - "bindings/python/**"
+      - "README.md"
+      - "Dockerfile.s390x.test"
+      - ".dockerignore"
+      - ".github/workflows/python.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   build_and_test:
@@ -13,7 +24,7 @@ jobs:
         # Lowest and highest, no version specified so that
         # new releases get automatically tested against
         version: [
-          {torch: torch==2.5, python: "3.10", arch: "x64", numpy: numpy},
+          {torch: torch==2.6, python: "3.11", arch: "x64", numpy: numpy},
           {torch: torch, python: "3.13", arch: "x64", numpy: numpy}
         ]
         include:
@@ -28,12 +39,6 @@ jobs:
               python: "3.14"
               numpy: numpy
               arch: "x64-freethreaded"
-          - os: macos-15-intel
-            version:
-              torch: torch
-              numpy: "numpy==1.26"
-              python: "3.10"
-              arch: "x64"
           - os: macos-latest
             version:
               torch: torch
@@ -99,13 +104,14 @@ jobs:
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
           pip install ".[${{ matrix.version.python == '3.14' && 'tf-nightly' || 'tensorflow' }}]"
-          # XXX: I assume this is still the case for 3.10
+          # XXX: I assume this is still the case for 3.11
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
           pip install ${{ matrix.version.numpy }}
         shell: bash
 
       - name: Install (jax, flax)
-        if: runner.os != 'Windows'
+        # flax pulls grpcio, which has no free-threaded wheel
+        if: runner.os != 'Windows' && matrix.version.arch != 'x64-freethreaded'
         # resolve jax together with the matrix numpy pin: ml_dtypes>=0.6 needs
         # numpy 2 and would otherwise upgrade it under a numpy-1 torch
         run:
@@ -144,7 +150,7 @@ jobs:
           pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
           # importing msgpack._cmsgpack re-enables the GIL, so force-disable
           # until msgpack declares support
-          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py
+          PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py --ignore=tests/test_flax_comparison.py
 
   test_s390x_big_endian:
     runs-on: ubuntu-latest
@@ -210,8 +216,10 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cargo install audit
-        run: cargo install cargo-audit
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
+        with:
+          tool: cargo-audit
 
       - name: Run Audit
         run: cargo audit -D warnings

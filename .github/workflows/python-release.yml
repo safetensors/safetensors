@@ -13,13 +13,24 @@ on:
     tags:
       - '*'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "safetensors/**"
+      - "bindings/python/**"
+      - "README.md"
+      - ".github/workflows/python-release.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   linux:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -27,7 +38,9 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
+          # 26.04's Docker blocks `socketcall`, so i686 containers have no
+          # network: https://github.com/actions/runner-images/issues/14790
+          - runner: ubuntu-24.04
             arch: x86
             target: i686-unknown-linux-gnu
           - runner: ubuntu-latest
@@ -65,6 +78,7 @@ jobs:
           path: dist
 
   musllinux:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -97,6 +111,7 @@ jobs:
           path: dist
 
   windows:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -127,13 +142,14 @@ jobs:
           path: dist
 
   macos:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
         platform:
           - runner: macos-15-intel
             target: x86_64
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64
         python_interpreter: ['3.14', '3.14t']
     steps:
@@ -154,6 +170,7 @@ jobs:
           path: dist
 
   sdist:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
