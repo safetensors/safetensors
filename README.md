@@ -16,7 +16,7 @@ Python
 Rust
 [![Crates.io](https://img.shields.io/crates/v/safetensors.svg)](https://crates.io/crates/safetensors)
 [![Documentation](https://docs.rs/safetensors/badge.svg)](https://docs.rs/safetensors/)
-[![Dependency status](https://deps.rs/repo/github/huggingface/safetensors/status.svg?path=safetensors)](https://deps.rs/repo/github/huggingface/safetensors?path=safetensors)
+[![Dependency status](https://deps.rs/repo/github/safetensors/safetensors/status.svg?path=safetensors)](https://deps.rs/repo/github/safetensors/safetensors?path=safetensors)
 
 # safetensors
 
@@ -43,7 +43,7 @@ For the sources, you need Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Make sure it's up to date and using stable channel
 rustup update
-git clone https://github.com/huggingface/safetensors
+git clone https://github.com/safetensors/safetensors
 cd safetensors/bindings/python
 pip install setuptools_rust
 pip install -e .

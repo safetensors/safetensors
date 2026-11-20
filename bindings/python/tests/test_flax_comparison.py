@@ -72,7 +72,7 @@ class LoadTestCase(unittest.TestCase):
     def test_loading_without_ml_dtype(self):
         # This does not work as we cannot unload
         # modules, copy this into its own file to test.
-        # https://github.com/huggingface/safetensors/issues/598
+        # https://github.com/safetensors/safetensors/issues/598
         sys.modules.pop("ml_dtypes", None)
         with safe_open(self.sf_filename, framework="flax") as f:
             f.get_tensor("test3")
