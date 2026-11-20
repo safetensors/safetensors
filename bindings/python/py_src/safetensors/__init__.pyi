@@ -248,6 +248,7 @@ class safe_open:
         *,
         device: Optional[Union[str, int]] = None,
         threads: int = 8,
+        direct: Optional[bool] = None,
     ) -> "PrefetchLoader":
         """
         Start loading the file's tensors to a CUDA device in the background.
@@ -279,6 +280,13 @@ class safe_open:
                 The CUDA device to load to; defaults to the handle's `device`.
             threads (`int`, defaults to 8):
                 Reader threads for this loader.
+            direct (`bool`, *optional*):
+                Whether to read the file directly from the disk, bypassing the page
+                cache. Direct reads are faster on fast disks but leave the file
+                uncached for later loads. `None` (the default) reads the parts already
+                cached from the cache and the rest directly; `True` reads everything
+                directly; `False` reads everything through the cache. Filesystems that
+                do not support direct reads always go through the cache.
 
         Raises if a planned tensor has a dtype the installed torch cannot represent
         (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
