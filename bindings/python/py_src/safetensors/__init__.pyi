@@ -247,7 +247,7 @@ class safe_open:
         plan: Optional[PrefetchPlan] = None,
         *,
         device: Optional[Union[str, int]] = None,
-        threads: int = 8,
+        threads: int = 16,
         direct: Optional[bool] = None,
     ) -> "PrefetchLoader":
         """
@@ -278,7 +278,7 @@ class safe_open:
                 `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
                 The CUDA device to load to; defaults to the handle's `device`.
-            threads (`int`, defaults to 8):
+            threads (`int`, defaults to 16):
                 Reader threads for this loader.
             direct (`bool`, *optional*):
                 Whether to read the file directly from the disk, bypassing the page

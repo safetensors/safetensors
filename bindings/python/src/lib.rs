@@ -2247,7 +2247,7 @@ impl safe_open {
     ///         `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
     ///         The CUDA device to load to; defaults to the handle's `device`.
-    ///     threads (`int`, defaults to 8):
+    ///     threads (`int`, defaults to 16):
     ///         Reader threads for this loader.
     ///     direct (`bool`, *optional*):
     ///         Whether to read the file directly from the disk, bypassing the page
@@ -2274,7 +2274,7 @@ impl safe_open {
     ///         for name, tensor in loader:
     ///             ...
     /// ```
-    #[pyo3(signature = (plan=None, *, device=None, threads=8, direct=None))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=16, direct=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
@@ -3354,7 +3354,7 @@ impl _safe_open_handle {
     }
 
     /// See [`safe_open::prefetch`].
-    #[pyo3(signature = (plan=None, *, device=None, threads=8, direct=None))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=16, direct=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
