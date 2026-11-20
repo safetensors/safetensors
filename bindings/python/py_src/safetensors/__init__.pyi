@@ -65,6 +65,9 @@ def serialize_file(
     """
     Serializes raw data into file.
 
+    On Linux, a tensor on a CUDA device (`TensorSpec.cuda`) is read from the
+    device: work that writes it must be complete before the call.
+
     Args:
         tensor_dict (`Dict[str, TensorSpec]`):
             Mapping of tensor name to its `TensorSpec`, e.g.:
@@ -99,6 +102,9 @@ class TensorSpec:
     (e.g. a numpy array, `bytes` or a `memoryview`): C-contiguous, in
     little-endian order, as many bytes as `dtype` and `shape` take. The spec
     holds the buffer, which keeps the memory alive until the spec is dropped.
+
+    `TensorSpec.cuda` describes a tensor on a CUDA device: only
+    `serialize_file`, on Linux, reads such a spec.
     """
     def __init__(
         self,
@@ -109,10 +115,36 @@ class TensorSpec:
     ) -> None:
         pass
 
+    @staticmethod
+    def cuda(
+        *,
+        dtype: str,
+        shape: Sequence[int],
+        owner: Any,
+        data_ptr: int,
+        device: int,
+    ) -> "TensorSpec":
+        """
+        Describes a tensor on CUDA device `device`: `data_ptr` is the device
+        address of its bytes, as many as `dtype` and `shape` take, and the spec
+        holds `owner` to keep them alive.
+
+        SAFETY: `data_ptr` is a raw device address. The caller must ensure it
+        is valid for as long as `owner` is alive.
+        """
+        pass
+
     @property
     def data_len(self) -> int:
         """
         The length of the tensor's buffer in bytes.
+        """
+        pass
+
+    @property
+    def device(self) -> Optional[int]:
+        """
+        The index of the CUDA device the tensor is on, `None` for host memory.
         """
         pass
 
