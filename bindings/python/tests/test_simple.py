@@ -1,5 +1,7 @@
+import errno
 import importlib
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -210,7 +212,23 @@ class ErrorsTestCase(unittest.TestCase):
         with self.assertRaises(FileNotFoundError) as ctx:
             with safe_open("notafile", framework="pt"):
                 pass
-        self.assertEqual(str(ctx.exception), "No such file or directory: notafile")
+        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+        self.assertEqual(ctx.exception.filename, "notafile")
+
+    @unittest.skipIf(
+        sys.platform == "win32" or os.geteuid() == 0,
+        "needs a file the user cannot read",
+    )
+    def test_permission_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "unreadable.safetensors")
+            save_file({"a": np.zeros(2)}, path)
+            os.chmod(path, 0)
+            with self.assertRaises(PermissionError) as ctx:
+                with safe_open(path, framework="numpy"):
+                    pass
+            self.assertEqual(ctx.exception.errno, errno.EACCES)
+            self.assertEqual(ctx.exception.filename, path)
 
 
 class ReadmeTestCase(unittest.TestCase):
