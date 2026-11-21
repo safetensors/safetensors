@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 
 import torch
@@ -104,6 +106,16 @@ class TorchModelTestCase(unittest.TestCase):
             _find_shared_tensors({"B": B, "C": C, "D": D}), [{"B", "D"}, {"C"}]
         )
 
+    def test_find_shared_tensors_nested_range_keeps_widest_stop(self):
+        A = torch.zeros((800,), dtype=torch.uint8)
+        a = A[:400]
+        b = A[300:500]
+        c = A[100:200]
+
+        self.assertEqual(
+            _find_shared_tensors({"a": a, "b": b, "c": c}), [{"a", "b", "c"}]
+        )
+
     def test_end_ptr(self):
         A = torch.zeros((4,))
         start = A.data_ptr()
@@ -138,8 +150,11 @@ class TorchModelTestCase(unittest.TestCase):
         self.assertEqual(
             _remove_duplicate_names({"A": A, "B": B, "C": A}), {"A": ["B", "C"]}
         )
+        self.assertEqual(_remove_duplicate_names({"B": B}), {})
+
+        C = A[:2, :]
         with self.assertRaises(RuntimeError):
-            self.assertEqual(_remove_duplicate_names({"B": B}), [])
+            _remove_duplicate_names({"B": B, "C": C})
 
     def test_failure(self):
         model = Model()
@@ -216,6 +231,76 @@ class TorchModelTestCase(unittest.TestCase):
         state_dict = model.state_dict()
         for k, v in model2.state_dict().items():
             torch.testing.assert_close(v, state_dict[k])
+
+    def test_workaround_gru_flattened_parameters_cpu(self):
+        model = torch.nn.GRU(input_size=12, hidden_size=12, batch_first=True)
+        model2 = torch.nn.GRU(input_size=12, hidden_size=12, batch_first=True)
+
+        state_dict = model.state_dict()
+        original = {name: tensor.clone() for name, tensor in state_dict.items()}
+        buffer = torch.empty(sum(tensor.numel() for tensor in state_dict.values()))
+        offset = 0
+        for name, parameter in model.named_parameters():
+            tensor = state_dict[name]
+            next_offset = offset + tensor.numel()
+            view = buffer[offset:next_offset].view_as(tensor)
+            view.copy_(tensor)
+            parameter.data = view
+            offset = next_offset
+
+        shared = _find_shared_tensors(model.state_dict())
+        self.assertEqual(len(shared), len(state_dict))
+        self.assertTrue(all(len(names) == 1 for names in shared))
+        self.assertTrue(
+            all(
+                not _is_complete(model.state_dict()[next(iter(names))])
+                for names in shared
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            filename = os.path.join(tmpdirname, "gru.safetensors")
+            save_model(model, filename)
+            load_model(model2, filename)
+
+        loaded = model2.state_dict()
+        for name, tensor in original.items():
+            torch.testing.assert_close(loaded[name], tensor)
+
+    def test_workaround_lstm_flattened_parameters_cpu(self):
+        model = torch.nn.LSTM(input_size=12, hidden_size=12, batch_first=True)
+        model2 = torch.nn.LSTM(input_size=12, hidden_size=12, batch_first=True)
+
+        state_dict = model.state_dict()
+        original = {name: tensor.clone() for name, tensor in state_dict.items()}
+        buffer = torch.empty(sum(tensor.numel() for tensor in state_dict.values()))
+        offset = 0
+        for name, parameter in model.named_parameters():
+            tensor = state_dict[name]
+            next_offset = offset + tensor.numel()
+            view = buffer[offset:next_offset].view_as(tensor)
+            view.copy_(tensor)
+            parameter.data = view
+            offset = next_offset
+
+        shared = _find_shared_tensors(model.state_dict())
+        self.assertEqual(len(shared), len(state_dict))
+        self.assertTrue(all(len(names) == 1 for names in shared))
+        self.assertTrue(
+            all(
+                not _is_complete(model.state_dict()[next(iter(names))])
+                for names in shared
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            filename = os.path.join(tmpdirname, "lstm.safetensors")
+            save_model(model, filename)
+            load_model(model2, filename)
+
+        loaded = model2.state_dict()
+        for name, tensor in original.items():
+            torch.testing.assert_close(loaded[name], tensor)
 
     def test_workaround_copy(self):
         model = CopyModel()
