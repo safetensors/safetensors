@@ -9,7 +9,7 @@ mod engine;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
-use pyo3::exceptions::{PyException, PyFileNotFoundError};
+use pyo3::exceptions::{PyException, PyFileNotFoundError, PyPermissionError};
 use pyo3::prelude::*;
 use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
@@ -1162,11 +1162,20 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
+        let file = File::open(&filename).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
                 filename.display()
-            ))
+            )),
+            std::io::ErrorKind::PermissionDenied => PyPermissionError::new_err(format!(
+                "[Errno 13] Permission denied: {}",
+                filename.display()
+            )),
+            _ => PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                "{}: {}",
+                err,
+                filename.display()
+            )),
         })?;
         let file = Arc::new(file);
         let device = device.unwrap_or(Device::Cpu);
