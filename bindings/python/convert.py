@@ -16,6 +16,7 @@ from huggingface_hub import (
     hf_hub_download,
 )
 from huggingface_hub.file_download import repo_folder_name
+from safetensors.convert_pr import discussion_continues_revision
 from safetensors.torch import _find_shared_tensors, _is_complete, load_file, save_file
 
 
@@ -280,7 +281,7 @@ def previous_pr(
         ):
             commits = api.list_repo_commits(model_id, revision=discussion.git_reference)
 
-            if revision_commit == commits[1].commit_id:
+            if discussion_continues_revision(commits, revision_commit):
                 return discussion
     return None
 
