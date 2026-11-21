@@ -230,8 +230,13 @@ class PreadBackendTests(unittest.TestCase):
                 f.prefetch({"fp32_2d": slice(0, 3, 2)})
             with self.assertRaisesRegex(Exception, "0-d"):
                 f.prefetch({"scalar_fp32": slice(0, 1)})
-            with self.assertRaisesRegex(Exception, "None or a slice"):
+            with self.assertRaisesRegex(Exception, "None, a slice or a list of slices"):
                 f.prefetch({"fp32_2d": 3})
+            # a list of slices: several row ranges of one tensor, each checked like a single slice
+            with self.assertRaisesRegex(Exception, "is empty"):
+                f.prefetch({"fp32_2d": []})
+            with self.assertRaisesRegex(Exception, "step 1"):
+                f.prefetch({"fp32_2d": [slice(0, 1), slice(0, 3, 2)]})
 
     def test_prefetch_rejects_unsupported_dtype(self):
         # F6 has no torch dtype: refuse at prefetch, before any device memory moves.
