@@ -6,6 +6,8 @@ mod dlpack;
 mod metal;
 
 mod engine;
+#[cfg(unix)]
+mod reader;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
@@ -3675,6 +3677,11 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySafeSlice>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
+    #[cfg(unix)]
+    {
+        m.add_class::<reader::Reader>()?;
+        m.add_class::<reader::ReadRequest>()?;
+    }
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

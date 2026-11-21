@@ -12,6 +12,8 @@ mod memory;
 mod pool;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 mod read;
+#[cfg(unix)]
+mod reader;
 #[cfg(target_os = "linux")]
 mod save;
 #[cfg(unix)]
@@ -25,6 +27,7 @@ pub use {
     cuda_memory::available,
     loader::{Feed, Loader, LoaderError, TensorIter},
     memory::Span,
+    reader::{Reader, Request, Target},
 };
 
 #[cfg(not(unix))]

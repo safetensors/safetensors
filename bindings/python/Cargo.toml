@@ -19,6 +19,7 @@ path = "../../safetensors"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+byte-mover = { path = "../../byte-mover", default-features = false }
 
 # Metal-direct MTLBuffer path is Apple-silicon-only: Shared-mode buffers rely
 # on UMA semantics that don't hold on Intel Macs with discrete GPUs. Intel

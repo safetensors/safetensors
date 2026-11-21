@@ -81,6 +81,10 @@ impl Fence for CudaEvent {
     fn wait(&self) -> Result<(), Error> {
         Ok(self.api.event_sync(self.event)?)
     }
+
+    fn done(&self) -> Result<bool, Error> {
+        Ok(self.api.event_query(self.event)?)
+    }
 }
 
 impl Drop for CudaEvent {

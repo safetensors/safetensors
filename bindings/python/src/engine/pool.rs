@@ -211,6 +211,10 @@ pub(crate) mod tests {
             self.0.store(true, Ordering::Relaxed);
             Ok(())
         }
+
+        fn done(&self) -> Result<bool, Error> {
+            Ok(self.0.load(Ordering::Relaxed))
+        }
     }
 
     #[test]
