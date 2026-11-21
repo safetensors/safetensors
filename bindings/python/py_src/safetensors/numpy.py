@@ -10,11 +10,8 @@ from safetensors import TensorSpec, deserialize, safe_open, serialize, serialize
 def _flatten(tensor_dict: Dict[str, np.ndarray]) -> Dict[str, TensorSpec]:
     flattened = {}
     for k, v in tensor_dict.items():
-        tensor = v
-        if not tensor.flags.c_contiguous:
-            tensor = np.ascontiguousarray(tensor)
-        if not _is_little_endian(tensor):
-            tensor = tensor.byteswap(inplace=False)
+        # C order and little-endian, in one copy at most
+        tensor = np.ascontiguousarray(v, dtype=v.dtype.newbyteorder("<"))
         flattened[k] = TensorSpec(
             dtype=v.dtype.name,
             shape=v.shape,
@@ -175,19 +172,3 @@ def _view2np(safeview) -> Dict[str, np.ndarray]:
             arr = arr.byteswap(inplace=False)
         result[k] = arr
     return result
-
-
-def _is_little_endian(tensor: np.ndarray) -> bool:
-    byteorder = tensor.dtype.byteorder
-    if byteorder == "=":
-        if sys.byteorder == "little":
-            return True
-        else:
-            return False
-    elif byteorder == "|":
-        return True
-    elif byteorder == "<":
-        return True
-    elif byteorder == ">":
-        return False
-    raise ValueError(f"Unexpected byte order {byteorder}")
