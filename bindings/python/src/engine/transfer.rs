@@ -49,6 +49,9 @@ impl From<std::io::Error> for Error {
 pub trait Fence: Send + Sync {
     /// Returns once the work completed.
     fn wait(&self) -> Result<(), Error>;
+
+    /// Whether the work completed.
+    fn done(&self) -> Result<bool, Error>;
 }
 
 /// A chunk's bytes in a slab: the bytes of `file` start `head` bytes into it.

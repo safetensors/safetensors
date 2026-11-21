@@ -5,6 +5,7 @@ on:
     paths:
       - "safetensors/**"
       - "bindings/python/**"
+      - "byte-mover/**"
       - "README.md"
       - "Dockerfile.s390x.test"
       - ".dockerignore"

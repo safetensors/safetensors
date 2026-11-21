@@ -1,4 +1,6 @@
 # Re-export this
+import sys
+
 from ._safetensors_rust import (  # noqa: F401
     FileLayout,
     PrefetchLoader,
@@ -13,3 +15,6 @@ from ._safetensors_rust import (  # noqa: F401
     serialize,
     serialize_file,
 )
+
+if sys.platform != "win32":
+    from ._safetensors_rust import ReadRequest, Reader  # noqa: F401
