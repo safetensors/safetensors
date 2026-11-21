@@ -1,3 +1,4 @@
 safetensors/target
 bindings/python/target
+byte-mover/target
 Dockerfile.s390x.test

@@ -223,6 +223,70 @@ class PrefetchLoader:
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         pass
 
+class ReadRequest:
+    """
+    One read of a `Reader`.
+    """
+
+    def wait(self) -> None:
+        """Returns once the bytes are in `out`. Raises if the read failed."""
+        pass
+    def done(self) -> bool:
+        """Whether `wait` would return at once."""
+        pass
+
+class Reader:
+    """
+    Reads parts of the tensors of one or several safetensors files into tensors the caller
+    gives, in the background. Not available on Windows.
+
+    A reader is meant to live as long as its files are read from: it keeps them open and
+    keeps its threads. Each `read` returns at once with a `ReadRequest`, and the bytes are in
+    `out` once it was waited. `safe_open.prefetch` is the way to load a file, or a planned
+    part of it, into new tensors.
+
+    Args:
+        filenames (`str`, `os.PathLike` or a list of those):
+            The files to read from. A tensor name appears in one of them only.
+        threads (`int`, *keyword-only*, defaults to 8):
+            How many reads run at once.
+    """
+    def __init__(
+        self,
+        filenames: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
+        *,
+        threads: int = 8,
+    ):
+        pass
+    def read(self, name: str, index: Any, out: Any) -> ReadRequest:
+        """
+        Starts reading `name[index]` into `out`, and returns at once.
+
+        Args:
+            name (`str`):
+                The tensor to read from.
+            index (*optional*):
+                Which part: any index `get_slice` takes whose bytes are contiguous in the
+                file, such as a row or a range of rows. `None` reads the whole tensor.
+            out (`torch.Tensor`):
+                Where the bytes go: a contiguous tensor with the dtype and shape of
+                `name[index]`, on the CPU, on a CUDA device or on MPS (torch 2.12 or
+                later). Nothing may read or write it, on its device either, until the
+                request was waited.
+
+        Returns:
+            (`ReadRequest`):
+                The read, to wait on.
+        """
+        pass
+    def close(self) -> None:
+        """Waits for the reads in flight and stops the reader's threads."""
+        pass
+    def __enter__(self) -> "Reader":
+        pass
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        pass
+
 class safe_open:
     """
     Opens a safetensors lazily and returns tensors as asked

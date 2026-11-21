@@ -16,7 +16,8 @@ use std::sync::OnceLock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions,
+    MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResource,
+    MTLResourceOptions, MTLStorageMode,
 };
 
 #[derive(Debug)]
@@ -112,4 +113,17 @@ impl MTLBuffer {
     pub fn nbytes(&self) -> usize {
         self.nbytes
     }
+}
+
+/// The host address of `nbytes` bytes at `offset` of a Metal buffer, when the
+/// host can reach them: a shared-mode buffer that long.
+///
+/// # Safety
+///
+/// `buffer` is a live `id<MTLBuffer>`.
+pub unsafe fn host_address(buffer: *const c_void, offset: usize, nbytes: usize) -> Option<u64> {
+    // SAFETY: the caller vouches for the buffer
+    let buffer = unsafe { buffer.cast::<ProtocolObject<dyn RawMTLBuffer>>().as_ref()? };
+    (buffer.storageMode() == MTLStorageMode::Shared && buffer.length() >= offset + nbytes)
+        .then(|| buffer.contents().as_ptr() as u64 + offset as u64)
 }
