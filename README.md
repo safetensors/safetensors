@@ -8,6 +8,11 @@
   <br/>
 </p>
 
+<p align="center">
+  <b>English</b> · <a href="https://github.com/huggingface/safetensors/blob/main/README.zh.md">简体中文</a>
+</p>
+
+
 Python
 [![Pypi](https://img.shields.io/pypi/v/safetensors.svg)](https://pypi.org/pypi/safetensors/)
 [![Documentation](https://img.shields.io/website/http/huggingface.co/docs/safetensors/index.svg?label=docs)](https://huggingface.co/docs/safetensors/index)
