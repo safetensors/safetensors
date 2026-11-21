@@ -33,6 +33,21 @@ pub struct Span {
     pub end: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Cuda(i32),
+    Host,
+}
+
+impl Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cuda(device) => write!(f, "cuda:{device}"),
+            Self::Host => write!(f, "mps"),
+        }
+    }
+}
+
 pub struct Loader<D>(PhantomData<D>);
 
 pub struct Feed<D>(PhantomData<D>);
@@ -76,7 +91,7 @@ impl<D> Loader<D> {
     pub fn load(
         _file: Arc<File>,
         _in_file_offset: usize,
-        _device: i32,
+        _target: Target,
         _threads: usize,
         _spans: Vec<Span>,
     ) -> Result<Self, LoaderError> {

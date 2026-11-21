@@ -667,7 +667,7 @@ struct SpanMeta {
     storage_shape: Vec<usize>,
 }
 
-/// The tensors of one file loading to a CUDA device in the background, see
+/// The tensors of one file loading to a CUDA or MPS device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
 /// by iterating. Tensors are allocated by torch on the CUDA stream current at
 /// `prefetch`, so torch accounts for them and frees each one when dropped;
@@ -685,8 +685,8 @@ pub struct PrefetchLoader {
     positions: Vec<Option<usize>>,
     /// tensor name -> span indices, in plan order
     index_map: HashMap<String, Vec<usize>>,
-    device: i32,
-    /// the stream torch allocated the tensors on
+    target: Target,
+    /// the stream torch allocated the tensors on (CUDA)
     alloc_stream: u64,
     background: Arc<Background>,
 }
@@ -769,11 +769,11 @@ struct Allocation {
     /// off after the first warm-up that fails
     warming: bool,
     next: usize,
-    device: i32,
+    target: Target,
 }
 
 impl Allocation {
-    fn new(metas: Vec<SpanMeta>, sizes: Vec<usize>, piece: usize, device: i32) -> Self {
+    fn new(metas: Vec<SpanMeta>, sizes: Vec<usize>, piece: usize, target: Target) -> Self {
         let before = std::iter::once(0)
             .chain(sizes.iter().scan(0, |sum, &n| {
                 *sum += n;
@@ -813,7 +813,7 @@ impl Allocation {
             warm,
             warming: true,
             next: 0,
-            device,
+            target,
         }
     }
 
@@ -822,7 +822,8 @@ impl Allocation {
     }
 
     /// Allocates the next tensors, on the current stream, until the first `target`
-    /// planned bytes have a destination or the batch is full.
+    /// planned bytes have a destination or the batch is full. On MPS, waits for the
+    /// device's queued work: torch may hand out memory that work still uses.
     fn batch(
         &mut self,
         py: Python<'_>,
@@ -835,10 +836,13 @@ impl Allocation {
         // one device object for the batch: torch parses a device string at every call
         let kwargs = torch
             .getattr(intern!(py, "device"))
-            .and_then(|device| device.call1(("cuda", self.device)))
+            .and_then(|device| match self.target {
+                Target::Cuda(index) => device.call1(("cuda", index)),
+                Target::Host => device.call1(("mps",)),
+            })
             .and_then(|device| [(intern!(py, "device"), device)].into_py_dict(py))
             .map_err(|cause| AllocFailure {
-                reason: format!("cannot allocate on cuda:{}: {cause}", self.device),
+                reason: format!("cannot allocate on {}: {cause}", self.target),
                 cause,
             })?;
         let mut dsts = Vec::new();
@@ -853,9 +857,12 @@ impl Allocation {
             if self.warming && self.warm[i] > 0 {
                 // best effort: the tensors may still fit without it. Not past the free
                 // memory: torch would flush the caller's cache to retry
+                let Target::Cuda(device) = self.target else {
+                    unreachable!("warm-up blocks are planned for cuda only")
+                };
                 let free = || -> PyResult<usize> {
                     let cuda = torch.getattr(intern!(py, "cuda"))?;
-                    cuda.call_method1(intern!(py, "mem_get_info"), (self.device,))?
+                    cuda.call_method1(intern!(py, "mem_get_info"), (device,))?
                         .get_item(0)?
                         .extract()
                 };
@@ -877,7 +884,10 @@ impl Allocation {
                         "torch allocated {nbytes} bytes for {size} bytes of data"
                     )));
                 }
-                let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                let ptr = match self.target {
+                    Target::Cuda(_) => tensor.call_method0(intern!(py, "data_ptr"))?.extract()?,
+                    Target::Host => mps_host_address(tensor)?,
+                };
                 Ok((ptr, tensor.clone().unbind()))
             })();
             match tensor {
@@ -885,14 +895,23 @@ impl Allocation {
                 Err(cause) => {
                     return Err(AllocFailure {
                         reason: format!(
-                            "cannot allocate {} ({size} bytes) on cuda:{}: {cause}",
-                            meta.name, self.device
+                            "cannot allocate {} ({size} bytes) on {}: {cause}",
+                            meta.name, self.target
                         ),
                         cause,
                     })
                 }
             }
             self.next += 1;
+        }
+        if self.target == Target::Host && !dsts.is_empty() {
+            torch
+                .getattr(intern!(py, "mps"))
+                .and_then(|mps| mps.call_method0(intern!(py, "synchronize")))
+                .map_err(|cause| AllocFailure {
+                    reason: format!("cannot wait for the mps device: {cause}"),
+                    cause,
+                })?;
         }
         Ok(dsts)
     }
@@ -1015,7 +1034,7 @@ fn allocate_ahead(background: Arc<Background>, mut alloc: Allocation) {
             if bg.stop.load(Ordering::Acquire) {
                 return false;
             }
-            if !entered {
+            if !entered && matches!(alloc.target, Target::Cuda(_)) {
                 // the current stream is per thread
                 entered = true;
                 let set = get_module(py, &TORCH_MODULE).and_then(|torch| {
@@ -1076,13 +1095,116 @@ impl Drop for Exited<'_> {
 fn hand_out(
     py: Python<'_>,
     tensor: Py<PyAny>,
-    (current, raw): (PyBound<'_, PyAny>, u64),
+    current: Option<(PyBound<'_, PyAny>, u64)>,
     alloc_stream: u64,
 ) -> PyResult<Py<PyAny>> {
-    if raw != alloc_stream {
-        tensor.call_method1(py, intern!(py, "record_stream"), (current,))?;
+    match current {
+        Some((current, raw)) if raw != alloc_stream => {
+            tensor.call_method1(py, intern!(py, "record_stream"), (current,))?;
+        }
+        _ => {}
     }
     Ok(tensor)
+}
+
+/// The consumer's current stream, for [`hand_out`]; none on MPS, whose tensors
+/// are written by the host before they are handed out.
+fn consumer_stream(py: Python<'_>, target: Target) -> PyResult<Option<(PyBound<'_, PyAny>, u64)>> {
+    match target {
+        Target::Cuda(device) => current_stream(py, device).map(Some),
+        Target::Host => Ok(None),
+    }
+}
+
+/// The host address of an MPS tensor's data: torch's `data_ptr` on MPS is its
+/// `id<MTLBuffer>` plus the byte offset, not a CPU pointer. Requires the Shared
+/// storage torch >= 2.15 allocates MPS tensors in.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mps_host_address(tensor: &PyBound<'_, PyAny>) -> PyResult<u64> {
+    let py = tensor.py();
+    let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+    let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
+    if nbytes == 0 {
+        return Ok(0); // nothing is read into it
+    }
+    let buffer: u64 = tensor
+        .call_method0(intern!(py, "untyped_storage"))?
+        .call_method0(intern!(py, "data_ptr"))?
+        .extract()?;
+    // SAFETY: an MPS storage's data pointer is its live `id<MTLBuffer>`
+    let contents = unsafe { crate::metal::shared_contents(buffer as *mut std::ffi::c_void) }
+        .ok_or_else(|| {
+            SafetensorError::new_err(
+                "prefetch to mps needs tensors in Shared storage, which torch >= 2.15 allocates",
+            )
+        })?;
+    Ok(contents as u64 + (ptr - buffer))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn mps_host_address(_tensor: &PyBound<'_, PyAny>) -> PyResult<u64> {
+    Err(SafetensorError::new_err(
+        "prefetch to mps needs Apple silicon",
+    ))
+}
+
+/// The destinations `out` gives a prefetch plan, in span order: per planned
+/// tensor, an MPS tensor (a list of them for a list of slices, in plan order),
+/// contiguous, of the planned dtype and byte size. Taking a span hands its tensor back.
+fn out_destinations(
+    out: &PyBound<'_, PyDict>,
+    metas: &[SpanMeta],
+    sizes: &[usize],
+    positions: &[Option<usize>],
+) -> PyResult<Vec<(u64, Py<PyAny>)>> {
+    let py = out.py();
+    let planned: std::collections::HashSet<&str> = metas.iter().map(|m| m.name.as_str()).collect();
+    for key in out.keys() {
+        let name: String = key.extract()?;
+        if !planned.contains(name.as_str()) {
+            return Err(SafetensorError::new_err(format!(
+                "prefetch out= has {name}, which is not in the plan"
+            )));
+        }
+    }
+    let mut dsts = Vec::with_capacity(metas.len());
+    for ((meta, &size), position) in metas.iter().zip(sizes).zip(positions) {
+        let name = &meta.name;
+        let given = out.get_item(name)?.ok_or_else(|| {
+            SafetensorError::new_err(format!("prefetch out= has no tensor for {name}"))
+        })?;
+        let tensor = match position {
+            None => given,
+            Some(i) => given
+                .cast::<PyList>()
+                .ok()
+                .and_then(|list| list.get_item(*i).ok())
+                .ok_or_else(|| {
+                    SafetensorError::new_err(format!(
+                        "prefetch out= for {name} must be a list with a tensor per planned slice"
+                    ))
+                })?,
+        };
+        let device: String = tensor
+            .getattr(intern!(py, "device"))?
+            .getattr(intern!(py, "type"))?
+            .extract()?;
+        let contiguous: bool = tensor
+            .call_method0(intern!(py, "is_contiguous"))?
+            .extract()?;
+        let nbytes: usize = tensor.getattr(intern!(py, "nbytes"))?.extract()?;
+        let same_dtype = tensor
+            .getattr(intern!(py, "dtype"))?
+            .eq(meta.dtype.bind(py))?;
+        if device != "mps" || !contiguous || nbytes != size || !same_dtype {
+            return Err(SafetensorError::new_err(format!(
+                "prefetch out= for {name} must be a contiguous mps tensor of dtype {} and {size} bytes",
+                meta.dtype.bind(py)
+            )));
+        }
+        dsts.push((mps_host_address(&tensor)?, tensor.unbind()));
+    }
+    Ok(dsts)
 }
 
 #[pymethods]
@@ -1110,7 +1232,7 @@ impl PrefetchLoader {
         })?;
         let listed = self.positions[spans[0]].is_some();
         let take_one = |idx: usize| -> PyResult<Py<PyAny>> {
-            let current = current_stream(py, self.device)?;
+            let current = consumer_stream(py, self.target)?;
             let taken = py.detach(|| self.loader.take_tensor(idx));
             let tensor =
                 taken.map_err(|e| self.background.error(py, &e, format!("{name}: {e}")))?;
@@ -1149,7 +1271,7 @@ impl PrefetchLoader {
             iter,
             names,
             positions: slf.positions.clone(),
-            device: slf.device,
+            target: slf.target,
             alloc_stream: slf.alloc_stream,
             background: slf.background.clone(),
             _keepalive: Some(Py::from(slf).into_any()),
@@ -1399,6 +1521,7 @@ impl Open {
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        out: Option<&PyBound<'_, PyDict>>,
     ) -> PyResult<PrefetchLoader> {
         if self.framework != Framework::Pytorch {
             return Err(SafetensorError::new_err(
@@ -1407,14 +1530,20 @@ impl Open {
         }
 
         let device = device.unwrap_or_else(|| self.device.clone());
-        let device_idx = match device {
-            Device::Cuda(index) | Device::Anonymous(index) => index as i32,
+        let target = match device {
+            Device::Cuda(index) | Device::Anonymous(index) => Target::Cuda(index as i32),
+            Device::Mps => Target::Host,
             other => {
                 return Err(SafetensorError::new_err(format!(
-                    "prefetch loads to cuda devices, not {other}"
+                    "prefetch loads to cuda or mps devices, not {other}"
                 )))
             }
         };
+        if out.is_some() && (target != Target::Host || plan.is_none()) {
+            return Err(SafetensorError::new_err(
+                "prefetch out= needs device=\"mps\" and a plan",
+            ));
+        }
         let rows_of = match plan {
             Some(plan) => Some(self.parse_plan(plan)?),
             None => None,
@@ -1497,12 +1626,28 @@ impl Open {
         // the first, the rest from the allocator thread
         let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        // the caller's tensors, checked before any read starts
+        let given = match out {
+            Some(out) => Some(out_destinations(out, &metas, &sizes, &positions)?),
+            None => None,
+        };
+        let loader = Loader::load(self.file.clone(), self.offset, target, threads, spans)?;
         let started = (|| -> PyResult<_> {
-            let (stream, stream_raw) = current_stream(py, device_idx)?;
-            let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
-            let mut alloc = Allocation::new(metas, sizes, piece, device_idx);
+            let (stream, stream_raw) = match target {
+                Target::Cuda(device) => current_stream(py, device)?,
+                Target::Host => (py.None().into_bound(py), 0),
+            };
+            let piece = match target {
+                Target::Cuda(device) => warm_piece(get_module(py, &TORCH_MODULE)?, device),
+                Target::Host => 0,
+            };
+            let mut alloc = Allocation::new(metas, sizes, piece, target);
             let feed = loader.feed();
+            if let Some(dsts) = given {
+                alloc.next = alloc.sizes.len();
+                feed.provide(dsts, stream_raw)
+                    .map_err(|(e, _)| PyErr::from(e))?;
+            }
             while !alloc.done() && alloc.before[alloc.next] < ALLOC_AHEAD {
                 let dsts = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
                 feed.provide(dsts, stream_raw)
@@ -1560,7 +1705,7 @@ impl Open {
             names,
             positions,
             index_map,
-            device: device_idx,
+            target,
             alloc_stream,
             background,
         })
@@ -2208,7 +2353,7 @@ pub struct TensorStream {
     names: Vec<String>,
     /// per span, its position in the plan's list of slices (keys `(name, position)`)
     positions: Vec<Option<usize>>,
-    device: i32,
+    target: Target,
     alloc_stream: u64,
     background: Arc<Background>,
     _keepalive: Option<Py<PyAny>>,
@@ -2221,7 +2366,7 @@ impl TensorStream {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
-        let current = current_stream(py, self.device)?;
+        let current = consumer_stream(py, self.target)?;
         match py.detach(|| self.iter.next()) {
             None => Ok(None),
             Some(Err(e)) => Err(self.background.error(py, &e, e.to_string())),
@@ -2288,7 +2433,7 @@ impl safe_open {
         })
     }
 
-    /// Start loading the file's tensors to a CUDA device in the background.
+    /// Start loading the file's tensors to a CUDA or MPS device in the background.
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
@@ -2305,6 +2450,11 @@ impl safe_open {
     /// independently of that work, call `prefetch` under a side stream
     /// (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
     ///
+    /// On MPS (Apple silicon, torch >= 2.15, which allocates MPS tensors in shared
+    /// memory) the reader threads `pread` straight into the tensors' memory: no
+    /// staging, no copy. Torch allocates them after the device's queued work is done,
+    /// or `out` gives them.
+    ///
     /// Args:
     ///     plan (`Dict[str, Optional[Union[slice, List[slice]]]]`, *optional*):
     ///         Which tensors to load: keys are tensor names, values `None` for
@@ -2315,9 +2465,14 @@ impl safe_open {
     ///         Tensors absent from the plan are not loaded by this loader.
     ///         `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
-    ///         The CUDA device to load to; defaults to the handle's `device`.
+    ///         The CUDA device, or `"mps"`, to load to; defaults to the handle's `device`.
     ///     threads (`int`, defaults to 8):
     ///         Reader threads for this loader.
+    ///     out (`Dict[str, Union[torch.Tensor, List[torch.Tensor]]]`, *optional*):
+    ///         MPS only: the tensors to read the plan into instead of new ones, keyed
+    ///         like the plan (a list for a list of slices, in plan order), each
+    ///         contiguous with the planned dtype and byte size. `take` and iteration
+    ///         hand them back once filled. No device work may still be queued on them.
     ///
     /// Raises if a planned tensor has a dtype the installed torch cannot represent
     /// (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
@@ -2335,15 +2490,16 @@ impl safe_open {
     ///         for name, tensor in loader:
     ///             ...
     /// ```
-    #[pyo3(signature = (plan=None, *, device=None, threads=8))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=8, out=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        out: Option<&PyBound<'_, PyDict>>,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(py, plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads, out)
     }
 
     /// Return the special non tensor information in the header
@@ -2489,7 +2645,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{Feed, Loader, LoaderError, Span, TensorIter};
+use crate::engine::{Feed, Loader, LoaderError, Span, Target, TensorIter};
 
 struct Disp(Vec<TensorIndexer>);
 
@@ -3414,15 +3570,16 @@ impl _safe_open_handle {
     }
 
     /// See [`safe_open::prefetch`].
-    #[pyo3(signature = (plan=None, *, device=None, threads=8))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=8, out=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        out: Option<&PyBound<'_, PyDict>>,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(py, plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads, out)
     }
 
     /// Return the special non tensor information in the header
