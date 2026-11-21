@@ -1,0 +1,60 @@
+name: byte-mover
+
+on:
+  pull_request:
+    paths:
+      - "byte-mover/**"
+      - ".github/workflows/byte-mover.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+    defaults:
+      run:
+        working-directory: ./byte-mover
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: "byte-mover"
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
+        with:
+          tool: cargo-audit
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint with Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Lint without io_uring
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+      - name: Run Tests
+        run: cargo test --locked --verbose
+
+      - name: Run Tests without io_uring
+        run: cargo test --locked --no-default-features --verbose
+
+      - name: Run Audit
+        run: cargo audit -D warnings
