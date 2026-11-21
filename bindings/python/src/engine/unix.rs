@@ -1,6 +1,8 @@
-//! CUDA prefetch engine: load byte spans of a safetensors data section into
+//! Prefetch engine: load byte spans of a safetensors data section into
 //! device memory the caller allocated, in the background, and hand each span's
-//! owner back, once, as its bytes land.
+//! owner back, once, as its bytes land. The flow below is CUDA's; for MPS
+//! unified memory ([`Target::Host`]) workers `pread` straight into the
+//! destinations, with no slab, copy or event.
 //!
 //! Two units, computed once from the spans the consumer requests, sorted by
 //! start and disjoint:
@@ -188,55 +190,82 @@ impl LoadPlan {
     }
 }
 
+/// Where a load writes its spans
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// device memory of this CUDA device, through a pinned staging slab
+    Cuda(i32),
+    /// host-visible memory (Apple silicon unified memory, MPS tensors in Shared
+    /// storage): workers read straight into the destinations
+    Host,
+}
+
+impl Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cuda(device) => write!(f, "cuda:{device}"),
+            Self::Host => write!(f, "mps"),
+        }
+    }
+}
+
 enum Sink<D> {
     Cuda(CudaSink<D>),
+    Host(HostSink<D>),
 }
 
 impl<D> Sink<D> {
-    /// `read(buffer, offset)` fills the chunk's slab from the source
+    /// `read(buffer, offset)` fills `buffer` from the source at `offset`
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
+        read: impl FnMut(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         match self {
             Self::Cuda(sink) => sink.load_chunk(chunk_idx, read),
+            Self::Host(sink) => sink.load_chunk(chunk_idx, read),
         }
     }
 
     fn wait_ready(&self, span: usize) -> Result<(), LoaderError> {
         match self {
             Self::Cuda(sink) => sink.wait_ready(span),
+            Self::Host(sink) => sink.wait_ready(span),
         }
     }
 
     fn take(&self, idx: usize) -> Result<D, LoaderError> {
         match self {
             Self::Cuda(sink) => sink.take(idx),
+            Self::Host(sink) => sink.take(idx),
         }
     }
 
     fn signal_stop(&self) {
         match self {
             Self::Cuda(sink) => sink.signal_stop(),
+            Self::Host(sink) => sink.signal_stop(),
         }
     }
 
     fn stopped(&self) -> bool {
         match self {
             Self::Cuda(sink) => sink.closed.load(Ordering::Acquire),
+            Self::Host(sink) => sink.closed.load(Ordering::Acquire),
         }
     }
 
     fn release(&self) -> Vec<D> {
         match self {
             Self::Cuda(sink) => sink.close(),
+            Self::Host(sink) => sink.close(),
         }
     }
 
     fn fully_scheduled(&self, span: usize) -> bool {
         match self {
             Self::Cuda(sink) => sink.fully_scheduled(span),
+            Self::Host(sink) => sink.fully_scheduled(span),
         }
     }
 
@@ -247,18 +276,21 @@ impl<D> Sink<D> {
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         match self {
             Self::Cuda(sink) => sink.provide(dsts, stream),
+            Self::Host(sink) => sink.provide(dsts),
         }
     }
 
     fn provided(&self) -> usize {
         match self {
             Self::Cuda(sink) => sink.provided.load(Ordering::Acquire),
+            Self::Host(sink) => sink.provided.load(Ordering::Acquire),
         }
     }
 
     fn scheduled(&self, claimed: usize) -> usize {
         match self {
             Self::Cuda(sink) => sink.scheduled(claimed),
+            Self::Host(sink) => sink.scheduled(claimed),
         }
     }
 }
@@ -474,7 +506,7 @@ impl<D> CudaSink<D> {
     fn load_chunk(
         &self,
         chunk_idx: usize,
-        read: impl FnOnce(&mut [u8], u64) -> std::io::Result<()>,
+        mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<()>,
     ) -> Result<(), LoaderError> {
         let chunk = self.plan.chunks[chunk_idx].clone();
         let spans = self.plan.chunk_spans[chunk_idx].clone();
@@ -644,6 +676,165 @@ impl<D> Drop for CudaSink<D> {
     }
 }
 
+/// Destinations the host writes: each chunk is read straight into the spans it
+/// carries, no staging and no copy. The caller makes the destinations free to
+/// write before providing them.
+struct HostSink<D> {
+    plan: Arc<LoadPlan>,
+    /// per span, the host address its bytes are read to; set by `provide`
+    dsts: Box<[AtomicU64]>,
+    /// per span, the owner of its destination; `None` until provided, and once
+    /// taken or released
+    owners: Box<[Mutex<Option<D>>]>,
+    /// the spans with a destination: a prefix of the plan
+    provided: AtomicUsize,
+    /// per chunk, whether its bytes landed
+    loaded: Box<[AtomicBool]>,
+    /// guards `provided` and `loaded` advancing and `closed` turning on, so none
+    /// is missed by a waiter on `progress`
+    progress_lock: Mutex<()>,
+    progress: Condvar,
+    closed: AtomicBool,
+    released: AtomicBool,
+}
+
+impl<D> HostSink<D> {
+    fn new(plan: Arc<LoadPlan>) -> Self {
+        let n = plan.spans.len();
+        Self {
+            dsts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            owners: (0..n).map(|_| Mutex::new(None)).collect(),
+            provided: AtomicUsize::new(0),
+            loaded: (0..plan.chunks.len())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            progress_lock: Mutex::new(()),
+            progress: Condvar::new(),
+            closed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            plan,
+        }
+    }
+
+    /// Gives the next `dsts.len()` spans their destinations. Hands `dsts` back if
+    /// the sink is released.
+    #[allow(clippy::type_complexity)]
+    fn provide(&self, dsts: Vec<(u64, D)>) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
+        let _g = self.progress_lock.lock().unwrap();
+        if self.released.load(Ordering::Acquire) {
+            return Err((LoaderError::Closed, dsts));
+        }
+        let first = self.provided.load(Ordering::Acquire);
+        assert!(
+            first + dsts.len() <= self.plan.spans.len(),
+            "more destinations than spans"
+        );
+        let n = dsts.len();
+        for (i, (ptr, owner)) in dsts.into_iter().enumerate() {
+            self.dsts[first + i].store(ptr, Ordering::Relaxed);
+            *self.owners[first + i].lock().unwrap() = Some(owner);
+        }
+        self.provided.store(first + n, Ordering::Release);
+        self.progress.notify_all();
+        Ok(())
+    }
+
+    /// Waits until `done` holds, or the sink closed.
+    fn wait(&self, done: impl Fn() -> bool) -> Result<(), LoaderError> {
+        if done() {
+            return Ok(());
+        }
+        let mut g = self.progress_lock.lock().unwrap();
+        loop {
+            if done() {
+                return Ok(());
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(LoaderError::Closed);
+            }
+            g = self.progress.wait(g).unwrap();
+        }
+    }
+
+    fn load_chunk(
+        &self,
+        chunk_idx: usize,
+        mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<()>,
+    ) -> Result<(), LoaderError> {
+        let chunk = self.plan.chunks[chunk_idx].clone();
+        let spans = self.plan.chunk_spans[chunk_idx].clone();
+        self.wait(|| self.provided.load(Ordering::Acquire) >= spans.end)?;
+        // one read per span piece: destinations are separate allocations
+        for s in spans {
+            let span = self.plan.spans[s];
+            let (start, end) = (span.start.max(chunk.start), span.end.min(chunk.end));
+            if start >= end {
+                continue;
+            }
+            let dst = self.dsts[s].load(Ordering::Relaxed) as usize + (start - span.start);
+            // SAFETY: the provider guarantees `dst` is host-writable for the span's
+            // bytes, and no other chunk writes this piece
+            let buffer = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, end - start) };
+            read(buffer, (self.plan.in_file_offset + start) as u64)?;
+        }
+        let _g = self.progress_lock.lock().unwrap();
+        self.loaded[chunk_idx].store(true, Ordering::Release);
+        self.progress.notify_all();
+        Ok(())
+    }
+
+    fn wait_ready(&self, span: usize) -> Result<(), LoaderError> {
+        // a zero-size span has no chunk: it is ready once provided
+        self.wait(|| self.fully_scheduled(span))
+    }
+
+    fn take(&self, idx: usize) -> Result<D, LoaderError> {
+        match self.owners[idx].lock().unwrap().take() {
+            Some(owner) => Ok(owner),
+            None if self.released.load(Ordering::Acquire) => Err(LoaderError::Closed),
+            None => Err(LoaderError::AlreadyDelivered),
+        }
+    }
+
+    /// Called once the workers are joined: no read is in flight, returns the
+    /// owners not taken.
+    fn close(&self) -> Vec<D> {
+        {
+            let _g = self.progress_lock.lock().unwrap();
+            self.closed.store(true, Ordering::Release);
+            self.released.store(true, Ordering::Release);
+            self.progress.notify_all();
+        }
+        self.owners
+            .iter()
+            .filter_map(|o| o.lock().unwrap().take())
+            .collect()
+    }
+
+    fn signal_stop(&self) {
+        let _g = self.progress_lock.lock().unwrap();
+        self.closed.store(true, Ordering::Release);
+        self.progress.notify_all();
+    }
+
+    /// Whether the span's bytes landed: the reads are synchronous
+    fn fully_scheduled(&self, span: usize) -> bool {
+        self.provided.load(Ordering::Acquire) > span
+            && self.plan.span_chunks[span]
+                .clone()
+                .all(|c| self.loaded[c].load(Ordering::Acquire))
+    }
+
+    /// How many spans the claimed chunks reach
+    fn scheduled(&self, claimed: usize) -> usize {
+        match claimed.min(self.plan.chunks.len()) {
+            n if n == self.plan.chunks.len() => self.plan.spans.len(),
+            0 => 0,
+            n => self.plan.chunk_spans[n - 1].end,
+        }
+    }
+}
+
 /// This is a generous limit on the maximum number of devices that could be connected to a single host
 const MAX_DEVICES: usize = 64;
 static STREAMS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(0) }; MAX_DEVICES];
@@ -804,14 +995,20 @@ impl<D: Send + 'static> Loader<D> {
     pub fn load(
         file: Arc<File>,
         in_file_offset: usize,
-        device: i32,
+        target: Target,
         threads: usize,
         spans: Vec<Span>,
     ) -> Result<Self, LoaderError> {
-        let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
-        if !(0..MAX_DEVICES as i32).contains(&device) {
-            return Err(LoaderError::InvalidDevice(device));
-        }
+        let cuda = match target {
+            Target::Cuda(device) => {
+                let cuda_api = api().ok_or(LoaderError::CudaRuntimeLoad)?;
+                if !(0..MAX_DEVICES as i32).contains(&device) {
+                    return Err(LoaderError::InvalidDevice(device));
+                }
+                Some((cuda_api, device))
+            }
+            Target::Host => None,
+        };
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -824,12 +1021,18 @@ impl<D: Send + 'static> Loader<D> {
         let plan = Arc::new(LoadPlan::new(spans, in_file_offset, CHUNK_SIZE));
         // avoid spawning too many threads when not needed, up to chunks.len()
         let threads = threads.clamp(1, plan.chunks.len().max(1));
-        let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
+        let sink = match cuda {
+            Some((cuda_api, device)) => {
+                let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
+                Sink::Cuda(CudaSink::new(cuda_api, pool, plan.clone(), device)?)
+            }
+            None => Sink::Host(HostSink::new(plan.clone())),
+        };
         let inner = Arc::new(LoaderInner {
             file,
             error: OnceLock::new(),
-            plan: plan.clone(),
-            sink: Sink::Cuda(CudaSink::new(cuda_api, pool, plan, device)?),
+            plan,
+            sink,
             next_chunk: AtomicUsize::new(0),
             schedule_lock: Mutex::new(()),
             schedule: Condvar::new(),
@@ -839,7 +1042,9 @@ impl<D: Send + 'static> Loader<D> {
         for _ in 0..threads {
             let inner = loader.inner.clone();
             let spawned = std::thread::Builder::new().spawn(move || {
-                let _ = cuda_api.set_device(device);
+                if let Some((cuda_api, device)) = cuda {
+                    let _ = cuda_api.set_device(device);
+                }
                 worker(inner)
             });
             // on failure, dropping the loader stops and joins the workers already started

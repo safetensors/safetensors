@@ -16,7 +16,8 @@ use std::sync::OnceLock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions,
+    MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResource,
+    MTLResourceOptions, MTLStorageMode,
 };
 
 #[derive(Debug)]
@@ -112,4 +113,15 @@ impl MTLBuffer {
     pub fn nbytes(&self) -> usize {
         self.nbytes
     }
+}
+
+/// The host address of the Shared-mode `id<MTLBuffer>` at `id` (what torch's
+/// `untyped_storage().data_ptr()` is on MPS); `None` when the buffer is not
+/// Shared, as torch < 2.15 allocates MPS tensors.
+///
+/// # Safety
+/// `id` must point to a live `id<MTLBuffer>`.
+pub unsafe fn shared_contents(id: *mut c_void) -> Option<*mut c_void> {
+    let buf = unsafe { &*(id as *const ProtocolObject<dyn RawMTLBuffer>) };
+    (buf.storageMode() == MTLStorageMode::Shared).then(|| buf.contents().as_ptr())
 }
