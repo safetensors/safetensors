@@ -111,6 +111,16 @@ class TestCase(unittest.TestCase):
             with safe_open(filename, framework="np") as f:
                 self.assertEqual(list(f.metadata()), ["a", "b", "c", "d", "e"])
 
+    def test_serialization_empty_metadata(self):
+        out = save({}, metadata={})
+        self.assertEqual(load(out), {})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "empty.safetensors")
+            save_file({}, filename, metadata={})
+            with safe_open(filename, framework="np") as f:
+                self.assertEqual(f.metadata(), {})
+
     def test_serialization_forces_alignment(self):
         data = np.zeros((2, 2), dtype=np.int32)
         data2 = np.zeros((2, 2), dtype=np.float16)

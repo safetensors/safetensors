@@ -654,7 +654,7 @@ impl Serialize for Metadata {
             names[index] = name;
         }
 
-        let length = self.metadata.as_ref().map_or(0, HashMap::len);
+        let length = usize::from(self.metadata.is_some());
         let mut map = serializer.serialize_map(Some(self.tensors.len() + length))?;
 
         if let Some(metadata) = &self.metadata {
@@ -1802,5 +1802,19 @@ mod tests {
     #[test]
     fn test_layout_no_tensors() {
         check_layout(&[], None);
+        check_layout(&[], Some(HashMap::new()));
+    }
+
+    #[test]
+    fn test_serialize_empty_metadata_map() {
+        let tensors: HashMap<String, TensorView> = HashMap::new();
+        let meta = HashMap::new();
+        let out = serialize(&tensors, Some(meta.clone())).unwrap();
+        let header = br#"{"__metadata__":{}}"#;
+        assert_eq!(&out[8..8 + header.len()], header);
+        let st = SafeTensors::deserialize(&out).unwrap();
+        assert!(st.is_empty());
+        let (_n, md) = SafeTensors::read_metadata(&out).unwrap();
+        assert_eq!(md.metadata(), &Some(meta));
     }
 }
