@@ -7,7 +7,8 @@ readers each of them writes.
 ## Now
 
 - Reads queued and reaped one by one, with an id and a result each.
-- Two backends: a pool of threads, and io_uring with registered memory.
+- Two backends: threads that `pread`, and threads that drive an io_uring each,
+  with registered memory where the locked-memory limit allows.
 
 ## Next
 
@@ -15,8 +16,8 @@ readers each of them writes.
 - Two priorities: reads needed now go before reads issued ahead.
 - Direct I/O helpers: opening a file for it, falling back to buffered reads
   when the filesystem refuses (no filesystem detection), `F_NOCACHE` on macOS.
-- io_uring: several rings, and reads that carry on when the locked-memory
-  limit is too low to register memory.
+- Picking the backend and the reads in flight that suit the machine.
+- io_uring: one registration shared by the rings, in place of one each.
 - Staging: an aligned pool for destinations that are not aligned, and
   completions that wait on a copy still in flight (device memory).
 - A CUDA destination: pinned staging and asynchronous copies, from the

@@ -2,9 +2,9 @@
 
 Reads byte ranges of files into memory the caller owns.
 
-Reads are queued on a `Mover`, run by a pool of threads or by an io_uring, and
-reaped one by one, each with the id it was queued under. Any thread may queue
-and reap. A mover knows nothing of what the bytes are: file formats, caches and
+Reads are queued on a `Mover`, run by a pool of threads that `pread` or drive
+an io_uring each, and reaped one by one, each with the id it was queued under.
+Any thread may queue and reap. A mover knows nothing of what the bytes are: file formats, caches and
 devices are the caller's.
 
 It is meant for programs that page model weights in and out while they run
@@ -27,8 +27,7 @@ let read = Read {
     len: record.len(),
 };
 // SAFETY: `record` and `file` outlive the read, which is reaped below
-unsafe { mover.submit(read)? };
-mover.flush()?;
+unsafe { mover.submit(read) };
 let done = mover.wait_done().expect("one read is pending");
 assert_eq!(done.id, 7);
 done.result?;
@@ -37,8 +36,9 @@ done.result?;
 ## Backends
 
 - `Mover::threads(n)`: `pread`s on `n` threads. Works on every Unix.
-- `Mover::uring(depth)`: one io_uring, on Linux, behind the `io-uring` feature
-  (on by default). `register` gives it memory to read into without pinning
+- `Mover::rings(n, depth)`: `n` io_urings, a thread each, with up to `depth`
+  reads in the kernel each, on Linux, behind the `io-uring` feature (on by
+  default). `register` gives the rings memory to read into without pinning
   pages at each read. It fails where io_uring is absent or forbidden, as under
   the default seccomp profile of most container runtimes: fall back to threads.
 

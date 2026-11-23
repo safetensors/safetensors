@@ -53,8 +53,8 @@ fn movers() -> Vec<(&'static str, Mover)> {
     #[cfg_attr(not(all(target_os = "linux", feature = "io-uring")), allow(unused_mut))]
     let mut movers = vec![("threads", Mover::threads(4).unwrap())];
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    match Mover::uring(8) {
-        Ok(mover) => movers.push(("uring", mover)),
+    match Mover::rings(2, 4) {
+        Ok(mover) => movers.push(("rings", mover)),
         Err(err) => eprintln!("skipped io_uring: {err}"),
     }
     movers
@@ -80,9 +80,8 @@ fn ranges_land_in_their_destinations() {
                 len,
             };
             // SAFETY: the buffers and the file outlive the reads, reaped below
-            unsafe { mover.submit(read).unwrap() };
+            unsafe { mover.submit(read) };
         }
-        mover.flush().unwrap();
         assert_eq!(mover.pending(), ranges.len(), "{name}");
         let mut seen = vec![false; ranges.len()];
         while let Some(done) = mover.wait_done() {
@@ -114,7 +113,7 @@ fn a_read_past_the_end_fails_alone() {
                 len: buffer.len(),
             };
             // SAFETY: the buffers and the file outlive the reads, reaped below
-            unsafe { mover.submit(read).unwrap() };
+            unsafe { mover.submit(read) };
         }
         let mut results = [mover.wait_done().unwrap(), mover.wait_done().unwrap()];
         results.sort_by_key(|done| done.id);
@@ -140,7 +139,7 @@ fn dropping_waits_for_the_reads() {
             len: buffer.len(),
         };
         // SAFETY: the buffer and the file outlive the mover
-        unsafe { mover.submit(read).unwrap() };
+        unsafe { mover.submit(read) };
         drop(mover);
         assert_eq!(buffer, fixture.data, "{name}");
     }
@@ -171,8 +170,7 @@ fn threads_queue_while_another_reaps() {
                         };
                         // SAFETY: each read has its own piece of `buffer`, which
                         // outlives the mover, as the file does
-                        unsafe { mover.submit(read).unwrap() };
-                        mover.flush().unwrap();
+                        unsafe { mover.submit(read) };
                     }
                 });
             }
@@ -231,9 +229,8 @@ fn a_wait_ends_on_reads_a_wake_or_its_timeout() {
                 len: buffer.len(),
             };
             // SAFETY: the buffers and the file outlive the reads, reaped below
-            unsafe { mover.submit(read).unwrap() };
+            unsafe { mover.submit(read) };
         }
-        mover.flush().unwrap();
         while out.len() < 5 {
             let reaped = mover.wait(&mut out, 2, Some(Duration::from_secs(10)));
             assert!((1..=2).contains(&reaped), "{name}");
@@ -254,7 +251,7 @@ fn a_wait_ends_on_reads_a_wake_or_its_timeout() {
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 #[test]
 fn reads_into_registered_memory() {
-    let Ok(mut mover) = Mover::uring(8) else {
+    let Ok(mut mover) = Mover::rings(2, 4) else {
         eprintln!("skipped: no io_uring");
         return;
     };
@@ -282,7 +279,7 @@ fn reads_into_registered_memory() {
             len,
         };
         // SAFETY: the destinations and the file outlive the reads, reaped below
-        unsafe { mover.submit(read).unwrap() };
+        unsafe { mover.submit(read) };
     }
     while let Some(done) = mover.wait_done() {
         done.result.unwrap();
