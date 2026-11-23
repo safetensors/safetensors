@@ -1,8 +1,8 @@
 //! Reads byte ranges of files into memory the caller owns.
 //!
-//! Reads are queued on a [`Mover`], run by a pool of threads or by an io_uring,
-//! and reaped one by one, each with the id it was queued under. Any thread may
-//! queue and reap. A mover knows nothing of what the bytes are: file formats,
+//! Reads are queued on a [`Mover`], run by a pool of threads that `pread` or
+//! drive an io_uring each, and reaped one by one, each with the id it was
+//! queued under. Any thread may queue and reap. A mover knows nothing of what the bytes are: file formats,
 //! caches and devices are the caller's.
 //!
 //! ```no_run
@@ -20,8 +20,7 @@
 //!     len: record.len(),
 //! };
 //! // SAFETY: `record` and `file` outlive the read, which is reaped below
-//! unsafe { mover.submit(read)? };
-//! mover.flush()?;
+//! unsafe { mover.submit(read) };
 //! let done = mover.wait_done().expect("one read is pending");
 //! assert_eq!(done.id, 7);
 //! done.result?;
@@ -33,9 +32,9 @@
 //! [`DIRECT_ALIGN`].
 #![cfg(unix)]
 
-mod threads;
+mod pool;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-mod uring;
+mod ring;
 
 use std::{
     io,
@@ -79,95 +78,63 @@ pub struct Done {
 /// Runs queued reads and hands them back as they finish, in any order.
 /// Dropping a mover waits for the reads still queued or running.
 pub struct Mover {
-    backend: Backend,
+    pool: pool::Pool,
     /// reads queued and not reaped yet
     pending: AtomicUsize,
     /// held by the thread that reaps
     reaper: Mutex<()>,
 }
 
-enum Backend {
-    Threads(threads::Threads),
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    Uring(Box<uring::Uring>),
-}
-
 impl Mover {
     /// A mover whose reads are `pread`s on `threads` threads: as many reads
     /// run at once.
     pub fn threads(threads: usize) -> io::Result<Self> {
-        Ok(Self::new(Backend::Threads(threads::Threads::new(threads)?)))
+        Ok(Self::new(pool::Pool::threads(threads)?))
     }
 
-    /// A mover whose reads go through one io_uring holding up to `depth` reads
-    /// in the kernel at once. Fails where io_uring is absent or forbidden, as
-    /// under the default seccomp profile of most container runtimes: fall back
-    /// to [`Self::threads`].
+    /// A mover whose reads go through `rings` io_urings, a thread each, holding
+    /// up to `depth` reads in the kernel each. Fails where io_uring is absent
+    /// or forbidden, as under the default seccomp profile of most container
+    /// runtimes: fall back to [`Self::threads`].
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    pub fn uring(depth: u32) -> io::Result<Self> {
-        Ok(Self::new(Backend::Uring(Box::new(uring::Uring::new(
-            depth,
-        )?))))
+    pub fn rings(rings: usize, depth: u32) -> io::Result<Self> {
+        Ok(Self::new(pool::Pool::rings(rings, depth)?))
     }
 
-    fn new(backend: Backend) -> Self {
+    fn new(pool: pool::Pool) -> Self {
         Self {
-            backend,
+            pool,
             pending: AtomicUsize::new(0),
             reaper: Mutex::new(()),
         }
     }
 
-    /// Registers `len` bytes at `base` with the kernel: reads into them skip the
-    /// page pinning each read otherwise pays. The memory counts against the
-    /// process's locked-memory limit, and the call fails past it. No-op for
-    /// [`Self::threads`].
+    /// Registers `len` bytes at `base` with the kernel, once per ring: reads
+    /// into them skip the page pinning each read otherwise pays. The memory
+    /// counts against the process's locked-memory limit once per ring, and
+    /// the call fails past it: the rings that could not register read into
+    /// the memory as into any other. Replaces the memory registered before.
+    /// Waits for the reads running to finish. No-op for [`Self::threads`].
     ///
     /// # Safety
     ///
     /// The memory stays valid for writes until the mover is dropped.
     pub unsafe fn register(&mut self, base: *mut u8, len: usize) -> io::Result<()> {
-        match &mut self.backend {
-            Backend::Threads(_) => {
-                let _ = (base, len);
-                Ok(())
-            }
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            // SAFETY: the caller vouches for the memory
-            Backend::Uring(uring) => unsafe { uring.register(base, len) },
-        }
+        // SAFETY: the caller vouches for the memory
+        unsafe { self.pool.register(base, len) }
     }
 
-    /// Queues `read`. It may start at once or at the next [`Self::flush`].
+    /// Queues `read`, which starts as soon as a thread is free.
     ///
     /// # Safety
     ///
-    /// Until the read is reaped ([`Self::try_done`], [`Self::wait_done`]) or
-    /// the mover is dropped: `read.dst` is valid for writes of `read.len`
-    /// bytes, nothing else reads or writes them, and `read.fd` stays open.
-    pub unsafe fn submit(&self, read: Read) -> io::Result<()> {
+    /// Until the read is reaped ([`Self::try_done`], [`Self::wait_done`],
+    /// [`Self::wait`]) or the mover is dropped: `read.dst` is valid for writes
+    /// of `read.len` bytes, nothing else reads or writes them, and `read.fd`
+    /// stays open.
+    pub unsafe fn submit(&self, read: Read) {
         self.pending.fetch_add(1, Ordering::AcqRel);
-        let queued = match &self.backend {
-            Backend::Threads(threads) => {
-                threads.submit(read);
-                Ok(())
-            }
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.submit(read),
-        };
-        if queued.is_err() {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-        }
-        queued
-    }
-
-    /// Starts the reads queued so far.
-    pub fn flush(&self) -> io::Result<()> {
-        match &self.backend {
-            Backend::Threads(_) => Ok(()),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.flush(),
-        }
+        self.pool.submit(read);
     }
 
     /// How many reads are queued or running, and not reaped
@@ -180,57 +147,33 @@ impl Mover {
     /// to reap.
     pub fn try_done(&self) -> Option<Done> {
         let _reaper = self.reaper.try_lock().ok()?;
-        let done = match &self.backend {
-            Backend::Threads(threads) => threads.try_done(),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.try_done(),
-        }?;
+        let done = self.pool.try_done()?;
         self.pending.fetch_sub(1, Ordering::AcqRel);
         Some(done)
     }
 
     /// The next finished read, waiting for it; `None` when none is pending.
-    /// Starts the reads queued so far. One thread waits at a time: another
-    /// one waits for its turn.
-    ///
-    /// # Panics
-    ///
-    /// If an io_uring fails with reads in the kernel: their destinations could
-    /// not be handed back safely.
+    /// One thread waits at a time: another one waits for its turn.
     pub fn wait_done(&self) -> Option<Done> {
         let _reaper = self.reaper.lock().unwrap();
         // a read pending now stays so until this thread reaps it
         if self.pending() == 0 {
             return None;
         }
-        let done = match &self.backend {
-            Backend::Threads(threads) => threads.wait_done(),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.wait_done(),
-        };
+        let done = self.pool.wait_done();
         self.pending.fetch_sub(1, Ordering::AcqRel);
         Some(done)
     }
-}
 
-impl Mover {
     /// Waits until a read finished, [`Self::wake`] was called or `timeout`
     /// elapsed, then moves up to `max` finished reads to `out` and returns how
     /// many. Unlike [`Self::wait_done`] it waits with no read pending too: a
     /// thread that only reaps can sleep here until another one queues a read
     /// or wakes it. One thread waits at a time.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::wait_done`].
     pub fn wait(&self, out: &mut Vec<Done>, max: usize, timeout: Option<Duration>) -> usize {
         let _reaper = self.reaper.lock().unwrap();
         let before = out.len();
-        match &self.backend {
-            Backend::Threads(threads) => threads.wait(out, max, timeout),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.wait(out, max, timeout),
-        }
+        self.pool.wait(out, max, timeout);
         let reaped = out.len() - before;
         self.pending.fetch_sub(reaped, Ordering::AcqRel);
         reaped
@@ -239,11 +182,7 @@ impl Mover {
     /// Makes the thread in [`Self::wait`], or the next one to call it, return
     /// even with no read finished.
     pub fn wake(&self) {
-        match &self.backend {
-            Backend::Threads(threads) => threads.wake(),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            Backend::Uring(uring) => uring.wake(),
-        }
+        self.pool.wake();
     }
 }
 
