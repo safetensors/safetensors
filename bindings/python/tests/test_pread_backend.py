@@ -206,7 +206,7 @@ class PreadBackendTests(unittest.TestCase):
     def test_prefetch_works_from_any_backend(self):
         # the backend only decides how get_slice reads; a loader opens its own reads
         with safe_open(self.path, framework="pt", device="cpu", backend="mmap") as f:
-            with self.assertRaisesRegex(Exception, "cuda devices, not cpu"):
+            with self.assertRaisesRegex(Exception, "cuda or mps devices, not cpu"):
                 f.prefetch()
 
     def test_prefetch_requires_pt(self):
@@ -219,6 +219,15 @@ class PreadBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "cuda"):
                 f.prefetch()
 
+    def test_prefetch_out_needs_mps_and_a_plan(self):
+        # checked before any device work, so these run anywhere
+        with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
+            out = {"fp32_2d": torch.empty(3, 4)}
+            with self.assertRaisesRegex(Exception, 'needs device="mps" and a plan'):
+                f.prefetch({"fp32_2d": None}, device="cuda:0", out=out)
+            with self.assertRaisesRegex(Exception, 'needs device="mps" and a plan'):
+                f.prefetch(device="mps", out=out)
+
     def test_prefetch_plan_rejects_bad_entries(self):
         # plan parsing happens before any device work, so these run without a GPU
         with safe_open(
@@ -230,8 +239,13 @@ class PreadBackendTests(unittest.TestCase):
                 f.prefetch({"fp32_2d": slice(0, 3, 2)})
             with self.assertRaisesRegex(Exception, "0-d"):
                 f.prefetch({"scalar_fp32": slice(0, 1)})
-            with self.assertRaisesRegex(Exception, "None or a slice"):
+            with self.assertRaisesRegex(Exception, "None, a slice or a list of slices"):
                 f.prefetch({"fp32_2d": 3})
+            # a list of slices: several row ranges of one tensor, each checked like a single slice
+            with self.assertRaisesRegex(Exception, "is empty"):
+                f.prefetch({"fp32_2d": []})
+            with self.assertRaisesRegex(Exception, "step 1"):
+                f.prefetch({"fp32_2d": [slice(0, 1), slice(0, 3, 2)]})
 
     def test_prefetch_rejects_unsupported_dtype(self):
         # F6 has no torch dtype: refuse at prefetch, before any device memory moves.
@@ -281,7 +295,7 @@ class PreadBackendTests(unittest.TestCase):
         with safe_open(
             self.path, framework="pt", device="cuda:0", backend="pread"
         ) as f:
-            with self.assertRaisesRegex(Exception, "cuda devices, not cpu"):
+            with self.assertRaisesRegex(Exception, "cuda or mps devices, not cpu"):
                 f.prefetch(device="cpu")
 
     def test_prefetch_loader_is_exported(self):
@@ -1119,6 +1133,80 @@ class PrefetchAllocationTests(unittest.TestCase):
                 loader.__exit__(None, None, None)
                 del fut
                 self.assertEqual(torch.cuda.memory_allocated(0), before)
+
+
+@unittest.skipIf(not torch.backends.mps.is_available(), "MPS is not available")
+class PrefetchMpsTests(unittest.TestCase):
+    """`prefetch(device="mps")`: the loader's threads read straight into the unified
+    memory of MPS tensors (Shared storage, torch >= 2.15), new ones or the caller's."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tempdir.name, "tiny.safetensors")
+        # a bank over 16 MiB spans several chunks
+        self.bank = torch.randn(10, 1024, 512)
+        save_file({**SOURCE_TENSORS, "bank": self.bank}, self.path)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_loads_every_tensor(self):
+        with safe_open(self.path, framework="pt", device="mps") as f:
+            with f.prefetch() as loader:
+                got = dict(loader)
+        self.assertEqual(set(got), set(SOURCE_TENSORS) | {"bank"})
+        for name, expected in {**SOURCE_TENSORS, "bank": self.bank}.items():
+            self.assertEqual(got[name].device.type, "mps", name)
+            self.assertEqual(got[name].dtype, expected.dtype, name)
+            self.assertEqual(got[name].shape, expected.shape, name)
+            self.assertTrue(_tensors_equal(got[name].cpu(), expected), name)
+
+    def test_plan_slices(self):
+        with safe_open(self.path, framework="pt", device="cpu") as f:
+            loader = f.prefetch(
+                {"bank": [slice(7, 8), slice(1, 3)], "fp32_2d": slice(1, 3)}, device="mps"
+            )
+            with loader:
+                self.assertTrue(torch.equal(loader.take("fp32_2d").cpu(), SOURCE_TENSORS["fp32_2d"][1:3]))
+                rows = loader.take("bank")
+                self.assertTrue(torch.equal(rows[0].cpu(), self.bank[7:8]))
+                self.assertTrue(torch.equal(rows[1].cpu(), self.bank[1:3]))
+                # used by device work right away
+                self.assertTrue(torch.allclose((rows[1] * 2).cpu(), self.bank[1:3] * 2))
+
+    def test_out_fills_the_given_tensors(self):
+        slots = torch.zeros(4, 1024, 512, device="mps")
+        torch.mps.synchronize()  # the zero fill is queued work on `slots`
+        with safe_open(self.path, framework="pt", device="mps") as f:
+            plan = {"bank": [slice(7, 8), slice(2, 3)], "fp32_2d": None}
+            out = {"bank": [slots[3], slots[0]], "fp32_2d": torch.empty(3, 4, device="mps")}
+            with f.prefetch(plan, out=out) as loader:
+                self.assertIs(loader.take("bank", 0), out["bank"][0])
+                self.assertIs(loader.take("fp32_2d"), out["fp32_2d"])
+                for _ in loader:
+                    pass
+        self.assertTrue(torch.equal(slots[3].cpu(), self.bank[7]))
+        self.assertTrue(torch.equal(slots[0].cpu(), self.bank[2]))
+        self.assertEqual(slots[1:3].abs().sum().item(), 0)
+        self.assertTrue(torch.equal(out["fp32_2d"].cpu(), SOURCE_TENSORS["fp32_2d"]))
+
+    def test_out_is_checked_before_reading(self):
+        slots = torch.zeros(4, 1024, 512, device="mps")
+        plan = {"bank": [slice(0, 1), slice(1, 2)]}
+        bad = {
+            "not in the plan": {"bank": [slots[0], slots[1]], "fp32_2d": slots[2]},
+            "has no tensor": {},
+            "a list with a tensor per planned slice": {"bank": [slots[0]]},
+            "contiguous mps tensor": {"bank": [slots[0], slots[1].half()]},
+        }
+        with safe_open(self.path, framework="pt", device="mps") as f:
+            for message, out in bad.items():
+                with self.assertRaisesRegex(SafetensorError, message):
+                    f.prefetch(plan, out=out)
+            with self.assertRaisesRegex(SafetensorError, "contiguous mps tensor"):
+                f.prefetch(plan, out={"bank": [slots[0], slots[1].cpu()]})
+            with self.assertRaisesRegex(SafetensorError, "contiguous mps tensor"):
+                f.prefetch(plan, out={"bank": [slots[0], slots[1:3]]})
 
 
 if __name__ == "__main__":

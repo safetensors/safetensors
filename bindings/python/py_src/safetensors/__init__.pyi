@@ -248,9 +248,10 @@ class safe_open:
         *,
         device: Optional[Union[str, int]] = None,
         threads: int = 8,
+        out: Optional[Dict[str, Union[Any, List[Any]]]] = None,
     ) -> "PrefetchLoader":
         """
-        Start loading the file's tensors to a CUDA device in the background.
+        Start loading the file's tensors to a CUDA or MPS device in the background.
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
         iterating it as `(name, tensor)` pairs in readiness order, as tensors torch allocates
@@ -265,6 +266,11 @@ class safe_open:
         independently of that work, call `prefetch` under a side stream
         (`with torch.cuda.stream(side):`); torch then keeps a separate cache for it.
 
+        On MPS (Apple silicon, torch >= 2.15, which allocates MPS tensors in shared
+        memory) the reader threads `pread` straight into the tensors' memory: no
+        staging, no copy. Torch allocates them after the device's queued work is done,
+        or `out` gives them.
+
         Args:
             plan (`Dict[str, Optional[slice]]`, *optional*):
                 Which tensors to load: keys are tensor names, values `None` for
@@ -272,9 +278,14 @@ class safe_open:
                 Tensors absent from the plan are not loaded by this loader.
                 `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
-                The CUDA device to load to; defaults to the handle's `device`.
+                The CUDA device, or `"mps"`, to load to; defaults to the handle's `device`.
             threads (`int`, defaults to 8):
                 Reader threads for this loader.
+            out (`Dict[str, Union[torch.Tensor, List[torch.Tensor]]]`, *optional*):
+                MPS only: the tensors to read the plan into instead of new ones, keyed
+                like the plan (a list for a list of slices, in plan order), each
+                contiguous with the planned dtype and byte size. `take` and iteration
+                hand them back once filled. No device work may still be queued on them.
 
         Raises if a planned tensor has a dtype the installed torch cannot represent
         (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
