@@ -1162,7 +1162,10 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|e| os_error(&e, &filename))?;
+        // opening the file and reading its header wait on the filesystem, for long on a
+        // network mount: other Python threads run meanwhile
+        let file = Python::attach(|py| py.detach(|| File::open(&filename)))
+            .map_err(|e| os_error(&e, &filename))?;
         let file = Arc::new(file);
         let device = device.unwrap_or(Device::Cpu);
         if device != Device::Cpu
@@ -1174,11 +1177,16 @@ impl Open {
             )));
         }
 
-        // SAFETY: Mmap is used to prevent allocating in Rust
-        // before making a copy within Python.
-        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&*file)? };
-
-        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
+        let (buffer, header) = Python::attach(|py| {
+            py.detach(|| -> std::io::Result<_> {
+                // SAFETY: Mmap is used to prevent allocating in Rust
+                // before making a copy within Python.
+                let buffer = unsafe { MmapOptions::new().map_copy_read_only(&*file)? };
+                let header = SafeTensors::read_metadata(&buffer);
+                Ok((buffer, header))
+            })
+        })?;
+        let (n, metadata) = header.map_err(|e| {
             SafetensorError::new_err(format!("Error while deserializing header: {e}"))
         })?;
 
