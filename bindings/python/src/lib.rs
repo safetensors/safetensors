@@ -9,7 +9,7 @@ mod engine;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
-use pyo3::exceptions::{PyException, PyFileNotFoundError};
+use pyo3::exceptions::{PyException, PyOSError};
 use pyo3::prelude::*;
 use pyo3::sync::{OnceLockExt, PyOnceLock};
 use pyo3::types::IntoPyDict;
@@ -1162,12 +1162,7 @@ impl Open {
         device: Option<Device>,
         backend: Backend,
     ) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
-                "No such file or directory: {}",
-                filename.display()
-            ))
-        })?;
+        let file = File::open(&filename).map_err(|e| os_error(&e, &filename))?;
         let file = Arc::new(file);
         let device = device.unwrap_or(Device::Cpu);
         if device != Device::Cpu
@@ -3268,6 +3263,28 @@ fn get_pydtype(
             }
         };
         Ok(dtype)
+    })
+}
+
+/// `err` on `path` as the `OSError` Python raises for it: Python picks
+/// `FileNotFoundError`, `PermissionError` and the like from the error number.
+fn os_error(err: &std::io::Error, path: &std::path::Path) -> PyErr {
+    let Some(errno) = err.raw_os_error() else {
+        return PyOSError::new_err(err.to_string());
+    };
+    let filename = path.as_os_str().to_os_string();
+    // on Windows the number is a system error code, from which Python derives `errno`
+    #[cfg(windows)]
+    return PyOSError::new_err((0, err.to_string(), filename, errno));
+    #[cfg(not(windows))]
+    Python::attach(|py| {
+        let strerror = PyModule::import(py, intern!(py, "os"))
+            .and_then(|os| {
+                os.call_method1(intern!(py, "strerror"), (errno,))?
+                    .extract()
+            })
+            .unwrap_or_else(|_| err.to_string());
+        PyOSError::new_err((errno, strerror, filename))
     })
 }
 
