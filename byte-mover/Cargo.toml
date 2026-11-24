@@ -1,20 +1,15 @@
 [package]
 name = "byte-mover"
-version = "0.1.0-dev.0"
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.86"
-homepage = "https://github.com/safetensors/safetensors"
 repository = "https://github.com/safetensors/safetensors"
-documentation = "https://docs.rs/byte-mover/"
 license = "Apache-2.0"
-keywords = ["io", "io_uring", "direct-io", "inference"]
-categories = ["filesystem", "asynchronous"]
-readme = "./README.md"
+publish = false
 description = """
 Reads byte ranges of files into memory the caller owns: requests are queued,
 run by a pool of threads or an io_uring, and reaped one by one.
 """
-exclude = ["target/*", "Cargo.lock"]
 
 [features]
 default = ["io-uring"]

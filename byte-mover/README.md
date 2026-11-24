@@ -7,10 +7,10 @@ an io_uring each, and reaped one by one, each with the id it was queued under.
 Any thread may queue and reap. A mover knows nothing of what the bytes are: file formats, caches and
 devices are the caller's.
 
-It is meant for programs that page model weights in and out while they run
-(the experts of a mixture-of-experts model, rows of a large table) and for
-loaders, where the time a read takes to come back matters as much as the bytes
-per second.
+It is the backend of safetensors' reader, for programs that page model weights
+in and out while they run (the experts of a mixture-of-experts model, rows of a
+large table), where the time a read takes to come back matters as much as the
+bytes per second.
 
 ```rust
 use byte_mover::{Mover, Read};
@@ -44,7 +44,6 @@ done.result?;
 
 ## Status
 
-Experimental: the API will change. See [ROADMAP.md](./ROADMAP.md).
-
-It lives in the safetensors repository and is versioned and released on its
-own. It does not depend on safetensors.
+Internal to safetensors: it is not published and its API changes without
+notice. It is a crate of its own so that it builds, tests and benchmarks
+without Python.
