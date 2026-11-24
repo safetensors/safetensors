@@ -941,6 +941,46 @@ class PrefetchCudaTests(unittest.TestCase):
             torch.equal(u8.cpu(), torch.tensor([1, 2, 3], dtype=torch.uint8))
         )
 
+    @unittest.skipUnless(hasattr(os, "posix_fadvise"), "evicts the file from the cache")
+    def test_direct_reads_match_cpu_load(self):
+        # data at an odd offset, file length not a multiple of 4 KiB, read uncached
+        path = os.path.join(self.tempdir.name, "odd.safetensors")
+        header = json.dumps(
+            {
+                "w": {
+                    "dtype": "I32",
+                    "shape": [300, 1000],
+                    "data_offsets": [0, 1200000],
+                },
+                "tail": {
+                    "dtype": "U8",
+                    "shape": [777],
+                    "data_offsets": [1200000, 1200777],
+                },
+            }
+        ).encode()
+        header += b" " * (1 - len(header) % 2)
+        data = torch.randint(0, 256, (1200777,), dtype=torch.uint8).numpy().tobytes()
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)) + header + data)
+            os.fsync(fh.fileno())
+        cpu = load_file_pt(path, backend="pread")
+        plan = {"w": (slice(5, 290), [slice(3, 40), slice(500, 777)]), "tail": None}
+        w = cpu["w"][5:290]
+        sliced = {"w": torch.cat([w[:, 3:40], w[:, 500:777]], 1), "tail": cpu["tail"]}
+        for direct in (None, True, False):
+            for p, want in ((None, cpu), (plan, sliced)):
+                fd = os.open(path, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+                with (
+                    safe_open(path, framework="pt") as f,
+                    f.prefetch(p, device="cuda:0", direct=direct) as loader,
+                ):
+                    got = dict(loader)
+                for name, t in want.items():
+                    self.assertTrue(torch.equal(got[name].cpu(), t), (direct, name))
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
 class PrefetchAllocationTests(unittest.TestCase):

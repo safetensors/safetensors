@@ -1361,6 +1361,7 @@ impl Open {
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        direct: Option<bool>,
     ) -> PyResult<PrefetchLoader> {
         if self.framework != Framework::Pytorch {
             return Err(SafetensorError::new_err(
@@ -1453,6 +1454,7 @@ impl Open {
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
         let loader = Loader::load(
             self.file.clone(),
+            direct,
             self.offset,
             device_idx,
             threads,
@@ -2250,6 +2252,13 @@ impl safe_open {
     ///         The CUDA device to load to; defaults to the handle's `device`.
     ///     threads (`int`, defaults to 8):
     ///         Reader threads for this loader.
+    ///     direct (`bool`, *optional*):
+    ///         Whether to read the file directly from the disk, bypassing the page
+    ///         cache. Direct reads are faster on fast disks but leave the file
+    ///         uncached for later loads. `None` (the default) reads the parts already
+    ///         cached from the cache and the rest directly; `True` reads everything
+    ///         directly; `False` reads everything through the cache. Filesystems that
+    ///         do not support direct reads always go through the cache.
     ///
     /// Raises if a planned tensor has a dtype the installed torch cannot represent
     /// (F6, F8_E8M0 before torch 2.7, F4 before 2.8), if a slice has a step other
@@ -2268,15 +2277,16 @@ impl safe_open {
     ///         for name, tensor in loader:
     ///             ...
     /// ```
-    #[pyo3(signature = (plan=None, *, device=None, threads=8))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=8, direct=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        direct: Option<bool>,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(py, plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads, direct)
     }
 
     /// Return the special non tensor information in the header
@@ -3369,15 +3379,16 @@ impl _safe_open_handle {
     }
 
     /// See [`safe_open::prefetch`].
-    #[pyo3(signature = (plan=None, *, device=None, threads=8))]
+    #[pyo3(signature = (plan=None, *, device=None, threads=8, direct=None))]
     pub fn prefetch(
         &self,
         py: Python<'_>,
         plan: Option<&PyBound<'_, PyDict>>,
         device: Option<Device>,
         threads: usize,
+        direct: Option<bool>,
     ) -> PyResult<PrefetchLoader> {
-        self.inner()?.prefetch(py, plan, device, threads)
+        self.inner()?.prefetch(py, plan, device, threads, direct)
     }
 
     /// Return the special non tensor information in the header
