@@ -10,7 +10,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "byte-mover"
-version = "0.1.0-dev.0"
+version = "0.0.0"
 dependencies = [
  "io-uring",
  "libc",

@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "byte-mover"
-version = "0.1.0-dev.0"
+version = "0.0.0"
 dependencies = [
  "libc",
 ]
