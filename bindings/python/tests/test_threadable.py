@@ -1,8 +1,10 @@
+import faulthandler
+import tempfile
 import unittest
 from concurrent import futures
 import threading
 import numpy as np
-from safetensors import TensorSpec, serialize_file
+from safetensors import TensorSpec, safe_open, serialize_file
 from safetensors.numpy import load_file
 import time
 import os
@@ -93,6 +95,36 @@ class TestCase(unittest.TestCase):
             for file_name in file_names:
                 if os.path.exists(file_name):
                     os.remove(file_name)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs a FIFO")
+    def test_safe_open_releases_gil(self):
+        """Opening a FIFO waits for its writer: this thread only becomes that
+        writer if `safe_open` lets go of the GIL while it opens the file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = os.path.join(tmp, "fifo")
+            os.mkfifo(fifo)
+            about_to_open = threading.Event()
+            errors = []
+
+            def opening():
+                about_to_open.set()
+                try:
+                    safe_open(fifo, "np")
+                except Exception as err:
+                    errors.append(err)
+
+            # fires from a C thread: a GIL that is never released cannot stop it
+            faulthandler.dump_traceback_later(30, exit=True)
+            thread = threading.Thread(target=opening)
+            thread.start()
+            about_to_open.wait()
+            time.sleep(0.2)
+            with open(fifo, "wb"):
+                pass
+            thread.join()
+            faulthandler.cancel_dump_traceback_later()
+            # a FIFO is no safetensors file
+            self.assertEqual(len(errors), 1)
 
 
 if __name__ == "__main__":
