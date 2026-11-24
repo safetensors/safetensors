@@ -1440,7 +1440,15 @@ impl Open {
         // the first, the rest from the allocator thread
         let sizes: Vec<usize> = spans.iter().map(|s| s.end - s.start).collect();
         let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
-        let loader = Loader::load(self.file.clone(), self.offset, device_idx, threads, spans)?;
+        let gathers = vec![None; spans.len()];
+        let loader = Loader::load(
+            self.file.clone(),
+            self.offset,
+            device_idx,
+            threads,
+            spans,
+            gathers,
+        )?;
         let started = (|| -> PyResult<_> {
             let (stream, stream_raw) = current_stream(py, device_idx)?;
             let piece = warm_piece(get_module(py, &TORCH_MODULE)?, device_idx);
