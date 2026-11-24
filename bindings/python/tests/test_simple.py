@@ -136,6 +136,33 @@ class TestCase(unittest.TestCase):
         self.assertEqual(out1[8:].index(b"\x00") + 8, 104)
         self.assertEqual((out1[8:].index(b"\x00") + 8) % 8, 0)
 
+    def test_save_file_returns_layout(self):
+        tensors = {
+            "b": np.arange(6, dtype=np.float32).reshape(2, 3),
+            "a": np.arange(4, dtype=np.int64),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "layout.safetensors")
+            layout = save_file(tensors, path, metadata={"framework": "np"})
+            with safe_open(path, framework="np") as f:
+                self.assertEqual(list(layout.tensors), f.offset_keys())
+                for name, meta in layout.tensors.items():
+                    read = f.get_tensor_meta(name)
+                    self.assertEqual(
+                        (meta.dtype, meta.shape, meta.data_offsets),
+                        (read.dtype, read.shape, read.data_offsets),
+                    )
+            raw = Path(path).read_bytes()
+            for name, meta in layout.tensors.items():
+                start, end = meta.data_offsets
+                little_endian = tensors[name].astype(
+                    tensors[name].dtype.newbyteorder("<")
+                )
+                self.assertEqual(
+                    raw[layout.data_offset + start : layout.data_offset + end],
+                    little_endian.tobytes(),
+                )
+
     def test_serialization_no_big_endian(self):
         # Big endian tensor
         data = np.zeros((2, 2), dtype=">i4")
