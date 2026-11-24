@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring, Submitter};
 
 use crate::{
     pool::{Shared, State},
@@ -17,8 +17,8 @@ use crate::{
 /// The kernel takes registered buffers of at most 1 GiB each
 const PIECE: usize = 1 << 30;
 
-/// What the poll on [`Ring::wake`] completes with, in place of a slot
-const WAKE: u64 = u64::MAX;
+/// What a completion that only ends a wait carries, in place of a slot
+pub(crate) const WAKE: u64 = u64::MAX;
 
 /// How many times a ring waits for the reads it submits before it checks
 /// again whether they finish as they are submitted
@@ -46,13 +46,18 @@ impl Registration {
     }
 }
 
+/// The reads in a ring and the memory registered with it
+pub(crate) struct Slots {
+    /// the reads, by the index the ring knows them under
+    reads: Vec<Option<Inflight>>,
+    free: Vec<usize>,
+    /// the memory registered, in pieces of [`PIECE`]
+    registered: Option<(usize, usize)>,
+}
+
 pub(crate) struct Ring {
     ring: IoUring,
-    /// the reads in the ring, by the index the ring knows them under
-    slots: Vec<Option<Inflight>>,
-    free: Vec<usize>,
-    /// the memory this ring registered, in pieces of [`PIECE`]
-    registered: Option<(usize, usize)>,
+    slots: Slots,
     /// the last [`Registration::asked`] answered
     answered: u64,
     /// an eventfd: a write to it ends the ring's wait in the kernel, for a
@@ -72,7 +77,7 @@ struct Inflight {
 
 /// Ends the process if the thread unwinds: the kernel may still write to the
 /// destinations of its reads, which nothing can hand back any more.
-struct AbortOnPanic;
+pub(crate) struct AbortOnPanic;
 
 impl Drop for AbortOnPanic {
     fn drop(&mut self) {
@@ -97,9 +102,7 @@ impl Ring {
             armed: false,
             parked: false,
             ring: IoUring::new(depth)?,
-            slots: (0..depth).map(|_| None).collect(),
-            free: (0..depth as usize).collect(),
-            registered: None,
+            slots: Slots::new(depth),
             answered: 0,
         })
     }
@@ -131,7 +134,7 @@ impl Ring {
                 if state.registration.asked != self.answered {
                     let (memory, asked) = (state.registration.memory, state.registration.asked);
                     drop(state);
-                    let refused = self.register(memory).err();
+                    let refused = self.slots.register(&self.ring.submitter(), memory).err();
                     self.answered = asked;
                     state = shared.state.lock().unwrap();
                     state.registration.answers += 1;
@@ -141,16 +144,12 @@ impl Ring {
                     shared.finished.notify_all();
                     continue;
                 }
-                let take = state.queue.len().div_ceil(rings).min(self.free.len());
-                for read in state.queue.drain(..take) {
-                    let slot = self.free.pop().expect("a free slot");
-                    self.slots[slot] = Some(Inflight { read, got: 0 });
-                    taken.push(slot);
-                }
+                let take = state.queue.len().div_ceil(rings).min(self.slots.free());
+                taken.extend(state.queue.drain(..take).map(|read| self.slots.take(read)));
                 if take > 0 && !state.queue.is_empty() {
                     roused = shared.rouse(&mut state);
                 }
-                if self.free.len() < self.slots.len() {
+                if !self.slots.idle() {
                     break;
                 }
                 if state.closed {
@@ -159,7 +158,7 @@ impl Ring {
                 state = shared.sleep(state);
             }
             let wait = taken.is_empty() || !inline;
-            if wait && !self.free.is_empty() {
+            if wait && self.slots.free() > 0 {
                 self.park(&mut state);
             }
             drop(state);
@@ -179,7 +178,7 @@ impl Ring {
                     waited = (waited + 1) % RECHECK;
                     inline = waited == 0;
                 } else {
-                    inline = taken.iter().all(|&slot| self.slots[slot].is_none());
+                    inline = taken.iter().all(|&slot| self.slots.reads[slot].is_none());
                 }
                 taken.clear();
             }
@@ -209,51 +208,9 @@ impl Ring {
         }
     }
 
-    /// Registers `memory` in place of what was registered. A ring that cannot
-    /// reads into it as into any other memory.
-    fn register(&mut self, memory: Option<(usize, usize)>) -> io::Result<()> {
-        if self.registered.take().is_some() {
-            self.ring.submitter().unregister_buffers()?;
-        }
-        let Some((base, len)) = memory else {
-            return Ok(());
-        };
-        let iovecs: Vec<libc::iovec> = (0..len.div_ceil(PIECE))
-            .map(|i| libc::iovec {
-                iov_base: (base + i * PIECE) as *mut libc::c_void,
-                iov_len: PIECE.min(len - i * PIECE),
-            })
-            .collect();
-        // SAFETY: `Mover::register` requires the memory valid until the mover
-        // is dropped, which ends this ring
-        unsafe { self.ring.submitter().register_buffers(&iovecs) }?;
-        self.registered = Some((base, len));
-        Ok(())
-    }
-
-    /// The registered piece that holds all of `len` bytes at `dst`
-    fn piece(&self, dst: *mut u8, len: usize) -> Option<u16> {
-        let (base, registered) = self.registered?;
-        let at = (dst as usize).checked_sub(base)?;
-        let piece = at / PIECE;
-        let within = at + len <= registered && (at + len - 1) / PIECE == piece;
-        (len > 0 && within).then_some(piece as u16)
-    }
-
     /// Queues what is left of the read in `slot`.
     fn push(&mut self, slot: usize) {
-        let Inflight { read, got } = self.slots[slot].as_ref().expect("in flight");
-        let (dst, len) = (read.dst.wrapping_add(*got), read.len - got);
-        // one request reads at most `u32::MAX` bytes: the rest follows as a short read
-        let chunk = len.min(u32::MAX as usize) as u32;
-        let (fd, offset) = (types::Fd(read.fd), read.offset + *got as u64);
-        let entry = match self.piece(dst, chunk as usize) {
-            Some(piece) => opcode::ReadFixed::new(fd, dst, chunk, piece)
-                .offset(offset)
-                .build(),
-            None => opcode::Read::new(fd, dst, chunk).offset(offset).build(),
-        }
-        .user_data(slot as u64);
+        let entry = self.slots.entry(slot);
         self.queue(&entry);
     }
 
@@ -269,26 +226,109 @@ impl Ring {
                 continue;
             }
             let slot = completion.user_data() as usize;
-            let inflight = self.slots[slot].as_mut().expect("in flight");
-            let result = match completion.result() {
-                0 if inflight.read.len > 0 => Err(io::ErrorKind::UnexpectedEof.into()),
-                n if n >= 0 => {
-                    inflight.got += n as usize;
-                    if inflight.got < inflight.read.len {
-                        self.push(slot);
-                        continue;
-                    }
-                    Ok(())
-                }
-                errno if errno == -libc::EINTR || errno == -libc::EAGAIN => {
-                    self.push(slot);
-                    continue;
-                }
-                errno => Err(io::Error::from_raw_os_error(-errno)),
-            };
-            let id = self.slots[slot].take().expect("in flight").read.id;
-            self.free.push(slot);
-            finished.push(Done { id, result });
+            match self.slots.land(slot, completion.result()) {
+                Some(done) => finished.push(done),
+                None => self.push(slot),
+            }
         }
+    }
+}
+
+impl Slots {
+    pub(crate) fn new(depth: u32) -> Self {
+        Self {
+            reads: (0..depth).map(|_| None).collect(),
+            free: (0..depth as usize).collect(),
+            registered: None,
+        }
+    }
+
+    /// How many more reads the ring takes
+    pub(crate) fn free(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Whether the ring holds no read
+    pub(crate) fn idle(&self) -> bool {
+        self.free.len() == self.reads.len()
+    }
+
+    /// Gives `read` a slot, which must be [`Self::free`].
+    pub(crate) fn take(&mut self, read: Read) -> usize {
+        let slot = self.free.pop().expect("a free slot");
+        self.reads[slot] = Some(Inflight { read, got: 0 });
+        slot
+    }
+
+    /// Registers `memory` in place of what was registered. A ring that cannot
+    /// reads into it as into any other memory.
+    pub(crate) fn register(
+        &mut self,
+        submitter: &Submitter<'_>,
+        memory: Option<(usize, usize)>,
+    ) -> io::Result<()> {
+        if self.registered.take().is_some() {
+            submitter.unregister_buffers()?;
+        }
+        let Some((base, len)) = memory else {
+            return Ok(());
+        };
+        let iovecs: Vec<libc::iovec> = (0..len.div_ceil(PIECE))
+            .map(|i| libc::iovec {
+                iov_base: (base + i * PIECE) as *mut libc::c_void,
+                iov_len: PIECE.min(len - i * PIECE),
+            })
+            .collect();
+        // SAFETY: `Mover::register` requires the memory valid until the mover
+        // is dropped, which ends the ring
+        unsafe { submitter.register_buffers(&iovecs) }?;
+        self.registered = Some((base, len));
+        Ok(())
+    }
+
+    /// The registered piece that holds all of `len` bytes at `dst`
+    fn piece(&self, dst: *mut u8, len: usize) -> Option<u16> {
+        let (base, registered) = self.registered?;
+        let at = (dst as usize).checked_sub(base)?;
+        let piece = at / PIECE;
+        let within = at + len <= registered && (at + len - 1) / PIECE == piece;
+        (len > 0 && within).then_some(piece as u16)
+    }
+
+    /// The request for what is left of the read in `slot`
+    pub(crate) fn entry(&self, slot: usize) -> squeue::Entry {
+        let Inflight { read, got } = self.reads[slot].as_ref().expect("in flight");
+        let (dst, len) = (read.dst.wrapping_add(*got), read.len - got);
+        // one request reads at most `u32::MAX` bytes: the rest follows as a short read
+        let chunk = len.min(u32::MAX as usize) as u32;
+        let (fd, offset) = (types::Fd(read.fd), read.offset + *got as u64);
+        match self.piece(dst, chunk as usize) {
+            Some(piece) => opcode::ReadFixed::new(fd, dst, chunk, piece)
+                .offset(offset)
+                .build(),
+            None => opcode::Read::new(fd, dst, chunk).offset(offset).build(),
+        }
+        .user_data(slot as u64)
+    }
+
+    /// Takes what the request of `slot` completed with: the read once it
+    /// ended, or `None` when what is left of it is to go back in the ring.
+    pub(crate) fn land(&mut self, slot: usize, result: i32) -> Option<Done> {
+        let inflight = self.reads[slot].as_mut().expect("in flight");
+        let result = match result {
+            0 if inflight.read.len > 0 => Err(io::ErrorKind::UnexpectedEof.into()),
+            n if n >= 0 => {
+                inflight.got += n as usize;
+                if inflight.got < inflight.read.len {
+                    return None;
+                }
+                Ok(())
+            }
+            errno if errno == -libc::EINTR || errno == -libc::EAGAIN => return None,
+            errno => Err(io::Error::from_raw_os_error(-errno)),
+        };
+        let id = self.reads[slot].take().expect("in flight").read.id;
+        self.free.push(slot);
+        Some(Done { id, result })
     }
 }
