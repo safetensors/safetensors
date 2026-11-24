@@ -33,6 +33,10 @@ pub struct Span {
     pub end: usize,
 }
 
+pub fn available() -> bool {
+    false
+}
+
 pub struct Loader<D>(PhantomData<D>);
 
 pub struct Feed<D>(PhantomData<D>);

@@ -363,7 +363,8 @@ class safe_open:
         each, but specific `framework` + `device` combinations take an internal
         fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
         it bulk-allocates shared `MTLBuffer`s, fills them with parallel
-        `pread(2)`, and hands them to torch via DLPack with no extra copy.
+        `pread(2)`, and hands them to torch via DLPack with no extra copy. On a
+        CUDA device with PyTorch, it loads through `prefetch`.
 
         Returns:
             (`Dict[str, Tensor]`):

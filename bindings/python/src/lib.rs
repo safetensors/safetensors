@@ -689,6 +689,9 @@ pub struct PrefetchLoader {
     background: Arc<Background>,
 }
 
+/// Reader threads of the loader `get_tensors` loads to a CUDA device with
+const GET_TENSORS_THREADS: usize = 16;
+
 /// Bytes of the plan torch allocates ahead of the read schedule
 const ALLOC_AHEAD: usize = 1 << 30;
 
@@ -2010,6 +2013,8 @@ impl Open {
     /// Shared `MTLBuffer`s, parallel-`pread`s into them, and hands them to
     /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
     /// The `mmap` backend uses the sequential loop, reading through the mmap.
+    /// Pytorch on a CUDA device loads through [`Open::prefetch`] when a CUDA
+    /// runtime is loaded.
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         // The bulk parallel-pread path is gated on the `pread` backend so the
         // `backend` choice is honored: `mmap` falls through to the per-tensor
@@ -2027,6 +2032,20 @@ impl Open {
             if let Storage::Pread(file) = self.storage.as_ref() {
                 return self.get_tensors_mps(file);
             }
+        }
+
+        if self.framework == Framework::Pytorch
+            && matches!(self.device, Device::Cuda(_))
+            && crate::engine::available()
+        {
+            return Python::attach(|py| -> PyResult<Py<PyDict>> {
+                let loader = self.prefetch(py, None, None, GET_TENSORS_THREADS, None)?;
+                let dict = PyDict::new(py);
+                for name in &loader.names {
+                    dict.set_item(name, loader.take(py, name)?)?;
+                }
+                Ok(dict.into())
+            });
         }
 
         Python::attach(|py| -> PyResult<Py<PyDict>> {
@@ -2355,7 +2374,8 @@ impl safe_open {
     ///
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
     /// each; for `device="mps"` it instead bulk-allocates Shared MTLBuffers,
-    /// parallel-`pread(2)`s into them, and hands them off via DLPack.
+    /// parallel-`pread(2)`s into them, and hands them off via DLPack. On a CUDA
+    /// device with PyTorch, it loads through `prefetch`.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
