@@ -118,7 +118,6 @@ impl CudaApi {
         Ok(ptr as *mut u8)
     }
 
-    #[cfg(test)]
     pub fn free_host(&self, ptr: *mut u8) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaFreeHost)(ptr as *mut c_void) })
     }

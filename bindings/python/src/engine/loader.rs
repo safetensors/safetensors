@@ -42,10 +42,10 @@ use std::{
 
 use super::{
     cuda::{api, CudaError, Stream},
-    cuda_memory::MAX_DEVICES,
+    cuda_memory::{pinned_pool, MAX_DEVICES},
     file::DirectFile,
     memory::{CudaSink, LoadPlan, Span},
-    pool::{pool, SlabPool},
+    pool::SlabPool,
     transfer::{self, Error, Plan, CHUNK_SIZE},
 };
 use safetensors::slice::Gather;
@@ -110,7 +110,7 @@ struct LoaderInner<D> {
     source: DirectFile,
     plan: Arc<LoadPlan>,
     sink: CudaSink<D>,
-    pool: &'static SlabPool,
+    pool: Arc<SlabPool>,
     /// the plan's chunks as the workers claim them, and the first error
     transfer: Plan,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -245,9 +245,9 @@ impl<D: Send + 'static> Loader<D> {
         let plan = Arc::new(LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE));
         // avoid spawning too many threads when not needed, up to chunks.len()
         let threads = threads.clamp(1, plan.chunks.len().max(1));
-        let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
+        let pool = cuda_api.with_device(device, |_| pinned_pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
-            source: DirectFile::new(file, direct, pool.aligned),
+            source: DirectFile::new(file, direct, pool.aligned()),
             transfer: Plan::new(plan.file_chunks()),
             plan: plan.clone(),
             sink: CudaSink::new(cuda_api, plan, device)?,
@@ -259,7 +259,7 @@ impl<D: Send + 'static> Loader<D> {
             let inner = loader.inner.clone();
             let spawned = std::thread::Builder::new().spawn(move || {
                 let _ = cuda_api.set_device(device);
-                transfer::work(&inner.transfer, &inner.source, &inner.sink, inner.pool)
+                transfer::work(&inner.transfer, &inner.source, &inner.sink, &inner.pool)
             });
             // on failure, dropping the loader stops and joins the workers already started
             loader.inner.workers.lock().unwrap().push(spawned?);
