@@ -20,6 +20,10 @@ const PIECE: usize = 1 << 30;
 /// What the poll on [`Ring::wake`] completes with, in place of a slot
 const WAKE: u64 = u64::MAX;
 
+/// How many times a ring waits for the reads it submits before it checks
+/// again whether they finish as they are submitted
+const RECHECK: u32 = 32;
+
 /// Memory the rings are asked to register, each for itself
 #[derive(Default)]
 pub(crate) struct Registration {
@@ -107,6 +111,12 @@ impl Ring {
         let _abort = AbortOnPanic;
         let mut finished = Vec::new();
         let mut taken = Vec::new();
+        // Whether reads finish as they are submitted, as reads from the page
+        // cache do. Nothing is left to wait for in the kernel then: listed
+        // as parked, the ring would be woken for nothing by each read queued
+        // while it copies.
+        let mut inline = true;
+        let mut waited = 0;
         loop {
             let mut state = shared.state.lock().unwrap();
             if std::mem::take(&mut self.parked) {
@@ -148,21 +158,31 @@ impl Ring {
                 }
                 state = shared.sleep(state);
             }
-            if !self.free.is_empty() {
+            let wait = taken.is_empty() || !inline;
+            if wait && !self.free.is_empty() {
                 self.park(&mut state);
             }
             drop(state);
             shared.wake(roused);
-            for slot in taken.drain(..) {
+            for &slot in &taken {
                 self.push(slot);
             }
-            match self.ring.submit_and_wait(1) {
+            match self.ring.submit_and_wait(wait as usize) {
                 Ok(_) => {}
                 // `EBUSY`: completions to reap first
                 Err(err) if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
                 Err(err) => panic!("io_uring failed with reads in flight: {err}"),
             }
             self.reap(&mut finished);
+            if !taken.is_empty() {
+                if wait {
+                    waited = (waited + 1) % RECHECK;
+                    inline = waited == 0;
+                } else {
+                    inline = taken.iter().all(|&slot| self.slots[slot].is_none());
+                }
+                taken.clear();
+            }
         }
     }
 
