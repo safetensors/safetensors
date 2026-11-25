@@ -1,4 +1,8 @@
+import json
+import os
 import platform
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -109,6 +113,64 @@ class LoadTestCase(unittest.TestCase):
                 self.assertEqual(loaded[k].dtype, v.dtype)
                 self.assertEqual(loaded[k].shape, v.shape)
                 self.assertTrue(mx.array_equal(loaded[k], v))
+
+    def test_prefetch(self):
+        data = {
+            "scalar": mx.array(3, dtype=mx.int64),
+            "empty": mx.zeros((2, 0), dtype=mx.float32),
+            "bf16": mx.arange(-8, 8, dtype=mx.float32).astype(mx.bfloat16),
+            "large": mx.arange(10 << 20, dtype=mx.float32).reshape(-1, 4),
+        }
+        local = "./tests/data/mlx_prefetch.safetensors"
+        save_file(data, local)
+        with safe_open(local, framework="mlx") as f:
+            with f.prefetch() as loader:
+                loaded = dict(loader)
+            self.assertEqual(loaded.keys(), data.keys())
+            for k, v in data.items():
+                self.assertEqual(loaded[k].dtype, v.dtype)
+                self.assertEqual(loaded[k].shape, v.shape)
+                self.assertTrue(mx.array_equal(loaded[k], v))
+            with f.prefetch({"large": slice(10, 20)}) as loader:
+                self.assertTrue(
+                    mx.array_equal(loader.take("large"), data["large"][10:20])
+                )
+
+    def test_prefetch_allocates_every_array_at_the_call(self):
+        # more than the 1 GiB numpy allocates ahead: MLX arrays are all allocated
+        # by `prefetch`, on the caller's thread and the CPU stream. A sparse file:
+        # only the first byte of each tensor is written.
+        count, size = 40, 32 << 20
+        header = {
+            f"t{i:02d}": {
+                "dtype": "U8",
+                "shape": [size],
+                "data_offsets": [i * size, (i + 1) * size],
+            }
+            for i in range(count)
+        }
+        header = json.dumps(header).encode()
+        calls = []
+
+        def zeros(*args, **kwargs):
+            calls.append((threading.get_ident(), kwargs.get("stream")))
+            return mx_zeros(*args, **kwargs)
+
+        mx_zeros = mx.zeros
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.safetensors")
+            with open(path, "wb") as f:
+                f.write(len(header).to_bytes(8, "little") + header)
+                data = f.tell()
+                for i in range(count):
+                    f.seek(data + i * size)
+                    f.write(bytes([i + 1]))
+                f.truncate(data + count * size)
+            with safe_open(path, framework="mlx") as f:
+                with mock.patch.object(mx, "zeros", zeros), f.prefetch() as loader:
+                    self.assertEqual(calls, [(threading.get_ident(), mx.cpu)] * count)
+                    for i in range(count):
+                        self.assertEqual(loader.take(f"t{i:02d}")[0].item(), i + 1)
 
     def test_deserialization_safe_open(self):
         weights = {}

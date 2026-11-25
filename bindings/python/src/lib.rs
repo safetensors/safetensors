@@ -837,6 +837,10 @@ enum Place {
     Cuda(i32),
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Mps,
+    /// host memory, as numpy arrays
+    Numpy,
+    /// host memory, as MLX arrays
+    Mlx,
 }
 
 impl Place {
@@ -844,8 +848,7 @@ impl Place {
     fn cuda(self) -> Option<i32> {
         match self {
             Self::Cuda(device) => Some(device),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Self::Mps => None,
+            _ => None,
         }
     }
 }
@@ -856,12 +859,13 @@ impl fmt::Display for Place {
             Self::Cuda(device) => write!(f, "cuda:{device}"),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::Mps => f.write_str("mps"),
+            Self::Numpy | Self::Mlx => f.write_str("cpu"),
         }
     }
 }
 
-/// The tensors of one file loading to a CUDA or MPS device in the background,
-/// see [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`]
+/// The tensors of one file loading in the background, to a CUDA or MPS device
+/// or to numpy or MLX arrays, see [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`]
 /// or by iterating; tensors not taken are released at `close`.
 ///
 /// On CUDA, tensors are allocated by torch on the stream current at `prefetch`,
@@ -896,11 +900,11 @@ const CPU_READ_THREADS: usize = 16;
 #[cfg(all(unix, target_endian = "little"))]
 const PARALLEL_READ_MIN: usize = 2 << 20;
 
-/// Bytes of the plan torch allocates ahead of the read schedule
+/// Bytes of the plan allocated ahead of the read schedule
 const ALLOC_AHEAD: usize = 1 << 30;
 
 /// At most this many tensors, and about this many bytes, per batch: the workers
-/// copy one batch while torch allocates the next, and the GIL is held per batch
+/// copy one batch while the next is allocated, and the GIL is held per batch
 const BATCH_TENSORS: usize = 256;
 const BATCH_BYTES: usize = 16 << 20;
 
@@ -1035,26 +1039,33 @@ impl Allocation {
         py: Python<'_>,
         target: usize,
     ) -> Result<Vec<(u64, Py<PyAny>)>, AllocFailure> {
-        let torch = get_module(py, &TORCH_MODULE).map_err(|cause| AllocFailure {
-            reason: "torch is not imported".into(),
-            cause,
-        })?;
         let place = self.place;
         // one device object for the batch: torch parses a device string at every call
         let cuda = place
             .cuda()
             .map(|device| {
+                let torch = get_module(py, &TORCH_MODULE)?;
                 let kwargs = torch
                     .getattr(intern!(py, "device"))?
                     .call1(("cuda", device))
                     .and_then(|device| [(intern!(py, "device"), device)].into_py_dict(py))?;
-                Ok((device, kwargs))
+                Ok((torch, device, kwargs))
             })
             .transpose()
             .map_err(|cause: PyErr| AllocFailure {
                 reason: format!("cannot allocate on {place}: {cause}"),
                 cause,
             })?;
+        let host = match place {
+            Place::Numpy => Some(get_module(py, &NUMPY_MODULE).cloned()),
+            Place::Mlx => Some(PyModule::import(py, intern!(py, "mlx.core"))),
+            _ => None,
+        }
+        .transpose()
+        .map_err(|cause| AllocFailure {
+            reason: format!("cannot allocate on {place}: {cause}"),
+            cause,
+        })?;
         let mut dsts = Vec::new();
         let first = self.before[self.next];
         while !self.done()
@@ -1064,8 +1075,9 @@ impl Allocation {
         {
             let i = self.next;
             let (meta, size) = (&self.metas[i], self.sizes[i]);
-            let tensor = match &cuda {
-                Some((device, kwargs)) => {
+            let tensor = match (&host, &cuda) {
+                (Some(module), _) => host_empty(module, place, meta, size),
+                (None, Some((torch, device, kwargs))) => {
                     if self.warming && self.warm[i] > 0 {
                         // best effort: the tensors may still fit without it. Not past the
                         // free memory: torch would flush the caller's cache to retry
@@ -1098,9 +1110,9 @@ impl Allocation {
                     })()
                 }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                None => mps_empty(py, meta, size),
+                (None, None) => mps_empty(py, meta, size),
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                None => unreachable!("every place but mps is a cuda device"),
+                (None, None) => unreachable!("a place is host memory or a cuda device"),
             };
             match tensor {
                 Ok(dst) => dsts.push(dst),
@@ -1115,6 +1127,12 @@ impl Allocation {
                 }
             }
             self.next += 1;
+        }
+        if let (Place::Mlx, Some(mlx)) = (place, &host) {
+            mlx_addresses(mlx, &mut dsts).map_err(|cause| AllocFailure {
+                reason: format!("cannot allocate on {place}: {cause}"),
+                cause,
+            })?;
         }
         Ok(dsts)
     }
@@ -1600,14 +1618,40 @@ impl Open {
         threads: usize,
         direct: Option<bool>,
     ) -> PyResult<PrefetchLoader> {
-        if self.framework != Framework::Pytorch {
-            return Err(SafetensorError::new_err(
-                "prefetch is only compatible with framework=\"pt\"",
-            ));
-        }
-
         let device = device.unwrap_or_else(|| self.device.clone());
         let place = match device {
+            _ if !matches!(
+                self.framework,
+                Framework::Pytorch | Framework::Numpy | Framework::Mlx
+            ) =>
+            {
+                return Err(SafetensorError::new_err(
+                    "prefetch is only compatible with framework=\"pt\", \"np\" and \"mlx\"",
+                ))
+            }
+            Device::Cpu if self.framework != Framework::Pytorch => {
+                if cfg!(target_endian = "big") {
+                    return Err(SafetensorError::new_err(
+                        "prefetch loads to the cpu on little-endian systems only",
+                    ));
+                }
+                match self.framework {
+                    // elsewhere MLX may keep its arrays on a device
+                    Framework::Mlx if cfg!(not(target_os = "macos")) => {
+                        return Err(SafetensorError::new_err(
+                            "prefetch loads mlx arrays on macOS only",
+                        ))
+                    }
+                    Framework::Mlx => Place::Mlx,
+                    _ => Place::Numpy,
+                }
+            }
+            other if self.framework != Framework::Pytorch => {
+                return Err(SafetensorError::new_err(format!(
+                    "prefetch loads {} tensors to the cpu, not {other}",
+                    self.framework
+                )))
+            }
             Device::Cuda(index) | Device::Anonymous(index) => Place::Cuda(index as i32),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Device::Mps if torch_supports_mps_dlpack() => Place::Mps,
@@ -1634,7 +1678,11 @@ impl Open {
             None => None,
         };
 
-        let torch = get_module(py, &TORCH_MODULE)?;
+        let module = match place {
+            Place::Numpy => get_module(py, &NUMPY_MODULE)?.clone(),
+            Place::Mlx => PyModule::import(py, intern!(py, "mlx.core"))?,
+            _ => get_module(py, &TORCH_MODULE)?.clone(),
+        };
         let mut spans = Vec::new();
         let mut gathers = Vec::new();
         let mut sizes = Vec::new();
@@ -1655,10 +1703,18 @@ impl Open {
 
             // before anything is allocated: F6 has no torch dtype, and older torch
             // lacks the newest ones
-            let dtype = get_pydtype(torch, info.dtype, false).map_err(|_| {
+            let dtype = match place {
+                Place::Numpy if info.dtype != Dtype::F4 => {
+                    get_pydtype(&module, info.dtype, true).ok()
+                }
+                Place::Mlx => mlx_dtype(&module, info.dtype),
+                Place::Numpy => None,
+                _ => get_pydtype(&module, info.dtype, false).ok(),
+            }
+            .ok_or_else(|| {
                 SafetensorError::new_err(format!(
-                    "prefetch cannot hand out dtype {:?}: torch has no matching dtype",
-                    info.dtype
+                    "prefetch cannot hand out dtype {:?}: {} has no matching dtype",
+                    info.dtype, self.framework
                 ))
             })?;
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1719,6 +1775,9 @@ impl Open {
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Place::Mps => Loader::load_host(file, direct, self.offset, threads, spans, gathers)?,
+            Place::Numpy | Place::Mlx => {
+                Loader::load_host(file, direct, self.offset, threads, spans, gathers)?
+            }
         };
         let started = (|| -> PyResult<_> {
             let (stream, stream_raw, piece) = match place.cuda() {
@@ -1731,8 +1790,14 @@ impl Open {
             };
             let mut alloc = Allocation::new(metas, sizes, piece, place);
             let feed = loader.feed();
-            while !alloc.done() && alloc.before[alloc.next] < ALLOC_AHEAD {
-                let dsts = alloc.batch(py, ALLOC_AHEAD).map_err(|f| f.into_pyerr(py))?;
+            // MLX before 0.31.2 fails when two threads evaluate at once: every MLX
+            // array is allocated here, none from the allocator thread
+            let ahead = match place {
+                Place::Mlx => usize::MAX,
+                _ => ALLOC_AHEAD,
+            };
+            while !alloc.done() && alloc.before[alloc.next] < ahead {
+                let dsts = alloc.batch(py, ahead).map_err(|f| f.into_pyerr(py))?;
                 feed.provide(dsts, stream_raw)
                     .map_err(|(e, _)| PyErr::from(e))?;
             }
@@ -2554,8 +2619,8 @@ impl safe_open {
         })
     }
 
-    /// Start loading the file's tensors to a CUDA device, or to MPS on Apple
-    /// silicon, in the background.
+    /// Start loading the file's tensors in the background: with torch to a CUDA
+    /// device, or to MPS on Apple silicon; with numpy or MLX to the CPU.
     ///
     /// Returns a [`PrefetchLoader`] that hands each tensor out once, by
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs in
@@ -2563,7 +2628,7 @@ impl safe_open {
     /// about 1 GiB ahead of the reads. The handle itself
     /// is unchanged: its header queries and [`Self::get_slice`] keep working, and several loaders can be
     /// started from one handle (for instance one per device). Requires
-    /// `framework="pt"`; works with either backend. Each loader runs `threads`
+    /// `framework="pt"`, `"np"` or `"mlx"`; works with either backend. Each loader runs `threads`
     /// reader threads; all CUDA loaders in the process share one pinned staging
     /// pool.
     ///
@@ -2575,6 +2640,10 @@ impl safe_open {
     /// On MPS, which needs torch 2.9 or later, each tensor wraps a Metal buffer
     /// allocated by safetensors, as with `get_tensor`, and reads go through the
     /// page cache.
+    ///
+    /// With numpy on Linux and macOS, and with MLX on macOS, each tensor is an
+    /// array the framework allocates, which the file is read into. MLX arrays are
+    /// all allocated at the call.
     ///
     /// Args:
     ///     plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -3572,9 +3641,69 @@ fn create_tensor<'a>(
     })
 }
 
+/// A new numpy or MLX array for `meta`'s span of `size` bytes, and the address
+/// of the numpy one's bytes; [`mlx_addresses`] gives those of MLX arrays.
+fn host_empty(
+    module: &PyBound<'_, PyModule>,
+    place: Place,
+    meta: &SpanMeta,
+    size: usize,
+) -> PyResult<(u64, Py<PyAny>)> {
+    let py = module.py();
+    let kwargs = [(intern!(py, "dtype"), &meta.dtype)].into_py_dict(py)?;
+    let shape = (meta.storage_shape.clone(),);
+    let mlx = matches!(place, Place::Mlx);
+    if mlx {
+        // on the GPU, MLX before 0.31.2 aborts if another thread evaluates meanwhile
+        kwargs.set_item(intern!(py, "stream"), module.getattr(intern!(py, "cpu"))?)?;
+    }
+    // MLX has no uninitialized array
+    let new = match mlx {
+        true => intern!(py, "zeros"),
+        false => intern!(py, "empty"),
+    };
+    let array = module.call_method(new, shape, Some(&kwargs))?;
+    let nbytes: usize = array.getattr(intern!(py, "nbytes"))?.extract()?;
+    if nbytes != size {
+        return Err(SafetensorError::new_err(format!(
+            "allocated {nbytes} bytes for {size} bytes of data"
+        )));
+    }
+    if mlx {
+        return Ok((0, array.unbind()));
+    }
+    let addr = array
+        .getattr(intern!(py, "__array_interface__"))?
+        .get_item(intern!(py, "data"))?
+        .get_item(0)?
+        .extract()?;
+    Ok((addr, array.unbind()))
+}
+
+/// Evaluates the MLX arrays of `dsts`, which allocates them, and sets the
+/// address of each one's bytes. It holds for the life of the array: the buffer
+/// an evaluated array exports is its own memory, and pins nothing more than
+/// the array.
+fn mlx_addresses(mlx: &PyBound<'_, PyModule>, dsts: &mut [(u64, Py<PyAny>)]) -> PyResult<()> {
+    let py = mlx.py();
+    let arrays = PyList::new(py, dsts.iter().map(|(_, array)| array))?;
+    mlx.call_method1(intern!(py, "eval"), (arrays,))?;
+    for (addr, array) in dsts {
+        let array = array.bind(py);
+        // the bytes of an empty array do not cast, and nothing is read into it
+        if array.getattr(intern!(py, "size"))?.extract::<usize>()? > 0 {
+            let buffer = mlx_bytes(array)?;
+            if buffer.readonly() {
+                return Err(SafetensorError::new_err("MLX exports a read-only array"));
+            }
+            *addr = buffer.buf_ptr() as u64;
+        }
+    }
+    Ok(())
+}
+
 /// The bytes of an evaluated MLX array. As a `memoryview` of bytes: pyo3 does
 /// not take the buffer a scalar exports, nor the format of a `bfloat16` one.
-#[cfg(all(unix, target_endian = "little"))]
 fn mlx_bytes(array: &PyBound<'_, PyAny>) -> PyResult<PyUntypedBuffer> {
     let view = pyo3::types::PyMemoryView::from(array)?
         .call_method1(intern!(array.py(), "cast"), ("B",))?;
@@ -3583,7 +3712,6 @@ fn mlx_bytes(array: &PyBound<'_, PyAny>) -> PyResult<PyUntypedBuffer> {
 
 /// The MLX dtype with the bytes of `dtype`, where there is one: MLX has no
 /// 64-bit floats on the GPU and turns them into 32-bit ones.
-#[cfg(all(unix, target_endian = "little"))]
 fn mlx_dtype(mlx: &PyBound<'_, PyModule>, dtype: Dtype) -> Option<Py<PyAny>> {
     let name = match dtype {
         Dtype::BOOL => "bool_",

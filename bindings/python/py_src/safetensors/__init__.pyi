@@ -203,8 +203,8 @@ class PySafeSlice:
 
 class PrefetchLoader:
     """
-    The tensors of one file loading to a CUDA or MPS device in the background, returned by
-    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating; tensors not
+    The tensors of one file loading in the background, to a CUDA or MPS device or to numpy or
+    MLX arrays, returned by `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating; tensors not
     taken are released at `close`.
 
     On CUDA, each one is a tensor torch allocated on the stream current at `prefetch`, so torch
@@ -278,15 +278,15 @@ class safe_open:
         direct: Optional[bool] = None,
     ) -> "PrefetchLoader":
         """
-        Start loading the file's tensors to a CUDA device, or to MPS on Apple silicon, in
-        the background.
+        Start loading the file's tensors in the background: with torch to a CUDA device, or
+        to MPS on Apple silicon; with numpy or MLX to the CPU.
 
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
         iterating it as `(name, tensor)` pairs in readiness order, as tensors allocated
         as the load advances, at most about 1 GiB ahead of the reads. The handle itself is
         unchanged: its header queries and `get_slice` keep working, and several loaders can be
-        started from one handle (for instance one per device). Requires `framework="pt"`; works
-        with either backend. Each loader runs `threads` reader threads; all CUDA loaders in
+        started from one handle (for instance one per device). Requires `framework="pt"`, `"np"`
+        or `"mlx"`; works with either backend. Each loader runs `threads` reader threads; all CUDA loaders in
         the process share one pinned staging pool.
 
         On CUDA, torch allocates the tensors on the stream current at the call, and their
@@ -296,6 +296,10 @@ class safe_open:
 
         On MPS, which needs torch 2.9 or later, each tensor wraps a Metal buffer allocated
         by safetensors, as with `get_tensor`, and reads go through the page cache.
+
+        With numpy on Linux and macOS, and with MLX on macOS, each tensor is an array the
+        framework allocates, which the file is read into. MLX arrays are all allocated at
+        the call.
 
         Args:
             plan (`Dict[str, Optional[Any]]`, *optional*):

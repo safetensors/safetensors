@@ -89,6 +89,17 @@ impl<D> Loader<D> {
         Err(LoaderError)
     }
 
+    pub fn load_host(
+        _file: Arc<File>,
+        _direct: Option<bool>,
+        _in_file_offset: usize,
+        _threads: usize,
+        _spans: Vec<Span>,
+        _gathers: Vec<Option<safetensors::slice::Gather>>,
+    ) -> Result<Self, LoaderError> {
+        Err(LoaderError)
+    }
+
     pub fn feed(&self) -> Feed<D> {
         Feed(PhantomData)
     }
