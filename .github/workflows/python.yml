@@ -149,31 +149,22 @@ jobs:
     name: Test bigendian - S390X
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # compiled here, tested in the emulated container
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
+        with:
+          target: s390x-unknown-linux-gnu
+          args: --release --out dist --manifest-path bindings/python/Cargo.toml --locked
+          manylinux: auto
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a  # v4.3.0
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
-      - name: Can push to GHCR?
+      - name: Can cache in GHCR?
         id: canpush
         shell: bash
         run: |
           echo "value=${{ github.event.pull_request.head.repo.fork == false }}" >> "$GITHUB_OUTPUT"
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
-        with:
-          # list of Docker images to use as base name for tags
-          images: |
-            ghcr.io/safetensors/safetensors/s390x
-          # generate Docker tags based on the following events/attributes
-          tags: |
-            type=schedule
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
       - name: Login to Registry
         if: steps.canpush.outputs.value == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
@@ -184,13 +175,12 @@ jobs:
       - name: Test big endian
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
+          # the checkout, which holds the wheel
+          context: .
           platforms: linux/s390x
           file: Dockerfile.s390x.test
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           cache-from: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
           cache-to: ${{ steps.canpush.outputs.value == 'true' && 'type=registry,ref=ghcr.io/safetensors/safetensors/s390x:cache,mode=max' || 'type=gha' }}
-          push: ${{ steps.canpush.outputs.value == 'true' }}
 
   audit:
     name: Audit dependencies
