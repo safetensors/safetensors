@@ -40,6 +40,7 @@ cuda_fns! {
     cudaMemcpy2DAsync:           fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, Stream) -> Err,
     cudaStreamCreateWithFlags:   fn(*mut Stream, c_uint) -> Err,
     cudaStreamDestroy:           fn(Stream) -> Err,
+    cudaStreamSynchronize:       fn(Stream) -> Err,
     cudaStreamWaitEvent:         fn(Stream, Event, c_uint) -> Err,
     cudaEventCreateWithFlags:    fn(*mut Event, c_uint) -> Err,
     cudaEventRecord:             fn(Event, Stream) -> Err,
@@ -189,6 +190,11 @@ impl CudaApi {
 
     pub fn stream_destroy(&self, s: Stream) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaStreamDestroy)(s) })
+    }
+
+    pub fn stream_sync(&self, s: Stream) -> Result<(), CudaError> {
+        // SAFETY: a runtime call on a stream handle, which the runtime validates
+        self.check(unsafe { (self.f.cudaStreamSynchronize)(s) })
     }
 
     fn event_create(&self) -> Result<Event, CudaError> {

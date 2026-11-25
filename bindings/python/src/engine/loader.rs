@@ -1,6 +1,6 @@
-//! CUDA prefetch engine: load byte spans of a safetensors data section into
-//! device memory the caller allocated, in the background, and hand each span's
-//! owner back, once, as its bytes land.
+//! CUDA prefetch: load spans of a safetensors data section into device memory
+//! the caller allocates as the load advances, in the background, and hand each
+//! span's owner back, once, as its bytes land.
 //!
 //! Data flow, per file:
 //!
@@ -8,45 +8,44 @@
 //! caller (one at a time)
 //!   Feed::provide(dsts, stream)          the next spans' destinations, in plan
 //!                                        order, and an event on `stream`
-//! worker threads, transfer::work from the DirectFile to the CudaSink
+//! worker threads, transfer::work from the DirectFile to the Memory
 //!   c = the Plan's next chunk            next entry of LoadPlan::chunks
-//!   CudaSink::wait_ready(c)              c's spans provided (condvar), then
+//!   Memory::wait_ready(c)                c's spans provided (condvar), then
 //!                                        the events of their batches
 //!   slab = SlabPool::acquire()           a pinned host slab from the shared
 //!                                        pool; waits for its previous copy
 //!   DirectFile::fill(c, slab)            one read per chunk
-//!   CudaSink::drain: memcpyAsync         one copy per run of adjacent
-//!     (slab -> destinations)             destinations, on STREAMS[device];
-//!                                        memcpy2DAsync for a gather's rows
-//!   chunk_completion_events[c] = event   recorded after the copies; 0 while
-//!                                        the chunk is still pending
+//!   Memory::drain -> CudaDevice::scatter one memcpyAsync per run of adjacent
+//!                                        destinations, on the device stream;
+//!                                        memcpy2DAsync for a gather's rows;
+//!                                        an event after them, which the
+//!                                        chunk and its slab keep
 //! consumer
 //!   take_tensor(s) / TensorIter::next    wait the events of s's chunks, then
 //!     -> owner of s's destination        handed out once (AlreadyDelivered after)
 //! ```
 //!
-//! [`Loader`] owns the worker threads; [`LoaderInner`] (source, plan, sink, the
-//! [`Plan`] of chunks with its first error) is shared with them and with
-//! [`TensorIter`]. Closing
-//! signals the workers, joins them, waits for the copies in flight, then
-//! returns the owners not taken: an outstanding iterator yields `Err(Closed)`
-//! once and is exhausted.
+//! [`Loader`] owns the worker threads; [`LoaderInner`] (source, memory, owners,
+//! the [`Plan`] of chunks with its first error) is shared with them and with
+//! [`TensorIter`]. Closing signals the workers, joins them, waits for the copies
+//! in flight, then returns the owners not taken: an outstanding iterator yields
+//! `Err(Closed)` once and is exhausted.
 
 use std::{
     collections::VecDeque,
     fmt::Display,
     fs::File,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread::JoinHandle,
 };
 
 use super::{
-    cuda::{api, CudaError, Stream},
-    cuda_memory::{pinned_pool, MAX_DEVICES},
+    cuda::{api, CudaApi, CudaError},
+    cuda_memory::{pinned_pool, CudaDevice, CudaEvent, MAX_DEVICES},
     file::DirectFile,
-    memory::{CudaSink, LoadPlan, Span},
+    memory::{LoadPlan, Memory, Span},
     pool::SlabPool,
-    transfer::{self, Error, Plan, CHUNK_SIZE},
+    transfer::{self, Error, Fence, Plan, Sink, CHUNK_SIZE},
 };
 use safetensors::slice::Gather;
 
@@ -54,10 +53,11 @@ use safetensors::slice::Gather;
 pub enum LoaderError {
     AlreadyDelivered,
     Closed,
-    Cuda(CudaError),
     CudaRuntimeLoad,
     InvalidDevice(i32),
     Io(std::io::Error),
+    /// A device call failed
+    Other(Box<dyn std::error::Error + Send + Sync>),
     WorkerFailed(String),
 }
 
@@ -69,7 +69,6 @@ impl Display for LoaderError {
                 "tensor already delivered (prefetch hands each tensor out once, via take or iteration)"
             ),
             Self::Closed => write!(f, "prefetch loader closed"),
-            Self::Cuda(e) => write!(f, "{e}"),
             Self::CudaRuntimeLoad => write!(
                 f,
                 "no CUDA runtime is loaded in this process; import a CUDA-enabled \
@@ -80,6 +79,7 @@ impl Display for LoaderError {
                 "device index {d} is out of range (0..{MAX_DEVICES})"
             ),
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Other(e) => write!(f, "{e}"),
             Self::WorkerFailed(msg) => f.write_str(msg),
         }
     }
@@ -96,7 +96,17 @@ impl LoaderError {
 
 impl From<CudaError> for LoaderError {
     fn from(value: CudaError) -> Self {
-        Self::Cuda(value)
+        Self::Other(Box::new(value))
+    }
+}
+
+impl From<Error> for LoaderError {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::Io(e) => Self::Io(e),
+            Error::Other(e) => Self::Other(e),
+            Error::Stopped => Self::Closed,
+        }
     }
 }
 
@@ -108,11 +118,17 @@ impl From<std::io::Error> for LoaderError {
 
 struct LoaderInner<D> {
     source: DirectFile,
-    plan: Arc<LoadPlan>,
-    sink: CudaSink<D>,
+    memory: Memory<CudaDevice>,
     pool: Arc<SlabPool>,
     /// the plan's chunks as the workers claim them, and the first error
     transfer: Plan,
+    /// per span, the owner of its destination; `None` until provided, and once
+    /// taken or released
+    owners: Box<[Mutex<Option<D>>]>,
+    /// set by `close`: `provide` hands destinations back from then on
+    released: Mutex<bool>,
+    api: &'static CudaApi,
+    device: i32,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -121,13 +137,25 @@ impl<D> LoaderInner<D> {
     /// another thread returns its owner or an error: `Closed`, or what failed the load.
     fn close(&self) -> Vec<D> {
         self.halt();
-        self.sink.close()
+        *self.released.lock().unwrap() = true;
+        let copied = self.memory.wait_copies();
+        let owners: Vec<D> = self
+            .owners
+            .iter()
+            .filter_map(|o| o.lock().unwrap().take())
+            .collect();
+        if copied.is_err() {
+            // copies may still be queued into them: leak them rather than free them
+            std::mem::forget(owners);
+            return Vec::new();
+        }
+        owners
     }
 
-    /// Signals the workers and joins them; the owners stay in the sink.
+    /// Signals the workers and joins them; the owners stay until `close`.
     fn halt(&self) {
         self.transfer.stop();
-        self.sink.signal_stop();
+        self.memory.stop();
         // held while joining: a concurrent halt returns once the workers are gone
         let mut workers = self.workers.lock().unwrap();
         for h in workers.drain(..) {
@@ -136,13 +164,22 @@ impl<D> LoaderInner<D> {
     }
 
     fn take_tensor(&self, idx: usize) -> Result<D, LoaderError> {
-        self.sink
+        self.memory
             .wait_landed(idx)
-            .and_then(|()| self.sink.take(idx))
+            .map_err(LoaderError::from)
+            .and_then(|()| self.take(idx))
             .map_err(|e| match (e, self.transfer.error()) {
                 (LoaderError::Closed, Some(err)) => LoaderError::WorkerFailed(err.to_string()),
                 (e, _) => e,
             })
+    }
+
+    fn take(&self, idx: usize) -> Result<D, LoaderError> {
+        match self.owners[idx].lock().unwrap().take() {
+            Some(owner) => Ok(owner),
+            None if *self.released.lock().unwrap() => Err(LoaderError::Closed),
+            None => Err(LoaderError::AlreadyDelivered),
+        }
     }
 }
 
@@ -167,18 +204,42 @@ impl<D> Feed<D> {
         dsts: Vec<(u64, D)>,
         stream: u64,
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
-        self.inner.sink.provide(dsts, stream as Stream)
+        let inner = &*self.inner;
+        let released = inner.released.lock().unwrap();
+        if *released {
+            return Err((LoaderError::Closed, dsts));
+        }
+        // the caller's allocator may hand out memory still in use by work queued
+        // on the stream it allocated on: workers wait for that work before copying
+        let ready: Arc<dyn Fence> = match CudaEvent::record(inner.api, inner.device, stream as _) {
+            Ok(event) => Arc::new(event),
+            Err(err) => return Err((err.into(), dsts)),
+        };
+        let first = inner.memory.provided();
+        assert!(
+            first + dsts.len() <= inner.memory.spans(),
+            "more destinations than spans"
+        );
+        let (addrs, owners): (Vec<u64>, Vec<D>) = dsts.into_iter().unzip();
+        for (slot, owner) in inner.owners[first..].iter().zip(owners) {
+            *slot.lock().unwrap() = Some(owner);
+        }
+        // SAFETY: each address is a tensor allocated for its span, kept alive by
+        // its owner until `take` hands it out once landed, or `close` returns it
+        // once the copies completed
+        unsafe { inner.memory.provide(addrs.into_iter(), Some(ready)) };
+        Ok(())
     }
 
     /// How many spans have a destination
     pub fn provided(&self) -> usize {
-        self.inner.sink.provided.load(Ordering::Acquire)
+        self.inner.memory.provided()
     }
 
     /// How many spans the read schedule has reached: at least the ones a
     /// worker is reading or waiting to read
     pub fn scheduled(&self) -> usize {
-        self.inner.sink.scheduled(self.inner.transfer.claimed())
+        self.inner.memory.scheduled(self.inner.transfer.claimed())
     }
 
     /// Whether the load stopped: closed, failed or halted
@@ -193,7 +254,7 @@ impl<D> Feed<D> {
             return;
         }
         self.inner.transfer.fail(Error::Other(reason.into()));
-        self.inner.sink.signal_stop();
+        self.inner.memory.stop();
     }
 
     /// Waits until the read schedule is past `scheduled` spans or the load stopped
@@ -206,7 +267,7 @@ impl<D> Feed<D> {
     /// Stops the load without joining the workers
     pub fn stop(&self) {
         self.inner.transfer.stop();
-        self.inner.sink.signal_stop();
+        self.inner.memory.stop();
     }
 
     /// Stops the load and joins the workers; the owners stay until `close`.
@@ -242,16 +303,21 @@ impl<D: Send + 'static> Loader<D> {
         if !(0..MAX_DEVICES as i32).contains(&device) {
             return Err(LoaderError::InvalidDevice(device));
         }
-        let plan = Arc::new(LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE));
+        let plan = LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE);
+        let memory = Memory::new(plan, CudaDevice::new(cuda_api, device)?);
+        let chunks = memory.chunks();
         // avoid spawning too many threads when not needed, up to chunks.len()
-        let threads = threads.clamp(1, plan.chunks.len().max(1));
+        let threads = threads.clamp(1, chunks.len().max(1));
         let pool = cuda_api.with_device(device, |_| pinned_pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
             source: DirectFile::new(file, direct, pool.aligned()),
-            transfer: Plan::new(plan.file_chunks()),
-            plan: plan.clone(),
-            sink: CudaSink::new(cuda_api, plan, device)?,
+            transfer: Plan::new(chunks),
+            owners: (0..memory.spans()).map(|_| Mutex::new(None)).collect(),
+            memory,
             pool,
+            released: Mutex::new(false),
+            api: cuda_api,
+            device,
             workers: Mutex::new(Vec::with_capacity(threads)),
         });
         let loader = Self { inner };
@@ -259,7 +325,7 @@ impl<D: Send + 'static> Loader<D> {
             let inner = loader.inner.clone();
             let spawned = std::thread::Builder::new().spawn(move || {
                 let _ = cuda_api.set_device(device);
-                transfer::work(&inner.transfer, &inner.source, &inner.sink, &inner.pool)
+                transfer::work(&inner.transfer, &inner.source, &inner.memory, &inner.pool)
             });
             // on failure, dropping the loader stops and joins the workers already started
             loader.inner.workers.lock().unwrap().push(spawned?);
@@ -288,7 +354,7 @@ impl<D> Loader<D> {
     pub fn iter(&self) -> TensorIter<D> {
         TensorIter {
             inner: self.inner.clone(),
-            pending: (0..self.inner.plan.spans.len()).collect(),
+            pending: (0..self.inner.memory.spans()).collect(),
         }
     }
 }
@@ -316,7 +382,7 @@ impl<D> Iterator for TensorIter<D> {
                 .pending
                 .iter()
                 .take(64)
-                .position(|&idx| self.inner.sink.fully_scheduled(idx))
+                .position(|&idx| self.inner.memory.landed(idx))
                 .unwrap_or(0);
             let idx = self.pending[pos];
             match self.inner.take_tensor(idx) {
