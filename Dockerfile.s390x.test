@@ -2,7 +2,6 @@ FROM s390x/python
 RUN wget https://repo.anaconda.com/miniconda/Miniconda3-py311_23.5.2-0-Linux-s390x.sh \
     && bash Miniconda3-py311_23.5.2-0-Linux-s390x.sh -b \
     && rm -f Miniconda3-py311_23.5.2-0-Linux-s390x.sh
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 RUN /root/miniconda3/bin/conda install pytorch cpuonly -c pytorch -y
 WORKDIR /safetensors/
 RUN /root/miniconda3/bin/pip install -U pip pytest
@@ -11,7 +10,9 @@ RUN /root/miniconda3/bin/pip install -U pip pytest
 COPY . .
 SHELL ["/bin/bash", "-c"]
 WORKDIR /safetensors/bindings/python/
-RUN source /root/.cargo/env && /root/miniconda3/bin/pip install -e .
+# cross-compiled before the build, the compiler is too slow emulated:
+# maturin build --release --target s390x-unknown-linux-gnu --out dist -m bindings/python/Cargo.toml
+RUN /root/miniconda3/bin/pip install /safetensors/dist/*.whl
 # Work around error probably caused by https://sourceware.org/bugzilla/show_bug.cgi?id=32653
 # E   ImportError: libopenblas.so.0: cannot enable executable stack as shared object requires: Invalid argument
 ENV GLIBC_TUNABLES=glibc.rtld.execstack=2
