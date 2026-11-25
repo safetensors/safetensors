@@ -54,6 +54,10 @@ jobs:
     defaults:
       run:
         working-directory: ./bindings/python
+    env:
+      UV_SYSTEM_PYTHON: 1
+      # the default torch for Linux bundles the CUDA libraries
+      UV_TORCH_BACKEND: cpu
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -81,32 +85,18 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Install (torch)
-        if: matrix.os != 'windows-11-arm'
         run: |
-          pip install ${{ matrix.version.numpy }}
-          pip install ${{ matrix.version.torch }}
+          pip install uv
+          uv pip install ${{ matrix.version.numpy }} ${{ matrix.version.torch }}
         shell: bash
-
-      - name: Install (torch windows arm64)
-        if: matrix.os == 'windows-11-arm'
-        run: |
-          pip install ${{ matrix.version.numpy }}
-          pip install ${{ matrix.version.torch }} --index-url https://download.pytorch.org/whl/cpu
-        shell: bash
-
-      - name: Install (hdf5 non windows)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install libhdf5-dev
 
       - name: Install (tensorflow)
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
-          pip install ".[${{ matrix.version.python == '3.14' && 'tf-nightly' || 'tensorflow' }}]"
+          uv pip install ".[${{ matrix.version.python == '3.14' && 'tf-nightly' || 'tensorflow' }}]"
           # XXX: I assume this is still the case for 3.11
           # Force reinstall of numpy, tensorflow uses numpy 2 even on 3.9
-          pip install ${{ matrix.version.numpy }}
+          uv pip install ${{ matrix.version.numpy }}
         shell: bash
 
       - name: Install (jax, flax)
@@ -115,39 +105,39 @@ jobs:
         # resolve jax together with the matrix numpy pin: ml_dtypes>=0.6 needs
         # numpy 2 and would otherwise upgrade it under a numpy-1 torch
         run:
-          pip install .[jax] ${{ matrix.version.numpy }}
+          uv pip install .[jax] ${{ matrix.version.numpy }}
         shell: bash
 
       - name: Install (mlx)
         if: matrix.os == 'macos-latest'
         run: |
-          pip install .[mlx]
+          uv pip install .[mlx]
         shell: bash
 
       - name: Check style
         run: |
-          pip install .[quality]
+          uv pip install .[quality]
           ruff format --check .
 
       - name: Run tests
         if: matrix.version.arch != 'x64-freethreaded' && matrix.os != 'windows-11-arm'
         run: |
           cargo test --locked
-          pip install ".[testing]"
+          uv pip install ".[testing]"
           pytest -sv tests/
 
       - name: Run tests (Windows arm64)
         if: matrix.os == 'windows-11-arm'
         run: |
           cargo test --locked
-          pip install ".[testing]"
+          uv pip install ".[testing]"
           pytest -sv tests/ --ignore=tests/test_tf_comparison.py
 
       - name: Run tests (freethreaded)
         if: matrix.version.arch == 'x64-freethreaded'
         run: |
           cargo test --locked
-          pip install --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
+          uv pip install --index-strategy unsafe-best-match --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
           # importing msgpack._cmsgpack re-enables the GIL, so force-disable
           # until msgpack declares support
           PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py --ignore=tests/test_flax_comparison.py
