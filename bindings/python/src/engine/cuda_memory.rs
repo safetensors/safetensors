@@ -1,8 +1,12 @@
-//! CUDA for the transfer engine: the stream each device's copies are queued on.
+//! CUDA for the transfer engine: the stream each device's copies are queued
+//! on, events as [`Fence`]s.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::cuda::{api, CudaApi, CudaError, Stream};
+use super::{
+    cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream},
+    transfer::{Error, Fence},
+};
 
 /// Whether a CUDA runtime is loaded in this process, as [`Loader::load`] needs
 pub fn available() -> bool {
@@ -34,4 +38,42 @@ fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<
 
 pub(super) fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
     get_stream(&STREAMS, api, device)
+}
+
+/// An event recorded on a stream: the work queued on it before
+pub struct CudaEvent {
+    api: &'static CudaApi,
+    event: Event,
+}
+
+// SAFETY: an event handle is used from any thread through the runtime API
+unsafe impl Send for CudaEvent {}
+// SAFETY: as for `Send`: the runtime API is thread safe
+unsafe impl Sync for CudaEvent {}
+
+impl CudaEvent {
+    pub(super) fn record_on(
+        api: &'static CudaApi,
+        d: &DeviceGuard<'_>,
+        stream: Stream,
+    ) -> Result<Self, CudaError> {
+        let event = d.event_create()?;
+        if let Err(err) = api.event_record(event, stream) {
+            let _ = api.event_destroy(event);
+            return Err(err);
+        }
+        Ok(Self { api, event })
+    }
+}
+
+impl Fence for CudaEvent {
+    fn wait(&self) -> Result<(), Error> {
+        Ok(self.api.event_sync(self.event)?)
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        let _ = self.api.event_destroy(self.event);
+    }
 }

@@ -258,7 +258,6 @@ impl CudaApi {
         self.set_device(device)?;
         let guard = DeviceGuard {
             api: self,
-            device,
             prev,
             restore,
             _thread_bound: std::marker::PhantomData,
@@ -278,7 +277,6 @@ impl CudaApi {
 /// Restores the caller's current device on drop.
 pub struct DeviceGuard<'a> {
     api: &'a CudaApi,
-    device: i32,
     prev: c_int,
     restore: bool,
     /// `cudaSetDevice` is per-thread state: the guard must be dropped on the
@@ -287,14 +285,6 @@ pub struct DeviceGuard<'a> {
 }
 
 impl DeviceGuard<'_> {
-    pub fn id(&self) -> i32 {
-        self.device
-    }
-
-    pub fn api(&self) -> &CudaApi {
-        self.api
-    }
-
     pub fn stream_create(&self) -> Result<Stream, CudaError> {
         self.api.stream_create()
     }
