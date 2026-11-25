@@ -2,8 +2,9 @@
 
 use std::{
     collections::VecDeque,
+    fs::File,
     io,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -34,6 +35,11 @@ pub(crate) struct State {
     pub(crate) closed: bool,
     /// set by `wake`, cleared by the `wait` it ends
     woken: bool,
+    /// how many threads sleep until a read is queued
+    idle: usize,
+    /// the rings that wait in the kernel with room for more reads, by the
+    /// eventfd that wakes each
+    pub(crate) parked: Vec<Arc<File>>,
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub(crate) registration: crate::ring::Registration,
 }
@@ -103,8 +109,11 @@ impl Pool {
     }
 
     pub(crate) fn submit(&self, read: Read) {
-        self.shared.state.lock().unwrap().queue.push_back(read);
-        self.shared.queued.notify_one();
+        let mut state = self.shared.state.lock().unwrap();
+        state.queue.push_back(read);
+        let roused = self.shared.rouse(&mut state);
+        drop(state);
+        self.shared.wake(roused);
     }
 
     pub(crate) fn try_done(&self) -> Option<Done> {
@@ -158,7 +167,7 @@ impl Shared {
                 if state.closed {
                     return;
                 }
-                state = self.queued.wait(state).unwrap();
+                state = self.sleep(state);
                 continue;
             };
             drop(state);
@@ -171,6 +180,45 @@ impl Shared {
             self.finished.notify_one();
         }
     }
+
+    /// Picks a thread that waits for reads to take one: a thread asleep, or a
+    /// ring that waits in the kernel for the reads it runs. For the caller to
+    /// [`Self::wake`] once the state is unlocked: a thread woken under the
+    /// lock would wait for it right away.
+    #[must_use]
+    pub(crate) fn rouse(&self, state: &mut State) -> Option<Roused> {
+        if state.idle > 0 {
+            return Some(Roused::Asleep);
+        }
+        state.parked.pop().map(Roused::Parked)
+    }
+
+    pub(crate) fn wake(&self, roused: Option<Roused>) {
+        match roused {
+            Some(Roused::Asleep) => self.queued.notify_one(),
+            Some(Roused::Parked(ring)) => {
+                let _ = io::Write::write(&mut &*ring, &1u64.to_ne_bytes());
+            }
+            None => {}
+        }
+    }
+
+    /// Sleeps until a read is queued, memory is to be registered, or the pool
+    /// closed.
+    pub(crate) fn sleep<'a>(&'a self, mut state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+        state.idle += 1;
+        state = self.queued.wait(state).unwrap();
+        state.idle -= 1;
+        state
+    }
+}
+
+/// What [`Shared::rouse`] picked
+pub(crate) enum Roused {
+    /// one of the threads asleep
+    Asleep,
+    /// a ring, by the eventfd that ends its wait in the kernel
+    Parked(Arc<File>),
 }
 
 impl Drop for Pool {

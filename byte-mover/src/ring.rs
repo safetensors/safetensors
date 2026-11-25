@@ -1,13 +1,28 @@
 //! A thread of the pool that runs its reads through an io_uring of its own
 
-use std::io;
+use std::{
+    fs::File,
+    io,
+    os::fd::{AsRawFd, FromRawFd},
+    sync::Arc,
+};
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 
-use crate::{pool::Shared, Done, Read};
+use crate::{
+    pool::{Shared, State},
+    Done, Read,
+};
 
 /// The kernel takes registered buffers of at most 1 GiB each
 const PIECE: usize = 1 << 30;
+
+/// What the poll on [`Ring::wake`] completes with, in place of a slot
+const WAKE: u64 = u64::MAX;
+
+/// How many times a ring waits for the reads it submits before it checks
+/// again whether they finish as they are submitted
+const RECHECK: u32 = 32;
 
 /// Memory the rings are asked to register, each for itself
 #[derive(Default)]
@@ -40,6 +55,13 @@ pub(crate) struct Ring {
     registered: Option<(usize, usize)>,
     /// the last [`Registration::asked`] answered
     answered: u64,
+    /// an eventfd: a write to it ends the ring's wait in the kernel, for a
+    /// read queued while the ring has room for it
+    wake: Arc<File>,
+    /// whether the ring polls `wake`
+    armed: bool,
+    /// whether `wake` is in [`State::parked`]
+    parked: bool,
 }
 
 struct Inflight {
@@ -63,7 +85,17 @@ impl Drop for AbortOnPanic {
 impl Ring {
     pub(crate) fn new(depth: u32) -> io::Result<Self> {
         let depth = depth.max(1);
+        // SAFETY: no pointer is involved
+        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor just created, that nothing else owns
+        let wake = Arc::new(unsafe { File::from_raw_fd(wake) });
         Ok(Self {
+            wake,
+            armed: false,
+            parked: false,
             ring: IoUring::new(depth)?,
             slots: (0..depth).map(|_| None).collect(),
             free: (0..depth as usize).collect(),
@@ -79,12 +111,22 @@ impl Ring {
         let _abort = AbortOnPanic;
         let mut finished = Vec::new();
         let mut taken = Vec::new();
+        // Whether reads finish as they are submitted, as reads from the page
+        // cache do. Nothing is left to wait for in the kernel then: listed
+        // as parked, the ring would be woken for nothing by each read queued
+        // while it copies.
+        let mut inline = true;
+        let mut waited = 0;
         loop {
             let mut state = shared.state.lock().unwrap();
+            if std::mem::take(&mut self.parked) {
+                state.parked.retain(|wake| !Arc::ptr_eq(wake, &self.wake));
+            }
             if !finished.is_empty() {
                 state.done.extend(finished.drain(..));
                 shared.finished.notify_one();
             }
+            let mut roused = None;
             loop {
                 if state.registration.asked != self.answered {
                     let (memory, asked) = (state.registration.memory, state.registration.asked);
@@ -105,25 +147,65 @@ impl Ring {
                     self.slots[slot] = Some(Inflight { read, got: 0 });
                     taken.push(slot);
                 }
+                if take > 0 && !state.queue.is_empty() {
+                    roused = shared.rouse(&mut state);
+                }
                 if self.free.len() < self.slots.len() {
                     break;
                 }
                 if state.closed {
                     return;
                 }
-                state = shared.queued.wait(state).unwrap();
+                state = shared.sleep(state);
+            }
+            let wait = taken.is_empty() || !inline;
+            if wait && !self.free.is_empty() {
+                self.park(&mut state);
             }
             drop(state);
-            for slot in taken.drain(..) {
+            shared.wake(roused);
+            for &slot in &taken {
                 self.push(slot);
             }
-            match self.ring.submit_and_wait(1) {
+            match self.ring.submit_and_wait(wait as usize) {
                 Ok(_) => {}
                 // `EBUSY`: completions to reap first
                 Err(err) if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
                 Err(err) => panic!("io_uring failed with reads in flight: {err}"),
             }
             self.reap(&mut finished);
+            if !taken.is_empty() {
+                if wait {
+                    waited = (waited + 1) % RECHECK;
+                    inline = waited == 0;
+                } else {
+                    inline = taken.iter().all(|&slot| self.slots[slot].is_none());
+                }
+                taken.clear();
+            }
+        }
+    }
+
+    /// Lists the ring among those a queued read wakes from the kernel.
+    fn park(&mut self, state: &mut State) {
+        state.parked.push(self.wake.clone());
+        self.parked = true;
+        if !std::mem::replace(&mut self.armed, true) {
+            let poll = opcode::PollAdd::new(types::Fd(self.wake.as_raw_fd()), libc::POLLIN as u32)
+                .build()
+                .user_data(WAKE);
+            self.queue(&poll);
+        }
+    }
+
+    fn queue(&mut self, entry: &squeue::Entry) {
+        // SAFETY: `Mover::submit` requires the destination and the descriptor
+        // of a read valid until it is reaped, and dropping the mover waits
+        // for it; the poll is on a descriptor the ring owns
+        while unsafe { self.ring.submission().push(entry) }.is_err() {
+            if let Err(err) = self.ring.submit() {
+                panic!("io_uring failed with reads in flight: {err}");
+            }
         }
     }
 
@@ -172,13 +254,7 @@ impl Ring {
             None => opcode::Read::new(fd, dst, chunk).offset(offset).build(),
         }
         .user_data(slot as u64);
-        // SAFETY: `Mover::submit` requires the destination and the descriptor
-        // valid until the read is reaped, and dropping the mover waits for it
-        while unsafe { self.ring.submission().push(&entry) }.is_err() {
-            if let Err(err) = self.ring.submit() {
-                panic!("io_uring failed with reads in flight: {err}");
-            }
-        }
+        self.queue(&entry);
     }
 
     /// Moves the reads that ended to `finished`; short ones go back in the ring.
@@ -187,6 +263,11 @@ impl Ring {
             let Some(completion) = self.ring.completion().next() else {
                 return;
             };
+            if completion.user_data() == WAKE {
+                self.armed = false;
+                let _ = io::Read::read(&mut &*self.wake, &mut [0; 8]);
+                continue;
+            }
             let slot = completion.user_data() as usize;
             let inflight = self.slots[slot].as_mut().expect("in flight");
             let result = match completion.result() {

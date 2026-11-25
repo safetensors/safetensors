@@ -289,3 +289,35 @@ fn reads_into_registered_memory() {
     assert_eq!(region[500_000..650_000], fixture.data[100_000..250_000]);
     assert_eq!(outside, fixture.data[5..1_005]);
 }
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[test]
+fn a_ring_takes_a_read_while_it_waits_for_another() {
+    use std::{io::Write, os::unix::net::UnixStream};
+    let Ok(mover) = Mover::rings(1, 2) else {
+        eprintln!("skipped: no io_uring");
+        return;
+    };
+    let fixture = Fixture::new(4096);
+    let (mut writer, reader) = UnixStream::pair().unwrap();
+    let (mut slow, mut fast) = ([0u8; 1], vec![0u8; 4096]);
+    let read = |id, fd, dst: &mut [u8]| Read {
+        id,
+        fd,
+        offset: 0,
+        dst: dst.as_mut_ptr(),
+        len: dst.len(),
+    };
+    // SAFETY: the buffers, the socket and the file outlive the reads, reaped below
+    unsafe { mover.submit(read(0, reader.as_raw_fd(), &mut slow)) };
+    // the ring now waits in the kernel for a byte nothing has sent
+    std::thread::sleep(Duration::from_millis(50));
+    // SAFETY: as above
+    unsafe { mover.submit(read(1, fixture.file.as_raw_fd(), &mut fast)) };
+    let mut out = Vec::new();
+    assert_eq!(mover.wait(&mut out, 2, Some(Duration::from_secs(10))), 1);
+    assert_eq!(out[0].id, 1);
+    writer.write_all(&[7]).unwrap();
+    assert_eq!(mover.wait_done().unwrap().id, 0);
+    assert_eq!((slow, fast), ([7], fixture.data.clone()));
+}
