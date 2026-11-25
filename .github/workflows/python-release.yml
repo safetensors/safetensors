@@ -7,17 +7,18 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - '*'
+  # every target is built once a week, and for a pull request that changes how
+  # they are built
+  schedule:
+    - cron: "0 3 * * 1"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "safetensors/**"
-      - "bindings/python/**"
-      - "README.md"
+      - "bindings/python/Cargo.toml"
+      - "bindings/python/Cargo.lock"
+      - "bindings/python/pyproject.toml"
       - ".github/workflows/python-release.yml"
   workflow_dispatch:
 
