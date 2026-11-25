@@ -6,6 +6,9 @@ on:
       - "safetensors/**"
       - "README.md"
       - ".github/workflows/rust.yml"
+  # fills the caches the pull requests read
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -32,6 +35,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: "safetensors"
 
       - name: Install cargo-audit
