@@ -111,9 +111,9 @@ impl Pool {
     pub(crate) fn submit(&self, read: Read) {
         let mut state = self.shared.state.lock().unwrap();
         state.queue.push_back(read);
-        let parked = self.shared.rouse(&mut state);
+        let roused = self.shared.rouse(&mut state);
         drop(state);
-        wake(parked);
+        self.shared.wake(roused);
     }
 
     pub(crate) fn try_done(&self) -> Option<Done> {
@@ -170,12 +170,7 @@ impl Shared {
                 state = self.sleep(state);
                 continue;
             };
-            let parked = match state.queue.is_empty() {
-                true => None,
-                false => self.rouse(&mut state),
-            };
             drop(state);
-            wake(parked);
             let done = Done {
                 id: read.id,
                 result: pread_all(&read),
@@ -186,16 +181,26 @@ impl Shared {
         }
     }
 
-    /// Gets a thread that waits for reads to take one: a thread asleep, or a
-    /// ring that waits in the kernel for the reads it runs. The ring is for
-    /// the caller to [`wake`] once the state is unlocked.
+    /// Picks a thread that waits for reads to take one: a thread asleep, or a
+    /// ring that waits in the kernel for the reads it runs. For the caller to
+    /// [`Self::wake`] once the state is unlocked: a thread woken under the
+    /// lock would wait for it right away.
     #[must_use]
-    pub(crate) fn rouse(&self, state: &mut State) -> Option<Arc<File>> {
+    pub(crate) fn rouse(&self, state: &mut State) -> Option<Roused> {
         if state.idle > 0 {
-            self.queued.notify_one();
-            return None;
+            return Some(Roused::Asleep);
         }
-        state.parked.pop()
+        state.parked.pop().map(Roused::Parked)
+    }
+
+    pub(crate) fn wake(&self, roused: Option<Roused>) {
+        match roused {
+            Some(Roused::Asleep) => self.queued.notify_one(),
+            Some(Roused::Parked(ring)) => {
+                let _ = io::Write::write(&mut &*ring, &1u64.to_ne_bytes());
+            }
+            None => {}
+        }
     }
 
     /// Sleeps until a read is queued, memory is to be registered, or the pool
@@ -208,11 +213,12 @@ impl Shared {
     }
 }
 
-/// Ends the wait in the kernel of the ring [`Shared::rouse`] picked.
-pub(crate) fn wake(parked: Option<Arc<File>>) {
-    if let Some(parked) = parked {
-        let _ = io::Write::write(&mut &*parked, &1u64.to_ne_bytes());
-    }
+/// What [`Shared::rouse`] picked
+pub(crate) enum Roused {
+    /// one of the threads asleep
+    Asleep,
+    /// a ring, by the eventfd that ends its wait in the kernel
+    Parked(Arc<File>),
 }
 
 impl Drop for Pool {

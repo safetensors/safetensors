@@ -10,7 +10,7 @@ use std::{
 use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::{
-    pool::{wake, Shared, State},
+    pool::{Shared, State},
     Done, Read,
 };
 
@@ -152,7 +152,7 @@ impl Ring {
                 self.park(&mut state);
             }
             drop(state);
-            wake(roused);
+            shared.wake(roused);
             for slot in taken.drain(..) {
                 self.push(slot);
             }
