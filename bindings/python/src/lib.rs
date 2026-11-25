@@ -3402,6 +3402,9 @@ fn create_tensor<'a>(
                 (get_module(py, &NUMPY_MODULE)?, true)
             }
         };
+        // numpy has no bfloat16: the bytes reach MLX as uint16
+        let mlx_bf16 = *framework == Framework::Mlx && dtype == Dtype::BF16;
+        let dtype = if mlx_bf16 { Dtype::U16 } else { dtype };
         let dtype: Py<PyAny> = get_pydtype(module, dtype, is_numpy)?;
         let count: usize = shape.iter().product();
         let shape = shape.to_vec();
@@ -3461,10 +3464,13 @@ fn create_tensor<'a>(
                     Ok(MLX_MODULE.get_or_init_py_attached(py, || module.into()))
                 })?
                 .bind(py);
-                module
-                    .getattr(intern!(py, "core"))?
-                    // .getattr(intern!(py, "array"))?
-                    .call_method1("array", (tensor,))?
+                let core = module.getattr(intern!(py, "core"))?;
+                let tensor = core.call_method1("array", (tensor,))?;
+                if mlx_bf16 {
+                    tensor.call_method1("view", (core.getattr(intern!(py, "bfloat16"))?,))?
+                } else {
+                    tensor
+                }
             }
             Framework::Paddle => {
                 let module = Python::attach(|py| -> PyResult<&Py<PyModule>> {

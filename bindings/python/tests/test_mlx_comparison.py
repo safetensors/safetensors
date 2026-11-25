@@ -1,6 +1,8 @@
 import platform
 import unittest
 
+import numpy as np
+
 
 HAS_MLX = False
 if platform.system() == "Darwin":
@@ -14,7 +16,7 @@ if platform.system() == "Darwin":
         pass
     if HAS_MLX:
         from safetensors import safe_open
-        from safetensors.mlx import load_file, save_file
+        from safetensors.mlx import load, load_file, save, save_file
 
 
 # MLX only exists on Mac
@@ -29,10 +31,6 @@ class LoadTestCase(unittest.TestCase):
             "test4": mx.random.uniform(shape=(1024, 1024), dtype=mx.float32).astype(
                 mx.complex64
             ),
-            # This doesn't work because bfloat16 is not implemented
-            # with similar workarounds as jax/tensorflow.
-            # https://github.com/ml-explore/mlx/issues/1296
-            # "test4": mx.random.uniform(shape=(1024, 1024), dtype=mx.bfloat16),
         }
         self.mlx_filename = "./tests/data/mlx_load.npz"
         self.sf_filename = "./tests/data/mlx_load.safetensors"
@@ -59,6 +57,32 @@ class LoadTestCase(unittest.TestCase):
         for k, v in weights.items():
             tv = mlx_weights[k]
             self.assertTrue(mx.allclose(v, tv))
+
+    def test_bfloat16(self):
+        data = {"a": mx.arange(-8, 8, dtype=mx.float32).astype(mx.bfloat16)}
+        local = "./tests/data/mlx_bfloat16.safetensors"
+        save_file(data, local)
+        for loaded in [load_file(local), load(save(data)), mx.load(local)]:
+            self.assertEqual(loaded["a"].dtype, mx.bfloat16)
+            self.assertTrue(mx.array_equal(loaded["a"], data["a"]))
+
+    def test_save_strided(self):
+        bf16 = mx.arange(10, dtype=mx.float32).astype(mx.bfloat16)
+        data = {
+            "a": mx.arange(10)[::2],
+            "b": mx.arange(12).reshape(3, 4)[:, ::2],
+            "c": bf16[::2],
+            "d": mx.arange(6).reshape(2, 3).T,
+        }
+        loaded = load(save(data))
+        for k, v in data.items():
+            self.assertEqual(loaded[k].dtype, v.dtype)
+            self.assertTrue(mx.array_equal(loaded[k], v))
+
+    def test_save_big_endian(self):
+        loaded = load(save({"a": np.arange(4, dtype=">i4")}))
+        self.assertEqual(loaded["a"].dtype, mx.int32)
+        self.assertTrue(mx.array_equal(loaded["a"], mx.arange(4)))
 
     def test_deserialization_safe_open(self):
         weights = {}

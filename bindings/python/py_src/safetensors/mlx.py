@@ -4,7 +4,15 @@ from typing import Dict, Optional, Union
 import numpy as np
 
 import mlx.core as mx
-from safetensors import FileLayout, numpy, safe_open
+from safetensors import (
+    FileLayout,
+    TensorSpec,
+    deserialize,
+    numpy,
+    safe_open,
+    serialize,
+    serialize_file,
+)
 
 
 def save(
@@ -34,8 +42,7 @@ def save(
     byte_data = save(tensors)
     ```
     """
-    np_tensors = _mx2np(tensors)
-    return numpy.save(np_tensors, metadata=metadata)
+    return bytes(serialize(_flatten(tensors), metadata=metadata))
 
 
 def save_file(
@@ -78,8 +85,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    np_tensors = _mx2np(tensors)
-    return numpy.save_file(np_tensors, filename, metadata=metadata, direct=direct)
+    return serialize_file(_flatten(tensors), filename, metadata=metadata, direct=direct)
 
 
 def load(data: bytes) -> Dict[str, mx.array]:
@@ -105,8 +111,7 @@ def load(data: bytes) -> Dict[str, mx.array]:
     loaded = load(data)
     ```
     """
-    flat = numpy.load(data)
-    return _np2mx(flat)
+    return _view2mx(deserialize(data))
 
 
 def load_file(
@@ -138,14 +143,28 @@ def load_file(
         return f.get_tensors()
 
 
-def _np2mx(numpy_dict: Dict[str, np.ndarray]) -> Dict[str, mx.array]:
-    for k, v in numpy_dict.items():
-        numpy_dict[k] = mx.array(v)
-    return numpy_dict
+def _flatten(tensors: Dict[str, mx.array]) -> Dict[str, TensorSpec]:
+    flattened = {}
+    for k, v in tensors.items():
+        # numpy has no bfloat16: the bytes cross as uint16
+        bf16 = isinstance(v, mx.array) and v.dtype == mx.bfloat16
+        array = np.asarray(v.view(mx.uint16) if bf16 else v)
+        # C order and little-endian, in one copy at most
+        array = np.asarray(array, dtype=array.dtype.newbyteorder("<"), order="C")
+        flattened[k] = TensorSpec(
+            dtype="bfloat16" if bf16 else array.dtype.name,
+            shape=array.shape,
+            data=array.reshape(-1).view(np.uint8),
+        )
+    return flattened
 
 
-def _mx2np(mx_dict: Dict[str, mx.array]) -> Dict[str, np.array]:
-    new_dict = {}
-    for k, v in mx_dict.items():
-        new_dict[k] = np.asarray(v)
-    return new_dict
+def _view2mx(safeview) -> Dict[str, mx.array]:
+    result = {}
+    for k, v in safeview:
+        bf16 = v["dtype"] == "BF16"
+        if bf16:
+            v = {**v, "dtype": "U16"}
+        array = mx.array(numpy._view2np([(k, v)])[k])
+        result[k] = array.view(mx.bfloat16) if bf16 else array
+    return result
