@@ -2,7 +2,7 @@ name: Python
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     paths:
       - "safetensors/**"
       - "bindings/python/**"
@@ -12,26 +12,38 @@ on:
       - ".github/workflows/python.yml"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  # a label other than `ci:full` starts a run that does nothing: it gets its own
+  # group, not to cancel the run in progress
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && github.run_id || '' }}
   cancel-in-progress: true
 
 jobs:
   matrix:
     name: Choose what to test
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
     outputs:
+      set: ${{ steps.choose.outputs.set }}
       include: ${{ steps.choose.outputs.include }}
     steps:
       - id: choose
         env:
-          READY: ${{ github.event.pull_request.draft != true }}
+          # `stacked`: the pull request is based on another one's branch
+          SET: >-
+            ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') && 'full'
+            || github.event_name == 'pull_request' && github.base_ref != 'main' && 'stacked'
+            || github.event.pull_request.draft && 'draft'
+            || 'full' }}
         # The lowest and the highest versions, the highest unpinned so that new
         # releases get tested. A `ready` entry waits for the pull request to be
-        # ready for review.
+        # ready for review; a stacked pull request only runs the `stacked` entry.
         run: |
-          jq -c --argjson ready "$READY" 'map(select($ready or (.ready | not)) | del(.ready))' <<'EOF' | sed 's/^/include=/' >> "$GITHUB_OUTPUT"
+          echo "set=$SET" >> "$GITHUB_OUTPUT"
+          jq -c --arg set "$SET" 'map(select(
+            if $set == "stacked" then .stacked elif $set == "draft" then .ready | not else true end
+          ) | del(.ready, .stacked))' <<'EOF' | sed 's/^/include=/' >> "$GITHUB_OUTPUT"
           [
-            {"os": "ubuntu-latest", "version": {"torch": "torch==2.6", "python": "3.11", "arch": "x64", "numpy": "numpy"}},
+            {"os": "ubuntu-latest", "version": {"torch": "torch==2.6", "python": "3.11", "arch": "x64", "numpy": "numpy"}, "stacked": true},
             {"os": "ubuntu-latest", "version": {"torch": "torch", "python": "3.13", "arch": "x64", "numpy": "numpy"}, "ready": true},
             {"os": "ubuntu-latest", "version": {"torch": "torch", "python": "3.14", "numpy": "numpy"}},
             {"os": "ubuntu-latest", "version": {"torch": "torch", "python": "3.14", "numpy": "numpy", "arch": "x64-freethreaded"}, "ready": true},
@@ -151,6 +163,8 @@ jobs:
           PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py --ignore=tests/test_flax_comparison.py
 
   test_s390x_big_endian:
+    needs: matrix
+    if: needs.matrix.outputs.set != 'stacked'
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -202,6 +216,8 @@ jobs:
 
   audit:
     name: Audit dependencies
+    needs: matrix
+    if: needs.matrix.outputs.set != 'stacked'
     runs-on: ubuntu-latest
     permissions:
       contents: read
