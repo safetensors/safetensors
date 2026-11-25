@@ -4,7 +4,10 @@ use std::{
     sync::{Condvar, Mutex, OnceLock},
 };
 
-use super::{file::DIRECT_ALIGN, transfer::Error, unix::CHUNK_SIZE};
+use super::{
+    file::DIRECT_ALIGN,
+    transfer::{Error, CHUNK_SIZE},
+};
 use crate::engine::cuda::{CudaApi, CudaError, DeviceGuard, Event, Stream};
 
 /// A chunk's superset aligned to [`DIRECT_ALIGN`] fits in a slab
