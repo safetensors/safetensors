@@ -204,6 +204,31 @@ class TestCase(unittest.TestCase):
                 for name, tensor in tensors.items():
                     np.testing.assert_array_equal(loaded[name], tensor)
 
+    def test_load_file_reads_every_shape(self):
+        # a scalar, an empty tensor, a bool one and one of several 16 MiB chunks:
+        # the file is large enough to be read in parallel
+        tensors = {
+            "scalar": np.array(3, dtype=np.int64),
+            "empty": np.zeros((2, 0), dtype=np.float32),
+            "bool": np.arange(11) % 3 == 0,
+            "large": np.arange(5 << 20, dtype=np.float64),
+        }
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.safetensors")
+            save_file(tensors, path)
+            for backend in ["mmap", "pread"]:
+                loaded = load_file(path, backend=backend)
+                self.assertEqual(loaded.keys(), tensors.keys())
+                for name, tensor in tensors.items():
+                    self.assertEqual(loaded[name].dtype, tensor.dtype)
+                    np.testing.assert_array_equal(loaded[name], tensor)
+                    self.assertTrue(loaded[name].flags.writeable)
+                # the per-tensor path returns views of a bytearray
+                parallel = (
+                    sys.platform in ("linux", "darwin") and sys.byteorder == "little"
+                )
+                self.assertEqual(loaded["large"].flags.owndata, parallel)
+
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
         n = torch.empty([], dtype=m.dtype, device=m.device)
