@@ -53,9 +53,11 @@ fn movers() -> Vec<(&'static str, Mover)> {
     #[cfg_attr(not(all(target_os = "linux", feature = "io-uring")), allow(unused_mut))]
     let mut movers = vec![("threads", Mover::threads(4).unwrap())];
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    match Mover::rings(2, 4) {
-        Ok(mover) => movers.push(("rings", mover)),
-        Err(err) => eprintln!("skipped io_uring: {err}"),
+    for (name, mover) in [("rings", Mover::rings(2, 4)), ("ring", Mover::ring(4))] {
+        match mover {
+            Ok(mover) => movers.push((name, mover)),
+            Err(err) => eprintln!("skipped io_uring: {err}"),
+        }
     }
     movers
 }
@@ -248,13 +250,48 @@ fn a_wait_ends_on_reads_a_wake_or_its_timeout() {
     }
 }
 
+#[test]
+fn a_wait_takes_a_read_queued_after_it_began() {
+    let fixture = Fixture::new(4096);
+    for (name, mover) in movers() {
+        let mut buffer = vec![0u8; 4096];
+        let read = Read {
+            id: 3,
+            fd: fixture.file.as_raw_fd(),
+            offset: 0,
+            dst: buffer.as_mut_ptr(),
+            len: buffer.len(),
+        };
+        let mut out = Vec::new();
+        std::thread::scope(|scope| {
+            let mover = &mover;
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: the buffer and the file outlive the read, reaped below
+                unsafe { mover.submit(read) };
+            });
+            let reaped = mover.wait(&mut out, 1, Some(Duration::from_secs(10)));
+            assert_eq!(reaped, 1, "{name}");
+        });
+        assert_eq!(out[0].id, 3, "{name}");
+        assert_eq!(buffer, fixture.data, "{name}");
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 #[test]
 fn reads_into_registered_memory() {
-    let Ok(mut mover) = Mover::rings(2, 4) else {
-        eprintln!("skipped: no io_uring");
-        return;
-    };
+    for mover in [Mover::rings(2, 4), Mover::ring(4)] {
+        let Ok(mover) = mover else {
+            eprintln!("skipped: no io_uring");
+            return;
+        };
+        read_into_registered_memory(mover);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn read_into_registered_memory(mut mover: Mover) {
     let fixture = Fixture::new(256 * 1024);
     let mut region = vec![0u8; 1 << 20];
     // SAFETY: `region` outlives the mover

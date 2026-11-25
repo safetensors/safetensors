@@ -3,7 +3,8 @@
 Reads byte ranges of files into memory the caller owns.
 
 Reads are queued on a `Mover`, run by a pool of threads that `pread` or drive
-an io_uring each, and reaped one by one, each with the id it was queued under.
+an io_uring each, or by an io_uring the calling threads drive, and reaped one
+by one, each with the id it was queued under.
 Any thread may queue and reap. A mover knows nothing of what the bytes are: file formats, caches and
 devices are the caller's.
 
@@ -41,6 +42,10 @@ done.result?;
   default). `register` gives the rings memory to read into without pinning
   pages at each read. It fails where io_uring is absent or forbidden, as under
   the default seccomp profile of most container runtimes: fall back to threads.
+- `Mover::ring(depth)`: one io_uring the calling threads drive, with no thread
+  of its own: a read starts when it is queued and its completion wakes the
+  thread that waits for it. For few reads in flight, where a hand-off between
+  threads costs more than the read.
 
 ## Status
 

@@ -1,8 +1,9 @@
 //! Reads byte ranges of files into memory the caller owns.
 //!
 //! Reads are queued on a [`Mover`], run by a pool of threads that `pread` or
-//! drive an io_uring each, and reaped one by one, each with the id it was
-//! queued under. Any thread may queue and reap. A mover knows nothing of what the bytes are: file formats,
+//! drive an io_uring each, or by an io_uring the calling threads drive, and
+//! reaped one by one, each with the id it was queued under. Any thread may
+//! queue and reap. A mover knows nothing of what the bytes are: file formats,
 //! caches and devices are the caller's.
 //!
 //! ```no_run
@@ -32,6 +33,8 @@
 //! [`DIRECT_ALIGN`].
 #![cfg(unix)]
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+mod driven;
 mod pool;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod ring;
@@ -78,18 +81,35 @@ pub struct Done {
 /// Runs queued reads and hands them back as they finish, in any order.
 /// Dropping a mover waits for the reads still queued or running.
 pub struct Mover {
-    pool: pool::Pool,
+    backend: Backend,
     /// reads queued and not reaped yet
     pending: AtomicUsize,
     /// held by the thread that reaps
     reaper: Mutex<()>,
 }
 
+enum Backend {
+    Pool(pool::Pool),
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    Driven(Box<driven::Driven>),
+}
+
+/// Calls the same method on the pool or the driven ring.
+macro_rules! backend {
+    ($backend:expr, $name:ident => $call:expr) => {
+        match $backend {
+            Backend::Pool($name) => $call,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Backend::Driven($name) => $call,
+        }
+    };
+}
+
 impl Mover {
     /// A mover whose reads are `pread`s on `threads` threads: as many reads
     /// run at once.
     pub fn threads(threads: usize) -> io::Result<Self> {
-        Ok(Self::new(pool::Pool::threads(threads)?))
+        Ok(Self::new(Backend::Pool(pool::Pool::threads(threads)?)))
     }
 
     /// A mover whose reads go through `rings` io_urings, a thread each, holding
@@ -98,12 +118,25 @@ impl Mover {
     /// runtimes: fall back to [`Self::threads`].
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub fn rings(rings: usize, depth: u32) -> io::Result<Self> {
-        Ok(Self::new(pool::Pool::rings(rings, depth)?))
+        Ok(Self::new(Backend::Pool(pool::Pool::rings(rings, depth)?)))
     }
 
-    fn new(pool: pool::Pool) -> Self {
+    /// A mover whose reads go through one io_uring that the calling threads
+    /// drive, holding up to `depth` reads in the kernel. A read starts in
+    /// [`Self::submit`] and the thread that waits for it sleeps in the kernel
+    /// until it finished: no thread stands between the two, which is what a
+    /// read costs most when few are in flight. Reads past `depth` start as
+    /// finished ones are reaped. Needs Linux 5.11; fails as [`Self::rings`] does.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub fn ring(depth: u32) -> io::Result<Self> {
+        Ok(Self::new(Backend::Driven(Box::new(driven::Driven::new(
+            depth,
+        )?))))
+    }
+
+    fn new(backend: Backend) -> Self {
         Self {
-            pool,
+            backend,
             pending: AtomicUsize::new(0),
             reaper: Mutex::new(()),
         }
@@ -121,10 +154,10 @@ impl Mover {
     /// The memory stays valid for writes until the mover is dropped.
     pub unsafe fn register(&mut self, base: *mut u8, len: usize) -> io::Result<()> {
         // SAFETY: the caller vouches for the memory
-        unsafe { self.pool.register(base, len) }
+        backend!(&mut self.backend, backend => unsafe { backend.register(base, len) })
     }
 
-    /// Queues `read`, which starts as soon as a thread is free.
+    /// Queues `read`, which starts as soon as a thread or the ring is free.
     ///
     /// # Safety
     ///
@@ -134,7 +167,7 @@ impl Mover {
     /// stays open.
     pub unsafe fn submit(&self, read: Read) {
         self.pending.fetch_add(1, Ordering::AcqRel);
-        self.pool.submit(read);
+        backend!(&self.backend, backend => backend.submit(read));
     }
 
     /// How many reads are queued or running, and not reaped
@@ -147,7 +180,7 @@ impl Mover {
     /// to reap.
     pub fn try_done(&self) -> Option<Done> {
         let _reaper = self.reaper.try_lock().ok()?;
-        let done = self.pool.try_done()?;
+        let done = backend!(&self.backend, backend => backend.try_done())?;
         self.pending.fetch_sub(1, Ordering::AcqRel);
         Some(done)
     }
@@ -160,7 +193,7 @@ impl Mover {
         if self.pending() == 0 {
             return None;
         }
-        let done = self.pool.wait_done();
+        let done = backend!(&self.backend, backend => backend.wait_done());
         self.pending.fetch_sub(1, Ordering::AcqRel);
         Some(done)
     }
@@ -173,7 +206,7 @@ impl Mover {
     pub fn wait(&self, out: &mut Vec<Done>, max: usize, timeout: Option<Duration>) -> usize {
         let _reaper = self.reaper.lock().unwrap();
         let before = out.len();
-        self.pool.wait(out, max, timeout);
+        backend!(&self.backend, backend => backend.wait(out, max, timeout));
         let reaped = out.len() - before;
         self.pending.fetch_sub(reaped, Ordering::AcqRel);
         reaped
@@ -182,7 +215,7 @@ impl Mover {
     /// Makes the thread in [`Self::wait`], or the next one to call it, return
     /// even with no read finished.
     pub fn wake(&self) {
-        self.pool.wake();
+        backend!(&self.backend, backend => backend.wake());
     }
 }
 
