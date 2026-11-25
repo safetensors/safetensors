@@ -10,13 +10,13 @@ mod loader;
 mod memory;
 #[cfg(unix)]
 mod pool;
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(all(unix, target_endian = "little"))]
 mod read;
 #[cfg(target_os = "linux")]
 mod save;
 #[cfg(unix)]
 mod transfer;
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(all(unix, target_endian = "little"))]
 pub use read::read;
 #[cfg(target_os = "linux")]
 pub use save::{save, Location};

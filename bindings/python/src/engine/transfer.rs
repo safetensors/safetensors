@@ -228,7 +228,6 @@ pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &Arc<SlabPool
 
 /// Moves every chunk of `plan` from `from` to `to` on up to `threads` workers,
 /// and returns once they are done, with the first error.
-#[cfg(target_os = "linux")]
 pub fn transfer(
     plan: Plan,
     from: &impl Source,

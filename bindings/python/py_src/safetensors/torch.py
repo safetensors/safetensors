@@ -358,8 +358,9 @@ def load_file(
             available options are all regular torch device locations.
         backend (`str`, *optional*, defaults to `"mmap"`):
             Storage backend used to serve tensor bytes. `"mmap"` (default)
-            and `"pread"` uses `pread(2)` to read tensor bytes. On Linux,
-            `"pread"` on the CPU reads the tensors in parallel.
+            and `"pread"` uses `pread(2)` to read tensor bytes. On Linux
+            and macOS, `"pread"` on the CPU reads a file larger than 2 MiB
+            in parallel.
 
     Returns:
         `Dict[str, torch.Tensor]`: dictionary that contains name as key, value as `torch.Tensor`
