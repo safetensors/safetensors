@@ -1,51 +1,41 @@
 use std::{
     collections::VecDeque,
     ops::{Deref, DerefMut},
-    sync::{Condvar, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
 };
 
 use super::{
     file::DIRECT_ALIGN,
-    transfer::{Error, CHUNK_SIZE},
+    transfer::{Error, Fence, CHUNK_SIZE},
 };
-use crate::engine::cuda::{CudaApi, CudaError, DeviceGuard, Event, Stream};
+use crate::engine::cuda::{CudaApi, CudaError};
 
 /// A chunk's superset aligned to [`DIRECT_ALIGN`] fits in a slab
 pub(super) const SLAB_SIZE: usize = CHUNK_SIZE.get() + 2 * DIRECT_ALIGN;
 const _: () = assert!(SLAB_SIZE.is_multiple_of(DIRECT_ALIGN));
 
-#[derive(Clone, Copy)]
 struct Slot {
     offset: usize,
-    /// (completion event of the last host2device copy, device id)
-    last_copy: Option<(Event, i32)>,
+    /// what may still read the slab
+    pending: Option<Arc<dyn Fence>>,
 }
 
 /// A slab leased from a [`SlabPool`]; returns to it on drop.
 pub struct Slab {
     pool: &'static SlabPool,
-    slot: Slot,
+    offset: usize,
+    pending: Option<Arc<dyn Fence>>,
 }
 
 impl Slab {
     fn ptr(&self) -> *mut u8 {
         // SAFETY: `offset` is a slab's start in the pool's buffer
-        unsafe { self.pool.buffer_ptr.add(self.slot.offset) }
+        unsafe { self.pool.buffer_ptr.add(self.offset) }
     }
 
-    /// Records on `stream` the copies reading the slab: [`SlabPool::acquire`]
-    /// waits for them before leasing it again.
-    pub(super) fn release(mut self, d: &DeviceGuard<'_>, stream: Stream) -> Result<(), CudaError> {
-        let event = match self.slot.last_copy.take() {
-            Some((event, device)) if device == d.id() => event,
-            Some((event, _)) => {
-                let _ = d.api().event_destroy(event);
-                d.event_create()?
-            }
-            None => d.event_create()?,
-        };
-        self.slot.last_copy = Some((event, d.id()));
-        d.api().event_record(event, stream)
+    /// Returns the slab to its pool, to be leased again once `fence` completed.
+    pub fn release_after(mut self, fence: Arc<dyn Fence>) {
+        self.pending = Some(fence);
     }
 }
 
@@ -67,12 +57,16 @@ impl DerefMut for Slab {
 
 impl Drop for Slab {
     fn drop(&mut self) {
-        self.pool.put_back(self.slot);
+        let slot = Slot {
+            offset: self.offset,
+            pending: self.pending.take(),
+        };
+        self.pool.free.lock().unwrap().push_back(slot);
+        self.pool.available.notify_one();
     }
 }
 
 pub struct SlabPool {
-    cuda: &'static CudaApi,
     buffer_ptr: *mut u8,
     slab_size: usize,
     /// whether every slab is aligned to [`DIRECT_ALIGN`]
@@ -90,11 +84,10 @@ impl SlabPool {
         let free = (0..n_slabs)
             .map(|i| Slot {
                 offset: i * slab_size,
-                last_copy: None,
+                pending: None,
             })
             .collect();
         Ok(Self {
-            cuda,
             buffer_ptr,
             slab_size,
             aligned: buffer_ptr.addr().is_multiple_of(DIRECT_ALIGN)
@@ -104,7 +97,7 @@ impl SlabPool {
         })
     }
 
-    /// Leases a slab, waiting for one to be free and for the copies that read it.
+    /// Leases a slab, waiting for one to be free and for what still reads it.
     pub fn acquire(&'static self) -> Result<Slab, Error> {
         // TODO: handle poisoning
         let mut free = self.free.lock().unwrap();
@@ -115,16 +108,16 @@ impl SlabPool {
             free = self.available.wait(free).unwrap();
         };
         drop(free);
-        let slab = Slab { pool: self, slot };
-        if let Some((event, _)) = slab.slot.last_copy {
-            self.cuda.event_sync(event)?;
+        let mut slab = Slab {
+            pool: self,
+            offset: slot.offset,
+            pending: slot.pending,
+        };
+        if let Some(pending) = &slab.pending {
+            pending.wait()?;
         }
+        slab.pending = None;
         Ok(slab)
-    }
-
-    fn put_back(&self, slot: Slot) {
-        self.free.lock().unwrap().push_back(slot);
-        self.available.notify_one();
     }
 }
 

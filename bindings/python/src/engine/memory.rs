@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    cuda_memory::device_stream,
+    cuda_memory::{device_stream, CudaEvent},
     loader::LoaderError,
     transfer::{Error, Sink, Staged},
 };
@@ -497,7 +497,8 @@ impl<D: Send> Sink for CudaSink<D> {
                     }
                 },
             )?;
-            staged.into_slab().release(d, self.stream)?;
+            let copied = CudaEvent::record_on(self.api, d, self.stream)?;
+            staged.into_slab().release_after(Arc::new(copied));
             let e = d.event_create()?;
             if let Err(err) = self.api.event_record(e, self.stream) {
                 let _ = self.api.event_destroy(e);

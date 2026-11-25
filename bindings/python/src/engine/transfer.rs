@@ -45,6 +45,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Work in flight, such as asynchronous copies
+pub trait Fence: Send + Sync {
+    /// Returns once the work completed.
+    fn wait(&self) -> Result<(), Error>;
+}
+
 /// A chunk's bytes in a slab: the bytes of `file` start `head` bytes into it.
 pub struct Staged {
     slab: Slab,
