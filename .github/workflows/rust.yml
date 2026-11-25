@@ -28,13 +28,14 @@ jobs:
         uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
         with:
           toolchain: stable
-          components: rustfmt, clippy, llvm-tools-preview
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: "safetensors"
 
       - name: Install cargo-audit
+        if: matrix.os == 'ubuntu-latest'
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
         with:
           tool: cargo-audit
@@ -52,5 +53,6 @@ jobs:
         run: cargo test --locked --no-default-features --verbose
 
       - name: Run Audit
+        if: matrix.os == 'ubuntu-latest'
         # RUSTSEC-2021-0145 is criterion so only within benchmarks
         run: cargo audit -D warnings --ignore RUSTSEC-2021-0145
