@@ -8,7 +8,7 @@ use std::{
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
 };
 
@@ -170,7 +170,7 @@ impl Plan {
 
 /// The worker loop: moves the next chunk of `plan` from `from` to `to`, until
 /// none is left or the plan stops. A failure fails the plan and stops `to`.
-pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &'static SlabPool) {
+pub fn work(plan: &Plan, from: &impl Source, to: &impl Sink, pool: &Arc<SlabPool>) {
     loop {
         if plan.stopped() {
             return;

@@ -1,10 +1,14 @@
 //! CUDA for the transfer engine: the stream each device's copies are queued
-//! on, events as [`Fence`]s.
+//! on, pinned host memory as a pool [`Backing`], events as [`Fence`]s.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
 
 use super::{
     cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream},
+    pool::{Backing, SlabPool, SLAB_SIZE},
     transfer::{Error, Fence},
 };
 
@@ -76,4 +80,51 @@ impl Drop for CudaEvent {
     fn drop(&mut self) {
         let _ = self.api.event_destroy(self.event);
     }
+}
+
+/// Page-locked host memory, which devices copy from and to asynchronously
+struct Pinned {
+    api: &'static CudaApi,
+    ptr: *mut u8,
+    size: usize,
+}
+
+// SAFETY: `ptr` is an allocation owned by `Pinned`, whose methods only read it
+unsafe impl Send for Pinned {}
+// SAFETY: as for `Send`
+unsafe impl Sync for Pinned {}
+
+// SAFETY: `cudaHostAlloc` returned `size` bytes at `ptr`, freed on drop only
+unsafe impl Backing for Pinned {
+    fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        let _ = self.api.free_host(self.ptr);
+    }
+}
+
+/// The pool of pinned slabs every CUDA transfer in the process shares
+pub fn pinned_pool(api: &'static CudaApi) -> Result<Arc<SlabPool>, CudaError> {
+    static POOL: OnceLock<Arc<SlabPool>> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    if POOL.get().is_none() {
+        let _g = INIT.lock().unwrap();
+        if POOL.get().is_none() {
+            let size = 32 * SLAB_SIZE;
+            let ptr = api.host_alloc(size)?;
+            let _ = POOL.set(SlabPool::new(
+                Box::new(Pinned { api, ptr, size }),
+                SLAB_SIZE,
+            ));
+        }
+    }
+    Ok(POOL.get().unwrap().clone())
 }
