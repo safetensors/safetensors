@@ -4,6 +4,7 @@
 
 use std::{
     fmt::Display,
+    num::NonZeroUsize,
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -12,6 +13,9 @@ use std::{
 };
 
 use super::pool::{Slab, SlabPool};
+
+/// The most bytes a worker moves at once
+pub const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
 
 /// Why a transfer failed
 #[derive(Debug)]
