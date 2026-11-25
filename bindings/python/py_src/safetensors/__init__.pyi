@@ -61,6 +61,8 @@ def serialize_file(
     tensor_dict: Dict[str, TensorSpec],
     filename: Union[str, "os.PathLike[str]"],
     metadata: Optional[Dict[str, str]] = None,
+    *,
+    direct: Optional[bool] = None,
 ) -> FileLayout:
     """
     Serializes raw data into file.
@@ -76,6 +78,11 @@ def serialize_file(
             The name of the file to write into.
         metadata (`Dict[str, str]`, *optional*):
             The optional purely text annotations
+        direct (`bool`, *optional*):
+            Whether to write the file directly to the disk, bypassing the page
+            cache. `None`, the default, does so for a file larger than 16 MiB;
+            `True` for any file; `False` for none. Filesystems that do not
+            support direct writes always go through the cache. Linux only.
 
     Returns:
         (`FileLayout`):

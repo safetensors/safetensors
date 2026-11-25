@@ -101,9 +101,10 @@ impl DirectFile {
         Ok(0)
     }
 
-    /// `file`, empty, to write `size` bytes to; the bytes are allocated now.
+    /// `file`, empty, to write `size` bytes to, through the page cache unless
+    /// `direct`; the bytes are allocated now.
     #[cfg(target_os = "linux")]
-    pub(super) fn create(file: Arc<File>, size: u64) -> std::io::Result<Self> {
+    pub(super) fn create(file: Arc<File>, size: u64, direct: bool) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         // SAFETY: `file` holds an open descriptor for the call's duration
         let allocated = libc::off_t::try_from(size)
@@ -112,7 +113,7 @@ impl DirectFile {
             file.set_len(size)?;
         }
         Ok(Self {
-            direct: Direct::open(&file, true, false),
+            direct: direct.then(|| Direct::open(&file, true, false)).flatten(),
             file,
             size,
         })
@@ -204,7 +205,10 @@ impl Drop for TempFile {
 }
 
 /// Writes the `size` bytes `from` holds to a new file, which replaces `path`
-/// once complete: a mapping of a previous `path` keeps its bytes.
+/// once complete: a mapping of a previous `path` keeps its bytes. `direct`:
+/// `Some(true)` writes with `O_DIRECT`, `Some(false)` through the page cache,
+/// `None` with `O_DIRECT` a file larger than a chunk, which a load right after
+/// reads faster from the cache.
 #[cfg(target_os = "linux")]
 pub(super) fn write_file(
     path: &Path,
@@ -212,8 +216,10 @@ pub(super) fn write_file(
     from: &impl Source,
     pool: &Arc<SlabPool>,
     threads: usize,
+    direct: Option<bool>,
 ) -> Result<(), Error> {
     let chunk = CHUNK_SIZE.get() as u64;
+    let direct = direct.unwrap_or(size > chunk);
     let chunks = || -> Box<[Range<u64>]> {
         (0..size.div_ceil(chunk))
             .map(|c| c * chunk..((c + 1) * chunk).min(size))
@@ -230,7 +236,7 @@ pub(super) fn write_file(
     };
     let replaced = (|| {
         let (temp, file) = temp()?;
-        let to = DirectFile::create(file.clone(), size)?;
+        let to = DirectFile::create(file.clone(), size, direct)?;
         // The last chunk goes first: a filesystem that only takes a file front
         // to back refuses it before any byte is written.
         let mut chunks = chunks().into_vec();

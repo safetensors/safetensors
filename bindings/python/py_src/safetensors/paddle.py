@@ -53,6 +53,8 @@ def save_file(
     tensors: Dict[str, paddle.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    *,
+    direct: Optional[bool] = None,
 ) -> FileLayout:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
@@ -66,6 +68,11 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        direct (`bool`, *optional*):
+            Whether to write the file directly to the disk, bypassing the page
+            cache. `None`, the default, does so for a file larger than 16 MiB;
+            `True` for any file; `False` for none. Filesystems that do not
+            support direct writes always go through the cache. Linux only.
 
     Returns:
         `FileLayout`: where the file holds each tensor: `data_offset`, the start of
@@ -84,7 +91,10 @@ def save_file(
     """
     keep_references_alive = []
     return serialize_file(
-        _flatten(tensors, keep_references_alive), filename, metadata=metadata
+        _flatten(tensors, keep_references_alive),
+        filename,
+        metadata=metadata,
+        direct=direct,
     )
 
 

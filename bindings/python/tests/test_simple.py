@@ -187,6 +187,23 @@ class TestCase(unittest.TestCase):
         load_file_pt(Path(filename))
         os.remove(Path(filename))
 
+    def test_save_file_direct(self):
+        # one chunk is 16 MiB: the default writes the first file through the
+        # page cache and the second directly
+        for size in [1000, (16 << 20) + 1000]:
+            tensors = {
+                "a": np.arange(size, dtype=np.uint8),
+                "b": np.arange(7, dtype=np.float32),
+            }
+            for direct in [None, True, False]:
+                with tempfile.TemporaryDirectory() as dir:
+                    path = os.path.join(dir, "out.safetensors")
+                    save_file(tensors, path, direct=direct)
+                    loaded = load_file(path)
+                self.assertEqual(loaded.keys(), tensors.keys())
+                for name, tensor in tensors.items():
+                    np.testing.assert_array_equal(loaded[name], tensor)
+
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
         n = torch.empty([], dtype=m.dtype, device=m.device)
