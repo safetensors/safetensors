@@ -2274,8 +2274,8 @@ impl Open {
     /// through [`Open::prefetch`] on a CUDA device when a CUDA runtime is loaded,
     /// and on MPS when torch takes Metal buffers and the file's dtypes. Pytorch
     /// on the CPU with the `pread` backend, and numpy with either backend, on Linux
-    /// and macOS read a file larger than [`PARALLEL_READ_MIN`] in parallel, see
-    /// [`Self::get_tensors_read_cpu`].
+    /// and macOS read a file larger than [`PARALLEL_READ_MIN`] in parallel, and so
+    /// does MLX on macOS, see [`Self::get_tensors_read_cpu`].
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         #[cfg(all(unix, target_endian = "little"))]
         if self.device == Device::Cpu && self.metadata.data_len() > PARALLEL_READ_MIN {
@@ -2283,6 +2283,8 @@ impl Open {
                 // the mmap backend hands out views of the mapping
                 Framework::Pytorch => matches!(self.storage.as_ref(), Storage::Pread(_)),
                 Framework::Numpy => true,
+                // elsewhere MLX may keep its arrays on a device
+                Framework::Mlx => cfg!(target_os = "macos"),
                 _ => false,
             };
             if parallel {
@@ -2326,51 +2328,93 @@ impl Open {
         })
     }
 
-    /// Allocates every tensor with torch or numpy, then reads the file into them
+    /// Allocates every tensor with the framework, then reads the file into them
     /// in parallel. `None` when a dtype needs the per-tensor path: `F4`, or one
     /// the framework lacks.
     #[cfg(all(unix, target_endian = "little"))]
     fn get_tensors_read_cpu(&self) -> PyResult<Option<Py<PyDict>>> {
         Python::attach(|py| {
-            let numpy = self.framework != Framework::Pytorch;
-            let module = match numpy {
-                true => get_module(py, &NUMPY_MODULE)?,
-                false => get_module(py, &TORCH_MODULE)?,
+            // MLX has no uninitialized array
+            let (module, new) = match self.framework {
+                Framework::Pytorch => (get_module(py, &TORCH_MODULE)?.clone(), "empty"),
+                Framework::Mlx => (PyModule::import(py, intern!(py, "mlx.core"))?, "zeros"),
+                _ => (get_module(py, &NUMPY_MODULE)?.clone(), "empty"),
             };
             let mut infos = Vec::new();
             for name in self.metadata.offset_keys() {
                 let info = self.metadata.info(&name).ok_or_else(|| {
                     SafetensorError::new_err(format!("File does not contain tensor {name}"))
                 })?;
-                match get_pydtype(module, info.dtype, numpy) {
-                    Ok(dtype) if info.dtype != Dtype::F4 => infos.push((name, info, dtype)),
+                let dtype = match self.framework {
+                    Framework::Mlx => mlx_dtype(&module, info.dtype),
+                    Framework::Pytorch => get_pydtype(&module, info.dtype, false).ok(),
+                    _ => get_pydtype(&module, info.dtype, true).ok(),
+                };
+                match dtype {
+                    Some(dtype) if info.dtype != Dtype::F4 => infos.push((name, info, dtype)),
                     _ => return Ok(None),
                 }
             }
             let dict = PyDict::new(py);
-            let mut tensors = Vec::with_capacity(infos.len());
+            let mut arrays = Vec::with_capacity(infos.len());
             for (name, info, dtype) in infos {
                 let kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                if self.framework == Framework::Mlx {
+                    // on the GPU, MLX before 0.31.2 aborts if another thread evaluates meanwhile
+                    kwargs.set_item(intern!(py, "stream"), module.getattr(intern!(py, "cpu"))?)?;
+                }
                 let shape = info.shape.clone();
-                let tensor = module.call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?;
-                let (start, end) = info.data_offsets;
-                let ptr: u64 = match numpy {
-                    true => tensor
-                        .getattr(intern!(py, "__array_interface__"))?
-                        .get_item(intern!(py, "data"))?
-                        .get_item(0)?
-                        .extract()?,
-                    false => tensor.call_method0(intern!(py, "data_ptr"))?.extract()?,
+                let tensor = module.call_method(new, (shape,), Some(&kwargs))?;
+                dict.set_item(name, &tensor)?;
+                arrays.push((info.data_offsets, tensor));
+            }
+            if self.framework == Framework::Mlx {
+                // MLX arrays are lazy: one evaluation allocates them all
+                module.call_method1(intern!(py, "eval"), (dict.values(),))?;
+            }
+            let mut tensors = Vec::with_capacity(arrays.len());
+            // of the MLX arrays, held while the file is read into them
+            let mut buffers = Vec::new();
+            for ((start, end), tensor) in arrays {
+                let (ptr, nbytes): (u64, usize) = match self.framework {
+                    // nothing is read into an empty array, whose bytes do not cast
+                    Framework::Mlx if start == end => (0, 0),
+                    Framework::Mlx => {
+                        let buffer = mlx_bytes(&tensor)?;
+                        if buffer.readonly() {
+                            return Ok(None);
+                        }
+                        let at = (buffer.buf_ptr() as u64, buffer.len_bytes());
+                        buffers.push(buffer);
+                        at
+                    }
+                    Framework::Pytorch => (
+                        tensor.call_method0(intern!(py, "data_ptr"))?.extract()?,
+                        tensor.getattr(intern!(py, "nbytes"))?.extract()?,
+                    ),
+                    _ => (
+                        tensor
+                            .getattr(intern!(py, "__array_interface__"))?
+                            .get_item(intern!(py, "data"))?
+                            .get_item(0)?
+                            .extract()?,
+                        tensor.getattr(intern!(py, "nbytes"))?.extract()?,
+                    ),
                 };
+                if nbytes != end - start {
+                    return Ok(None);
+                }
                 tensors.push((start..end, ptr));
-                dict.set_item(name, tensor)?;
             }
             let file = self.file.clone();
-            // SAFETY: each address is a tensor just allocated with its range's
-            // bytes, which `dict` keeps alive and only this call accesses
+            // SAFETY: each address holds its range's bytes in an array just
+            // allocated, which `dict` keeps alive and only this call accesses. A
+            // torch or numpy array owns that memory; an evaluated MLX array
+            // exports it as a writable buffer, held in `buffers` during the read.
             let read = py.detach(|| unsafe {
                 crate::engine::read(file, self.offset, &tensors, CPU_READ_THREADS)
             });
+            drop(buffers);
             read.map_err(|e| {
                 SafetensorError::new_err(format!("Could not read tensors from file: {e}"))
             })?;
@@ -2654,7 +2698,7 @@ impl safe_open {
     /// each. On a CUDA device with PyTorch, and on Apple-silicon MPS with torch
     /// 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
     /// and the `"pread"` backend, or with numpy and either backend, on Linux and
-    /// macOS, it reads a file larger than 2 MiB in parallel.
+    /// macOS, it reads a file larger than 2 MiB in parallel. So it does with MLX on macOS.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
@@ -3526,6 +3570,38 @@ fn create_tensor<'a>(
         // let tensor = tensor.into_py_bound(py);
         Ok(tensor.into())
     })
+}
+
+/// The bytes of an evaluated MLX array. As a `memoryview` of bytes: pyo3 does
+/// not take the buffer a scalar exports, nor the format of a `bfloat16` one.
+#[cfg(all(unix, target_endian = "little"))]
+fn mlx_bytes(array: &PyBound<'_, PyAny>) -> PyResult<PyUntypedBuffer> {
+    let view = pyo3::types::PyMemoryView::from(array)?
+        .call_method1(intern!(array.py(), "cast"), ("B",))?;
+    PyUntypedBuffer::get(&view)
+}
+
+/// The MLX dtype with the bytes of `dtype`, where there is one: MLX has no
+/// 64-bit floats on the GPU and turns them into 32-bit ones.
+#[cfg(all(unix, target_endian = "little"))]
+fn mlx_dtype(mlx: &PyBound<'_, PyModule>, dtype: Dtype) -> Option<Py<PyAny>> {
+    let name = match dtype {
+        Dtype::BOOL => "bool_",
+        Dtype::F32 => "float32",
+        Dtype::F16 => "float16",
+        Dtype::BF16 => "bfloat16",
+        Dtype::I64 => "int64",
+        Dtype::U64 => "uint64",
+        Dtype::I32 => "int32",
+        Dtype::U32 => "uint32",
+        Dtype::I16 => "int16",
+        Dtype::U16 => "uint16",
+        Dtype::I8 => "int8",
+        Dtype::U8 => "uint8",
+        Dtype::C64 => "complex64",
+        _ => return None,
+    };
+    Some(mlx.getattr(name).ok()?.unbind())
 }
 
 fn get_pydtype(
