@@ -78,6 +78,11 @@ jobs:
           python-version: ${{ matrix.version.python }}
           architecture: ${{ matrix.version.arch }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+        with:
+          enable-cache: false
+
       - name: Lint with RustFmt
         run: cargo fmt -- --check
 
@@ -86,7 +91,6 @@ jobs:
 
       - name: Install (torch)
         run: |
-          pip install uv
           uv pip install ${{ matrix.version.numpy }} ${{ matrix.version.torch }}
         shell: bash
 
@@ -137,7 +141,7 @@ jobs:
         if: matrix.version.arch == 'x64-freethreaded'
         run: |
           cargo test --locked
-          uv pip install --index-strategy unsafe-best-match --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple ".[testing]"
+          uv pip install ".[testing]"
           # importing msgpack._cmsgpack re-enables the GIL, so force-disable
           # until msgpack declares support
           PYTHON_GIL=0 pytest -sv tests/ --ignore=tests/test_tf_comparison.py --ignore=tests/test_flax_comparison.py
