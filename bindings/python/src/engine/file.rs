@@ -213,7 +213,12 @@ pub(super) fn write_file(
     let replaced = (|| {
         let (temp, file) = temp()?;
         let to = DirectFile::create(file.clone(), size)?;
-        transfer(Plan::new(chunks()), from, &to, pool, threads)?;
+        // The last chunk goes first: a filesystem that only takes a file front
+        // to back refuses it before any byte is written.
+        let mut chunks = chunks().into_vec();
+        let last = chunks.pop().into_iter().collect();
+        transfer(Plan::new(last), from, &to, pool, 1)?;
+        transfer(Plan::new(chunks.into()), from, &to, pool, threads)?;
         // drops the padding of a direct write
         file.set_len(size)?;
         temp.persist(path)?;
