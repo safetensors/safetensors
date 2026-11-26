@@ -4,7 +4,7 @@
 use crate::sync::lock;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
 };
 
 use super::{
@@ -210,20 +210,21 @@ impl Drop for Pinned {
     }
 }
 
-/// The pool of pinned slabs every CUDA transfer in the process shares
+/// Slabs in the [`pinned_pool`]: twice the default thread count, so workers
+/// keep reading while slabs wait for their device copies
+const PINNED_SLABS: usize = 32;
+
+/// The pool of pinned slabs every CUDA transfer in the process shares,
+/// allocated by the first call
 pub fn pinned_pool(api: &'static CudaApi) -> Result<Arc<SlabPool>, CudaError> {
-    static POOL: OnceLock<Arc<SlabPool>> = OnceLock::new();
-    static INIT: Mutex<()> = Mutex::new(());
-    if POOL.get().is_none() {
-        let _g = lock(&INIT);
-        if POOL.get().is_none() {
-            let size = 32 * SLAB_SIZE;
-            let ptr = api.host_alloc(size)?;
-            let _ = POOL.set(SlabPool::new(
-                Box::new(Pinned { api, ptr, size }),
-                SLAB_SIZE,
-            ));
-        }
+    static POOL: Mutex<Option<Arc<SlabPool>>> = Mutex::new(None);
+    let mut pool = lock(&POOL);
+    if let Some(pool) = &*pool {
+        return Ok(pool.clone());
     }
-    Ok(POOL.get().unwrap().clone())
+    let size = PINNED_SLABS * SLAB_SIZE;
+    let ptr = api.host_alloc(size)?;
+    let new = SlabPool::new(Box::new(Pinned { api, ptr, size }), SLAB_SIZE);
+    *pool = Some(new.clone());
+    Ok(new)
 }
