@@ -462,3 +462,15 @@ class ReadmeTestCase(unittest.TestCase):
                 tensor = slice_[index]
                 self.assertEqual(tensor.shape, A[index].shape, index)
                 self.assertTrue(np.array_equal(tensor, A[index]), index)
+
+    def test_numpy_slice_empty_tensor_with_large_dims(self):
+        A = np.empty((2**40, 2, 0), dtype=np.uint8)
+        filename = f"./slice_empty_large_{threading.get_ident()}.safetensors"
+        save_file({"a": A}, filename)
+
+        for backend in ["mmap", "pread"]:
+            with safe_open(filename, framework="np", backend=backend) as f:
+                slice_ = f.get_slice("a")
+                for index in [np.s_[:, :1], np.s_[::2], np.s_[:, ::2]]:
+                    tensor = slice_[index]
+                    self.assertEqual(tensor.shape, A[index].shape, (backend, index))
