@@ -489,7 +489,7 @@ impl<'data> SafeTensors<'data> {
         let metadata: HashMetadata =
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
-        let buffer_end = metadata.validate()?;
+        let buffer_end = metadata.data_len();
         if buffer_end + N_LEN + n != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
