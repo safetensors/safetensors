@@ -1,6 +1,7 @@
 //! CUDA for the transfer engine: a device's memory to [`Scatter`] into, pinned host
 //! memory as a pool [`Backing`], events as [`Fence`]s.
 
+use crate::sync::lock;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
@@ -214,7 +215,7 @@ pub fn pinned_pool(api: &'static CudaApi) -> Result<Arc<SlabPool>, CudaError> {
     static POOL: OnceLock<Arc<SlabPool>> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if POOL.get().is_none() {
-        let _g = INIT.lock().unwrap();
+        let _g = lock(&INIT);
         if POOL.get().is_none() {
             let size = 32 * SLAB_SIZE;
             let ptr = api.host_alloc(size)?;

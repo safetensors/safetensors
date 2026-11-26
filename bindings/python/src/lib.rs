@@ -6,6 +6,7 @@ mod dlpack;
 mod metal;
 
 mod engine;
+mod sync;
 
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
+use sync::{lock, wait};
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -1118,7 +1120,7 @@ impl Background {
     /// waits without the GIL. The tensors not taken stay with the loader.
     fn halt(&self, py: Python<'_>) {
         self.stop.store(true, Ordering::Release);
-        let thread = self.thread.lock().unwrap().take();
+        let thread = lock(&self.thread).take();
         py.detach(|| {
             // wakes the allocator thread
             self.feed.stop();
@@ -1142,9 +1144,9 @@ impl Background {
         if std::thread::current().name() == Some(ALLOCATOR_THREAD) {
             return;
         }
-        let mut exited = self.exited.lock().unwrap();
+        let mut exited = lock(&self.exited);
         while !*exited {
-            exited = self.exit.wait(exited).unwrap();
+            exited = wait(&self.exit, exited);
         }
     }
 
@@ -1263,7 +1265,7 @@ struct Exited<'a>(&'a Background);
 
 impl Drop for Exited<'_> {
     fn drop(&mut self) {
-        *self.0.exited.lock().unwrap() = true;
+        *lock(&self.0.exited) = true;
         self.0.exit.notify_all();
     }
 }
@@ -1730,7 +1732,7 @@ impl Open {
                 exit: Condvar::new(),
             });
             {
-                let mut live = LIVE_LOADERS.lock().unwrap();
+                let mut live = lock(&LIVE_LOADERS);
                 // a thread started now would outlive the hook into finalization
                 let live = live.as_mut().ok_or_else(|| {
                     SafetensorError::new_err("cannot prefetch once the interpreter exits")
@@ -1747,7 +1749,7 @@ impl Open {
                     })
                     // the hook may already wait on it
                     .inspect_err(|_| drop(Exited(&background)))?;
-                *background.thread.lock().unwrap() = Some(thread);
+                *lock(&background.thread) = Some(thread);
             }
             Ok((background, stream_raw))
         })();
@@ -2447,7 +2449,7 @@ struct safe_open {
 
 impl safe_open {
     fn inner(&self) -> PyResult<Arc<Open>> {
-        let inner = self.inner.lock().unwrap().clone();
+        let inner = lock(&self.inner).clone();
         inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
@@ -2656,7 +2658,7 @@ impl safe_open {
     /// Exits the context manager
     pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
         // dropped once the lock is released
-        let _open = self.inner.lock().unwrap().take();
+        let _open = lock(&self.inner).take();
     }
 }
 
@@ -3570,7 +3572,7 @@ struct _safe_open_handle {
 
 impl _safe_open_handle {
     fn inner(&self) -> PyResult<Arc<Open>> {
-        let inner = self.inner.lock().unwrap().clone();
+        let inner = lock(&self.inner).clone();
         inner.ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))
     }
 }
@@ -3707,7 +3709,7 @@ impl _safe_open_handle {
     /// Exits the context manager
     pub fn __exit__(&self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
         // dropped once the lock is released
-        let _open = self.inner.lock().unwrap().take();
+        let _open = lock(&self.inner).take();
     }
 }
 

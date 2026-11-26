@@ -17,6 +17,7 @@
 //!
 //! The memory's [`Scatter`] makes the copies: host memory, or a device's.
 
+use crate::sync::{lock, wait};
 use std::{
     num::NonZeroUsize,
     ops::Range,
@@ -494,7 +495,7 @@ impl<S> Memory<S> {
         addrs: impl ExactSizeIterator<Item = u64>,
         ready: Option<Arc<dyn Fence>>,
     ) {
-        let _g = self.provision_lock.lock().unwrap();
+        let _g = lock(&self.provision_lock);
         let first = self.provided.load(Ordering::Acquire);
         assert!(
             first + addrs.len() <= self.dests.len(),
@@ -514,7 +515,7 @@ impl<S> Memory<S> {
         if self.provided.load(Ordering::Acquire) >= n {
             return Ok(());
         }
-        let mut g = self.provision_lock.lock().unwrap();
+        let mut g = lock(&self.provision_lock);
         loop {
             if self.provided.load(Ordering::Acquire) >= n {
                 return Ok(());
@@ -522,7 +523,7 @@ impl<S> Memory<S> {
             if self.stopped.load(Ordering::Acquire) {
                 return Err(Error::Stopped);
             }
-            g = self.provision.wait(g).unwrap();
+            g = wait(&self.provision, g);
         }
     }
 
@@ -651,7 +652,7 @@ impl<S: Scatter> Sink for Memory<S> {
     }
 
     fn stop(&self) {
-        let _g = self.provision_lock.lock().unwrap();
+        let _g = lock(&self.provision_lock);
         self.stopped.store(true, Ordering::Release);
         self.provision.notify_all();
     }

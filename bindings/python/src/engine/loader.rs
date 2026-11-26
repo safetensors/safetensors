@@ -31,6 +31,7 @@
 //! in flight, then returns the owners not taken: an outstanding iterator yields
 //! `Err(Closed)` once and is exhausted.
 
+use crate::sync::lock;
 use std::{
     collections::VecDeque,
     fmt::Display,
@@ -137,13 +138,9 @@ impl<D> LoaderInner<D> {
     /// another thread returns its owner or an error: `Closed`, or what failed the load.
     fn close(&self) -> Vec<D> {
         self.halt();
-        *self.released.lock().unwrap() = true;
+        *lock(&self.released) = true;
         let copied = self.memory.wait_copies();
-        let owners: Vec<D> = self
-            .owners
-            .iter()
-            .filter_map(|o| o.lock().unwrap().take())
-            .collect();
+        let owners: Vec<D> = self.owners.iter().filter_map(|o| lock(o).take()).collect();
         if copied.is_err() {
             // copies may still be queued into them: leak them rather than free them
             std::mem::forget(owners);
@@ -157,7 +154,7 @@ impl<D> LoaderInner<D> {
         self.transfer.stop();
         self.memory.stop();
         // held while joining: a concurrent halt returns once the workers are gone
-        let mut workers = self.workers.lock().unwrap();
+        let mut workers = lock(&self.workers);
         for h in workers.drain(..) {
             let _ = h.join();
         }
@@ -175,9 +172,9 @@ impl<D> LoaderInner<D> {
     }
 
     fn take(&self, idx: usize) -> Result<D, LoaderError> {
-        match self.owners[idx].lock().unwrap().take() {
+        match lock(&self.owners[idx]).take() {
             Some(owner) => Ok(owner),
-            None if *self.released.lock().unwrap() => Err(LoaderError::Closed),
+            None if *lock(&self.released) => Err(LoaderError::Closed),
             None => Err(LoaderError::AlreadyDelivered),
         }
     }
@@ -205,7 +202,7 @@ impl<D> Feed<D> {
         stream: u64,
     ) -> Result<(), (LoaderError, Vec<(u64, D)>)> {
         let inner = &*self.inner;
-        let released = inner.released.lock().unwrap();
+        let released = lock(&inner.released);
         if *released {
             return Err((LoaderError::Closed, dsts));
         }
@@ -222,7 +219,7 @@ impl<D> Feed<D> {
         );
         let (addrs, owners): (Vec<u64>, Vec<D>) = dsts.into_iter().unzip();
         for (slot, owner) in inner.owners[first..].iter().zip(owners) {
-            *slot.lock().unwrap() = Some(owner);
+            *lock(slot) = Some(owner);
         }
         // SAFETY: each address is a tensor allocated for its span, kept alive by
         // its owner until `take` hands it out once landed, or `close` returns it
@@ -356,7 +353,7 @@ impl<D: Send + 'static> Loader<D> {
                 transfer::work(&inner.transfer, &inner.source, &inner.memory, &inner.pool)
             });
             // on failure, dropping the loader stops and joins the workers already started
-            loader.inner.workers.lock().unwrap().push(spawned?);
+            lock(&loader.inner.workers).push(spawned?);
         }
         Ok(loader)
     }

@@ -2,6 +2,7 @@
 //! slab from a [`SlabPool`], fills it with a chunk of the file from a
 //! [`Source`], and drains it to a [`Sink`], until the [`Plan`]'s chunks run out.
 
+use crate::sync::{lock, wait};
 use std::{
     fmt::Display,
     num::NonZeroUsize,
@@ -166,16 +167,16 @@ impl Plan {
     }
 
     fn notify(&self) {
-        drop(self.progress_lock.lock().unwrap());
+        drop(lock(&self.progress_lock));
         self.progress.notify_all();
     }
 
     /// Waits until `done` holds or the plan stopped; `done` is checked again
     /// each time a chunk is claimed.
     pub fn wait_until(&self, done: impl Fn() -> bool) {
-        let mut g = self.progress_lock.lock().unwrap();
+        let mut g = lock(&self.progress_lock);
         while !done() && !self.stopped() {
-            g = self.progress.wait(g).unwrap();
+            g = wait(&self.progress, g);
         }
     }
 

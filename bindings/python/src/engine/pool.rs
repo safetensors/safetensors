@@ -1,6 +1,7 @@
 //! Slabs: buffers a worker stages a chunk in, leased from a [`SlabPool`] cut
 //! from one [`Backing`] allocation.
 
+use crate::sync::{lock, wait};
 use std::{
     collections::VecDeque,
     ops::{Deref, DerefMut},
@@ -127,7 +128,7 @@ impl Drop for Slab {
             offset: self.offset,
             pending: self.pending.take(),
         };
-        self.pool.free.lock().unwrap().push_back(slot);
+        lock(&self.pool.free).push_back(slot);
         self.pool.available.notify_one();
     }
 }
@@ -167,13 +168,12 @@ impl SlabPool {
 
     /// Leases a slab, waiting for one to be free and for what still reads it.
     pub fn acquire(self: &Arc<Self>) -> Result<Slab, Error> {
-        // TODO: handle poisoning
-        let mut free = self.free.lock().unwrap();
+        let mut free = lock(&self.free);
         let slot = loop {
             if let Some(s) = free.pop_front() {
                 break s;
             }
-            free = self.available.wait(free).unwrap();
+            free = wait(&self.available, free);
         };
         drop(free);
         let mut slab = Slab {
