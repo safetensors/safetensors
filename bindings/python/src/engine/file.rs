@@ -127,15 +127,15 @@ impl Sink for DirectFile {
 /// removed if dropped before
 #[cfg(target_os = "linux")]
 struct TempFile {
-    file: Arc<File>,
     path: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl TempFile {
     /// `.tmp` and 6 random letters or digits, in the directory of `path`, with
-    /// the permissions of a new file
-    fn beside(path: &Path) -> std::io::Result<Self> {
+    /// the permissions of a new file. Some filesystems can't remove an open
+    /// file: drop the file first.
+    fn beside(path: &Path) -> std::io::Result<(Self, Arc<File>)> {
         use std::{hash::BuildHasher, os::unix::fs::OpenOptionsExt};
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let dir = match path.parent() {
@@ -160,12 +160,7 @@ impl TempFile {
                 .mode(0o666)
                 .open(&temp);
             match opened {
-                Ok(file) => {
-                    return Ok(Self {
-                        file: Arc::new(file),
-                        path: Some(temp),
-                    })
-                }
+                Ok(file) => return Ok((Self { path: Some(temp) }, Arc::new(file))),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 1 << 16 => {
                     attempts += 1;
                 }
@@ -200,22 +195,64 @@ pub(super) fn write_file(
     pool: &Arc<SlabPool>,
     threads: usize,
 ) -> Result<(), Error> {
-    let temp = TempFile::beside(path)?;
-    // The file keeps the permissions of the one it replaces, where the
-    // filesystem has any.
-    if let Ok(replaced) = std::fs::metadata(path) {
-        let _ = temp.file.set_permissions(replaced.permissions());
-    }
-    let to = DirectFile::create(temp.file.clone(), size)?;
     let chunk = CHUNK_SIZE.get() as u64;
-    let chunks = (0..size.div_ceil(chunk))
-        .map(|c| c * chunk..((c + 1) * chunk).min(size))
-        .collect();
-    transfer(Plan::new(chunks), from, &to, pool, threads)?;
-    // drops the padding of a direct write
-    temp.file.set_len(size)?;
-    temp.persist(path)?;
-    Ok(())
+    let chunks = || -> Box<[Range<u64>]> {
+        (0..size.div_ceil(chunk))
+            .map(|c| c * chunk..((c + 1) * chunk).min(size))
+            .collect()
+    };
+    let temp = || -> std::io::Result<(TempFile, Arc<File>)> {
+        let (temp, file) = TempFile::beside(path)?;
+        // The file keeps the permissions of the one it replaces, where the
+        // filesystem has any.
+        if let Ok(replaced) = std::fs::metadata(path) {
+            let _ = file.set_permissions(replaced.permissions());
+        }
+        Ok((temp, file))
+    };
+    let replaced = (|| {
+        let (temp, file) = temp()?;
+        let to = DirectFile::create(file.clone(), size)?;
+        transfer(Plan::new(chunks()), from, &to, pool, threads)?;
+        // drops the padding of a direct write
+        file.set_len(size)?;
+        temp.persist(path)?;
+        Ok(())
+    })();
+    match replaced {
+        // Object store mounts only take a file written front to back, with no
+        // truncation or write at an offset; some have no rename either, and
+        // then only take a new file.
+        Err(Error::Io(e)) if refused(&e) => {
+            let front_to_back = |file: Arc<File>| {
+                let to = DirectFile {
+                    file,
+                    direct: None,
+                    size,
+                };
+                transfer(Plan::new(chunks()), from, &to, pool, 1)
+            };
+            if path.exists() {
+                let (temp, file) = temp()?;
+                front_to_back(file)?;
+                Ok(temp.persist(path)?)
+            } else {
+                let file = File::options().write(true).create_new(true).open(path)?;
+                front_to_back(Arc::new(file)).inspect_err(|_| {
+                    let _ = std::fs::remove_file(path);
+                })
+            }
+        }
+        replaced => replaced,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refused(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM | libc::EINVAL)
+    )
 }
 
 impl Source for DirectFile {
