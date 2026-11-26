@@ -4,7 +4,14 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 
-from safetensors import TensorSpec, deserialize, safe_open, serialize, serialize_file
+from safetensors import (
+    FileLayout,
+    TensorSpec,
+    deserialize,
+    safe_open,
+    serialize,
+    serialize_file,
+)
 
 
 def _flatten(tensor_dict: Dict[str, np.ndarray]) -> Dict[str, TensorSpec]:
@@ -56,7 +63,7 @@ def save_file(
     tensor_dict: Dict[str, np.ndarray],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
-) -> None:
+) -> FileLayout:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
 
@@ -71,7 +78,9 @@ def save_file(
             tensors. This is purely informative and does not affect tensor loading.
 
     Returns:
-        `None`
+        `FileLayout`: where the file holds each tensor: `data_offset`, the start of
+        the data section, and `tensors`, each tensor's dtype, shape and offsets
+        within that section, by name, in file order.
 
     Example:
 
@@ -83,7 +92,7 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    serialize_file(_flatten(tensor_dict), filename, metadata=metadata)
+    return serialize_file(_flatten(tensor_dict), filename, metadata=metadata)
 
 
 def load(data: bytes) -> Dict[str, np.ndarray]:
