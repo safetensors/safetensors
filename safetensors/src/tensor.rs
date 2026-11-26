@@ -327,35 +327,32 @@ where
     V: View,
     I: IntoIterator<Item = (S, V)>,
 {
-    let (
-        PreparedData {
-            n,
-            header_bytes,
-            offset,
-            metadata,
-        },
-        _,
-    ) = prepare(data, data_info)?;
+    let (prepared, _) = prepare(data, data_info)?;
+    Ok(prepared.layout())
+}
 
-    let mut header = Vec::with_capacity(N_LEN + header_bytes.len());
-    header.extend(n.to_le_bytes());
-    header.extend(header_bytes);
+impl PreparedData {
+    fn layout(self) -> FileLayout {
+        let mut header = Vec::with_capacity(N_LEN + self.header_bytes.len());
+        header.extend(self.n.to_le_bytes());
+        header.extend(self.header_bytes);
 
-    let mut names = vec![String::new(); metadata.tensors.len()];
-    for (name, index) in metadata.index_map {
-        names[index] = name;
+        let mut names = vec![String::new(); self.metadata.tensors.len()];
+        for (name, index) in self.metadata.index_map {
+            names[index] = name;
+        }
+        let tensors = names
+            .into_iter()
+            .zip(self.metadata.tensors)
+            .map(|(name, info)| (name, info.data_offsets.0..info.data_offsets.1))
+            .collect();
+
+        FileLayout {
+            header,
+            tensors,
+            data_len: self.offset,
+        }
     }
-    let tensors = names
-        .into_iter()
-        .zip(metadata.tensors)
-        .map(|(name, info)| (name, info.data_offsets.0..info.data_offsets.1))
-        .collect();
-
-    Ok(FileLayout {
-        header,
-        tensors,
-        data_len: offset,
-    })
 }
 
 #[cfg(feature = "std")]
@@ -426,27 +423,24 @@ fn buffered_write_to_file<V: View>(
 /// Serialize to a regular file the dictionnary of tensors.
 /// Writing directly to file reduces the need to allocate the whole amount to
 /// memory.
+///
+/// Returns the [`FileLayout`] of the file written.
 #[cfg(feature = "std")]
 pub fn serialize_to_file<S, V, I>(
     data: I,
     data_info: Option<HashMap<String, String>>,
     filename: &std::path::Path,
-) -> Result<(), SafeTensorError>
+) -> Result<FileLayout, SafeTensorError>
 where
     S: AsRef<str> + Ord + Display,
     V: View,
     I: IntoIterator<Item = (S, V)>,
 {
-    let (
-        PreparedData {
-            n, header_bytes, ..
-        },
-        tensors,
-    ) = prepare(data, data_info)?;
+    let (prepared, tensors) = prepare(data, data_info)?;
 
-    buffered_write_to_file(filename, n, &header_bytes, &tensors)?;
+    buffered_write_to_file(filename, prepared.n, &prepared.header_bytes, &tensors)?;
 
-    Ok(())
+    Ok(prepared.layout())
 }
 
 /// A structure owning some metadata to lookup tensors on a shared `data`

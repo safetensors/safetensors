@@ -317,7 +317,7 @@ fn write_tensors(
     tensor_dict: &HashMap<String, Py<TensorSpec>>,
     metadata: Option<HashMap<String, String>>,
     filename: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<safetensors::tensor::FileLayout, String> {
     let layout = safetensors::tensor::file_layout(
         tensor_dict.iter().map(|(k, v)| (k.as_str(), v.get())),
         metadata,
@@ -341,7 +341,8 @@ fn write_tensors(
     // SAFETY: each spec holds a buffer of `data_len` bytes, the length of its
     // range, or vouches for as many at its device address (see `TensorSpec::cuda`)
     unsafe { engine::save(filename, &layout.header, &tensors, size, SAVE_THREADS) }
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(layout)
 }
 
 /// Serializes raw data into file.
@@ -359,8 +360,8 @@ fn write_tensors(
 ///         The optional purely text annotations
 ///
 /// Returns:
-///     (`NoneType`):
-///         On success return None
+///     (`FileLayout`):
+///         Where the file holds each tensor
 #[pyfunction]
 #[pyo3(signature = (tensor_dict, filename, metadata=None))]
 fn serialize_file(
@@ -368,10 +369,10 @@ fn serialize_file(
     tensor_dict: HashMap<String, Py<TensorSpec>>,
     filename: PathBuf,
     metadata: Option<HashMap<String, String>>,
-) -> PyResult<()> {
+) -> PyResult<FileLayout> {
     #[cfg(not(target_os = "linux"))]
     host_specs(&tensor_dict)?;
-    py.detach(|| {
+    let layout = py.detach(|| {
         #[cfg(target_os = "linux")]
         let written = write_tensors(&tensor_dict, metadata, &filename);
         #[cfg(not(target_os = "linux"))]
@@ -382,7 +383,30 @@ fn serialize_file(
         )
         .map_err(|e| e.to_string());
         written.map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
+    })?;
+    let tensors = PyDict::new(py);
+    for (name, range) in layout.tensors {
+        let spec = tensor_dict[&name].get();
+        let meta = TensorMeta {
+            dtype: spec.dtype.to_string(),
+            shape: spec.shape.clone(),
+            data_offsets: (range.start, range.end),
+        };
+        tensors.set_item(name, meta)?;
+    }
+    Ok(FileLayout {
+        data_offset: layout.header.len(),
+        tensors: tensors.unbind(),
     })
+}
+
+/// Where a file written by `serialize_file` holds its tensors.
+#[pyclass(frozen, get_all)]
+pub struct FileLayout {
+    /// Where the data section starts in the file
+    data_offset: usize,
+    /// Each tensor's header entry by name, in file order
+    tensors: Py<PyDict>,
 }
 
 /// Opens a safetensors lazily and returns tensors as asked
@@ -3640,6 +3664,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorStream>()?;
     m.add_class::<PrefetchLoader>()?;
     m.add_class::<TensorSpec>()?;
+    m.add_class::<FileLayout>()?;
     m.add_class::<TensorMeta>()?;
     m.add_class::<PySafeSlice>()?;
     m.add_class::<safe_open>()?;
