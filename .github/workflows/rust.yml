@@ -56,3 +56,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         # RUSTSEC-2021-0145 is criterion so only within benchmarks
         run: cargo audit -D warnings --ignore RUSTSEC-2021-0145
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
