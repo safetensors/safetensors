@@ -10,8 +10,12 @@ mod loader;
 mod memory;
 #[cfg(unix)]
 mod pool;
+#[cfg(target_os = "linux")]
+mod save;
 #[cfg(unix)]
 mod transfer;
+#[cfg(target_os = "linux")]
+pub use save::save;
 #[cfg(unix)]
 pub use {
     cuda_memory::available,

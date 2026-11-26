@@ -220,6 +220,34 @@ fn serialize<'b>(
     Ok(pybytes)
 }
 
+/// Threads that write a file in `serialize_file`
+#[cfg(target_os = "linux")]
+const SAVE_THREADS: usize = 16;
+
+/// Writes the file `serialize_to_file` writes, its header and tensor offsets
+/// from `file_layout`, the tensors' bytes from their buffers.
+#[cfg(target_os = "linux")]
+fn write_tensors(
+    tensor_dict: &HashMap<String, Py<TensorSpec>>,
+    metadata: Option<HashMap<String, String>>,
+    filename: &std::path::Path,
+) -> Result<(), String> {
+    let layout = safetensors::tensor::file_layout(
+        tensor_dict.iter().map(|(k, v)| (k.as_str(), v.get())),
+        metadata,
+    )
+    .map_err(|e| e.to_string())?;
+    let tensors: Vec<_> = layout
+        .tensors
+        .iter()
+        .map(|(name, range)| (range.clone(), tensor_dict[name].get().data.buf_ptr() as u64))
+        .collect();
+    let size = layout.header.len() + layout.data_len;
+    // SAFETY: each spec holds a buffer of `data_len` bytes, the length of its range
+    unsafe { engine::save(filename, &layout.header, &tensors, size, SAVE_THREADS) }
+        .map_err(|e| e.to_string())
+}
+
 /// Serializes raw data into file.
 ///
 /// Args:
@@ -243,15 +271,17 @@ fn serialize_file(
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
     py.detach(|| {
-        safetensors::tensor::serialize_to_file(
+        #[cfg(target_os = "linux")]
+        let written = write_tensors(&tensor_dict, metadata, &filename);
+        #[cfg(not(target_os = "linux"))]
+        let written = safetensors::tensor::serialize_to_file(
             tensor_dict.iter().map(|(k, v)| (k.as_str(), v.get())),
             metadata,
             filename.as_path(),
         )
-        .map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
-    })?;
-
-    Ok(())
+        .map_err(|e| e.to_string());
+        written.map_err(|e| SafetensorError::new_err(format!("Error while serializing: {e}")))
+    })
 }
 
 /// Opens a safetensors lazily and returns tensors as asked
