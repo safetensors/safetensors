@@ -8,7 +8,7 @@
 //! ```
 //!
 //! - spans [`LoadPlan::spans`]: a byte interval of the data section, copied to
-//!   its destination, or, with a [`Gather`], packed into it by the gather's
+//!   its destination, or, with a [`slice::Gather`], packed into it by the gather's
 //!   strided copies.
 //! - chunks ([`LoadPlan::chunks`]): at most [`CHUNK_SIZE`](super::transfer::CHUNK_SIZE) of adjacent spans,
 //!   never across a gap. The I/O unit: one read, one slab, one copy per run of
@@ -27,8 +27,11 @@ use std::{
     time::Duration,
 };
 
-use super::transfer::{Error, Fence, Sink, Staged};
-use safetensors::slice::{Gather, StridedCopy};
+use super::{
+    pool::Slab,
+    transfer::{Error, Fence, Sink, Source, Staged},
+};
+use safetensors::slice::{self, StridedCopy};
 
 /// A byte interval `start..end` of the file's data section
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +46,7 @@ pub struct LoadPlan {
     spans: Box<[Span]>,
     /// per span, the copies that pack its bytes into its destination; `None` for
     /// one plain copy
-    gathers: Box<[Option<Gather>]>,
+    gathers: Box<[Option<slice::Gather>]>,
     /// per span, the `chunks` that carry its bytes; empty for a zero-size span
     span_chunks: Box<[Range<usize>]>,
     /// data section byte interval of each chunk: at most [`CHUNK_SIZE`](super::transfer::CHUNK_SIZE) of
@@ -115,7 +118,7 @@ fn clip(copy: &StridedCopy, window: &Range<usize>) -> [Option<StridedCopy>; 3] {
 impl LoadPlan {
     pub fn new(
         spans: Vec<Span>,
-        gathers: Vec<Option<Gather>>,
+        gathers: Vec<Option<slice::Gather>>,
         in_file_offset: usize,
         chunk_size: NonZeroUsize,
     ) -> Self {
@@ -176,6 +179,38 @@ impl LoadPlan {
         let c = self.chunks.partition_point(|c| c.start < start);
         debug_assert_eq!(self.chunks.get(c).map(|c| c.start), Some(start));
         c
+    }
+
+    /// The spans that meet `file`, a byte range of the file
+    fn spans_in(&self, file: &Range<u64>) -> Range<usize> {
+        let (start, end) = (
+            file.start as usize - self.in_file_offset,
+            file.end as usize - self.in_file_offset,
+        );
+        let first = self.spans.partition_point(|s| s.end <= start);
+        first..first + self.spans[first..].partition_point(|s| s.start < end)
+    }
+
+    /// The copy of the bytes of span `s` in `file` from `addr`, where span `s`
+    /// is, to their offset in `file`
+    fn copy_from(&self, s: usize, file: &Range<u64>, addr: u64) -> Option<StridedCopy> {
+        assert!(
+            self.gathers[s].is_none(),
+            "a gather is copied to memory only"
+        );
+        let (span, at) = (self.spans[s], file.start as usize - self.in_file_offset);
+        let (start, end) = (
+            span.start.max(at),
+            span.end.min(file.end as usize - self.in_file_offset),
+        );
+        (start < end).then(|| StridedCopy {
+            src: addr as usize + (start - span.start),
+            dst: start - at,
+            width: end - start,
+            height: 1,
+            src_pitch: 0,
+            dst_pitch: 0,
+        })
     }
 
     /// Issues the copies of chunk `c` from its slab, sources as offsets in the slab
@@ -269,6 +304,31 @@ pub trait Scatter: Send + Sync {
     }
 }
 
+/// Copies chunks out of the memory a [`Memory`]'s destinations are in
+pub trait Gather: Send + Sync {
+    /// Copies bytes to `dst` as `copies` say: sources are addresses in this
+    /// memory, destinations offsets in `dst`. Complete on return.
+    fn gather(&self, dst: &mut [u8], copies: &[StridedCopy]) -> Result<(), Error>;
+}
+
+/// Host memory, copied by the worker
+#[cfg(all(test, target_os = "linux"))]
+pub struct Host;
+
+#[cfg(all(test, target_os = "linux"))]
+impl Gather for Host {
+    fn gather(&self, dst: &mut [u8], copies: &[StridedCopy]) -> Result<(), Error> {
+        for c in copies {
+            debug_assert_eq!(c.height, 1);
+            // SAFETY: `Memory::provide` requires the address readable for its
+            // span's bytes, which `c` is within
+            let src = unsafe { std::slice::from_raw_parts(c.src as *const u8, c.width) };
+            dst[c.dst..c.dst + c.width].copy_from_slice(src);
+        }
+        Ok(())
+    }
+}
+
 /// A chunk's copies once issued: their fence, `None` when they completed
 /// in [`Scatter::scatter`]
 type Issued = Option<Arc<dyn Fence>>;
@@ -333,9 +393,11 @@ impl<S> Memory<S> {
     /// # Safety
     ///
     /// Each address is valid for writes of its span's bytes (or its gather's
-    /// [`Gather::len`]) in this memory's space, until every copy to it
-    /// completed: [`Self::wait_landed`] returned for its span, or
-    /// [`Self::wait_copies`] once no worker is left.
+    /// [`slice::Gather::len`]) in this memory, until
+    /// every copy to it completed: [`Self::wait_landed`] returned for its
+    /// span, or [`Self::wait_copies`] once no worker is left. When the memory
+    /// is a [`Source`], each address is valid for reads of its span's bytes
+    /// until the transfer returns.
     pub unsafe fn provide(
         &self,
         addrs: impl ExactSizeIterator<Item = u64>,
@@ -424,6 +486,19 @@ impl<S> Memory<S> {
             .iter()
             .filter_map(|l| l.get().and_then(Option::as_ref))
             .try_for_each(|fence| fence.wait())
+    }
+}
+
+impl<S: Gather> Source for Memory<S> {
+    fn fill(&self, file: Range<u64>, mut slab: Slab) -> Result<Staged, Error> {
+        let len = (file.end - file.start) as usize;
+        let spans = self.plan.spans_in(&file);
+        self.wait_provided(spans.end)?;
+        let copies: Vec<StridedCopy> = spans
+            .filter_map(|s| self.plan.copy_from(s, &file, self.dest(s).addr))
+            .collect();
+        self.space.gather(&mut slab[..len], &copies)?;
+        Ok(Staged::new(slab, 0, file))
     }
 }
 
@@ -945,5 +1020,30 @@ mod tests {
         });
         assert_eq!(transfer.error().unwrap().to_string(), "copy failed");
         assert!(matches!(memory.wait_landed(0), Err(Error::Stopped)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_memory_gathers_any_window() {
+        // three tensors back to back, the middle one empty, read in windows that
+        // cut them
+        let tensors: [Vec<u8>; 3] = [(0..5).collect(), vec![], (5..12).collect()];
+        let plan = LoadPlan::new(
+            vec![sp(0, 5), sp(5, 5), sp(5, 12)],
+            vec![None; 3],
+            0,
+            NonZeroUsize::new(4).unwrap(),
+        );
+        let memory = Memory::new(plan, super::Host);
+        // SAFETY: each tensor outlives `memory`
+        unsafe { memory.provide(tensors.iter().map(|t| t.as_ptr() as u64), None) };
+        let pool = heap_pool(1, 16);
+        for window in [0..12, 0..3, 3..9, 5..6, 11..12] {
+            let staged = memory
+                .fill(window.clone(), pool.acquire().unwrap())
+                .unwrap();
+            let expected: Vec<u8> = (window.start as u8..window.end as u8).collect();
+            assert_eq!(staged.bytes(), expected, "{window:?}");
+        }
     }
 }
