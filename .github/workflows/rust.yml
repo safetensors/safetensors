@@ -12,24 +12,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Install Rust Stable
-        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
-        with:
-          toolchain: stable
-          components: rustfmt
-
-      - name: Check formatting
-        working-directory: ./safetensors
-        run: cargo fmt --all -- --check
-
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -46,7 +28,7 @@ jobs:
         uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # stable
         with:
           toolchain: stable
-          components: clippy
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
@@ -74,3 +56,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         # RUSTSEC-2021-0145 is criterion so only within benchmarks
         run: cargo audit -D warnings --ignore RUSTSEC-2021-0145
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
