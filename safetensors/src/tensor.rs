@@ -489,7 +489,7 @@ impl<'data> SafeTensors<'data> {
         let metadata: HashMetadata =
             serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
         let metadata: Metadata = metadata.try_into()?;
-        let buffer_end = metadata.validate()?;
+        let buffer_end = metadata.data_len();
         if buffer_end + N_LEN + n != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
@@ -698,7 +698,7 @@ impl Metadata {
         Ok(metadata)
     }
 
-    fn validate(&self) -> Result<usize, SafeTensorError> {
+    fn validate(&self) -> Result<(), SafeTensorError> {
         let mut start = 0;
         for (i, info) in self.tensors.iter().enumerate() {
             let (s, e) = info.data_offsets;
@@ -734,7 +734,7 @@ impl Metadata {
                 return Err(SafeTensorError::TensorInvalidInfo);
             }
         }
-        Ok(start)
+        Ok(())
     }
 
     /// Gives back the tensor metadata
