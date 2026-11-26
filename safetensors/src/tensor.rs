@@ -698,7 +698,7 @@ impl Metadata {
         Ok(metadata)
     }
 
-    fn validate(&self) -> Result<usize, SafeTensorError> {
+    fn validate(&self) -> Result<(), SafeTensorError> {
         let mut start = 0;
         for (i, info) in self.tensors.iter().enumerate() {
             let (s, e) = info.data_offsets;
@@ -734,7 +734,7 @@ impl Metadata {
                 return Err(SafeTensorError::TensorInvalidInfo);
             }
         }
-        Ok(start)
+        Ok(())
     }
 
     /// Gives back the tensor metadata
