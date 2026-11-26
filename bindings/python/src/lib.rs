@@ -58,11 +58,51 @@ static TORCH_MPS_DLPACK: OnceLock<bool> = OnceLock::new();
 /// (e.g. a numpy array, `bytes` or a `memoryview`): C-contiguous, in
 /// little-endian order, as many bytes as `dtype` and `shape` take. The spec
 /// holds the buffer, which keeps the memory alive until the spec is dropped.
+///
+/// `TensorSpec.cuda` describes a tensor on a CUDA device: only
+/// `serialize_file`, on Linux, reads such a spec.
 #[pyclass(frozen)]
 struct TensorSpec {
     dtype: Dtype,
     shape: Vec<usize>,
-    data: PyUntypedBuffer,
+    data: Data,
+}
+
+/// Where a spec's bytes are
+enum Data {
+    Host(PyUntypedBuffer),
+    /// `len` bytes at `ptr` on a CUDA device, which `_owner` keeps alive
+    Cuda {
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        ptr: u64,
+        len: usize,
+        device: i32,
+        _owner: Py<PyAny>,
+    },
+}
+
+/// The header's dtype and shape for a framework's, and the bytes they take
+fn spec_layout(dtype: &str, mut shape: Vec<usize>) -> PyResult<(Dtype, Vec<usize>, usize)> {
+    let dtype = parse_dtype_str(dtype)?;
+    // F4 packs two elements per byte; the safetensors header records the
+    // logical element count, so double the last dim.
+    if dtype == Dtype::F4 && !shape.is_empty() {
+        let n = shape.len();
+        shape[n - 1] = shape[n - 1].checked_mul(2).ok_or_else(|| {
+            SafetensorError::new_err(format!(
+                "F4 last-dim {} doubled to logical shape overflows usize",
+                shape[n - 1]
+            ))
+        })?;
+    }
+    let len = shape
+        .iter()
+        .try_fold(dtype.bitsize(), |bits, dim| bits.checked_mul(*dim))
+        .ok_or_else(|| {
+            SafetensorError::new_err(format!("{dtype} of shape {shape:?} overflows usize"))
+        })?
+        .div_ceil(8);
+    Ok((dtype, shape, len))
 }
 
 #[pymethods]
@@ -70,34 +110,50 @@ impl TensorSpec {
     #[new]
     #[pyo3(signature = (*, dtype, shape, data))]
     fn new(dtype: &str, shape: Vec<usize>, data: &PyBound<'_, PyAny>) -> PyResult<Self> {
-        let dtype = parse_dtype_str(dtype)?;
-        let mut shape = shape;
-        // F4 packs two elements per byte; the safetensors header records the
-        // logical element count, so double the last dim.
-        if dtype == Dtype::F4 && !shape.is_empty() {
-            let n = shape.len();
-            shape[n - 1] = shape[n - 1].checked_mul(2).ok_or_else(|| {
-                SafetensorError::new_err(format!(
-                    "F4 last-dim {} doubled to logical shape overflows usize",
-                    shape[n - 1]
-                ))
-            })?;
-        }
+        let (dtype, shape, len) = spec_layout(dtype, shape)?;
         let data = PyUntypedBuffer::get(data)?;
         if !data.is_c_contiguous() {
             return Err(SafetensorError::new_err("data is not C-contiguous"));
         }
-        let expected = shape
-            .iter()
-            .try_fold(dtype.bitsize(), |bits, dim| bits.checked_mul(*dim))
-            .map(|bits| bits.div_ceil(8));
-        if expected != Some(data.len_bytes()) {
+        if data.len_bytes() != len {
             return Err(SafetensorError::new_err(format!(
                 "data is {} bytes, which {dtype} of shape {shape:?} is not",
                 data.len_bytes()
             )));
         }
-        Ok(Self { dtype, shape, data })
+        Ok(Self {
+            dtype,
+            shape,
+            data: Data::Host(data),
+        })
+    }
+
+    /// Describes a tensor on CUDA device `device`: `data_ptr` is the device
+    /// address of its bytes, as many as `dtype` and `shape` take, and the spec
+    /// holds `owner` to keep them alive.
+    ///
+    /// SAFETY: `data_ptr` is a raw device address. The caller must ensure it
+    /// is valid for as long as `owner` is alive.
+    #[staticmethod]
+    #[pyo3(signature = (*, dtype, shape, owner, data_ptr, device))]
+    fn cuda(
+        dtype: &str,
+        shape: Vec<usize>,
+        owner: Py<PyAny>,
+        data_ptr: u64,
+        device: i32,
+    ) -> PyResult<Self> {
+        let (dtype, shape, len) = spec_layout(dtype, shape)?;
+        Ok(Self {
+            dtype,
+            shape,
+            data: Data::Cuda {
+                ptr: data_ptr,
+                len,
+                device,
+                _owner: owner,
+            },
+        })
     }
 
     /// The tensor's dtype as its safetensors format code (e.g. `"F32"`, `"BF16"`,
@@ -119,16 +175,43 @@ impl TensorSpec {
     /// The length of the tensor's buffer in bytes.
     #[getter]
     fn data_len(&self) -> usize {
-        self.data.len_bytes()
+        match &self.data {
+            Data::Host(buffer) => buffer.len_bytes(),
+            Data::Cuda { len, .. } => *len,
+        }
+    }
+
+    /// The index of the CUDA device the tensor is on, `None` for host memory.
+    #[getter]
+    fn device(&self) -> Option<i32> {
+        match self.data {
+            Data::Host(_) => None,
+            Data::Cuda { device, .. } => Some(device),
+        }
     }
 
     fn __repr__(&self) -> String {
+        let device = match self.device() {
+            Some(d) => format!(", device={d}"),
+            None => String::new(),
+        };
         format!(
-            "TensorSpec(dtype='{}', shape={:?}, data_len={})",
+            "TensorSpec(dtype='{}', shape={:?}, data_len={}{device})",
             self.dtype(),
             self.shape,
             self.data_len()
         )
+    }
+}
+
+/// Fails on a spec in device memory, which only `serialize_file` on Linux reads.
+fn host_specs(tensor_dict: &HashMap<String, Py<TensorSpec>>) -> PyResult<()> {
+    match tensor_dict.iter().find(|(_, v)| v.get().device().is_some()) {
+        Some((name, _)) => Err(SafetensorError::new_err(format!(
+            "Error while serializing: {name} is in device memory, which only \
+             serialize_file on Linux reads"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -142,17 +225,19 @@ impl View for &TensorSpec {
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        let len = self.data.len_bytes();
+        let Data::Host(buffer) = &self.data else {
+            panic!("device memory read as host memory")
+        };
+        let len = buffer.len_bytes();
         if len == 0 {
             return Cow::Borrowed(&[]);
         }
-        // SAFETY: the buffer `self` holds keeps `len` contiguous bytes alive at
-        // this address
-        Cow::Borrowed(unsafe { slice::from_raw_parts(self.data.buf_ptr() as *const u8, len) })
+        // SAFETY: `buffer` keeps `len` contiguous bytes alive at this address
+        Cow::Borrowed(unsafe { slice::from_raw_parts(buffer.buf_ptr() as *const u8, len) })
     }
 
     fn data_len(&self) -> usize {
-        self.data.len_bytes()
+        TensorSpec::data_len(self)
     }
 }
 
@@ -208,6 +293,7 @@ fn serialize<'b>(
     tensor_dict: HashMap<String, Py<TensorSpec>>,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<PyBound<'b, PyBytes>> {
+    host_specs(&tensor_dict)?;
     let out = py
         .detach(|| {
             safetensors::tensor::serialize(
@@ -240,15 +326,28 @@ fn write_tensors(
     let tensors: Vec<_> = layout
         .tensors
         .iter()
-        .map(|(name, range)| (range.clone(), tensor_dict[name].get().data.buf_ptr() as u64))
+        .map(|(name, range)| match &tensor_dict[name].get().data {
+            Data::Host(buffer) => (
+                range.clone(),
+                buffer.buf_ptr() as u64,
+                engine::Location::Host,
+            ),
+            Data::Cuda { ptr, device, .. } => {
+                (range.clone(), *ptr, engine::Location::Cuda(*device))
+            }
+        })
         .collect();
     let size = layout.header.len() + layout.data_len;
-    // SAFETY: each spec holds a buffer of `data_len` bytes, the length of its range
+    // SAFETY: each spec holds a buffer of `data_len` bytes, the length of its
+    // range, or vouches for as many at its device address (see `TensorSpec::cuda`)
     unsafe { engine::save(filename, &layout.header, &tensors, size, SAVE_THREADS) }
         .map_err(|e| e.to_string())
 }
 
 /// Serializes raw data into file.
+///
+/// On Linux, a tensor on a CUDA device (`TensorSpec.cuda`) is read from the
+/// device: work that writes it must be complete before the call.
 ///
 /// Args:
 ///     tensor_dict (`Dict[str, TensorSpec]`):
@@ -270,6 +369,8 @@ fn serialize_file(
     filename: PathBuf,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    host_specs(&tensor_dict)?;
     py.detach(|| {
         #[cfg(target_os = "linux")]
         let written = write_tensors(&tensor_dict, metadata, &filename);
