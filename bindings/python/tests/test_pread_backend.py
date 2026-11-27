@@ -246,10 +246,15 @@ class PreadBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "devices, not cpu"):
                 f.prefetch()
 
-    def test_prefetch_requires_pt(self):
-        with safe_open(self.path, framework="numpy", backend="pread") as f:
-            with self.assertRaisesRegex(Exception, 'framework="pt"'):
+    def test_prefetch_requires_pt_np_or_mlx(self):
+        with safe_open(self.path, framework="flax", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, 'framework="pt", "np" and "mlx"'):
                 f.prefetch()
+
+    def test_prefetch_numpy_requires_cpu(self):
+        with safe_open(self.path, framework="numpy", backend="pread") as f:
+            with self.assertRaisesRegex(Exception, "to the cpu, not cuda:0"):
+                f.prefetch(device="cuda:0")
 
     def test_prefetch_requires_cuda(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:

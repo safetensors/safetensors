@@ -1,5 +1,5 @@
-//! CUDA prefetch: load spans of a safetensors data section into device memory
-//! the caller allocates as the load advances, in the background, and hand each
+//! Prefetch: load spans of a safetensors data section into device or host
+//! memory the caller allocates as the load advances, in the background, and hand each
 //! span's owner back, once, as its bytes land.
 //!
 //! Data flow, per file:
@@ -47,7 +47,6 @@ use super::{
     pool::SlabPool,
     transfer::{self, Error, Plan, Sink, CHUNK_SIZE},
 };
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::{memory::Host, pool::HostMemory, pool::SLAB_SIZE};
 use safetensors::slice::Gather;
 
@@ -311,7 +310,6 @@ impl<D: Send + 'static> Loader<D> {
 
     /// As [`Self::load`], to host memory: destinations are host addresses, and
     /// [`Feed::provide`] ignores its stream.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn load_host(
         file: Arc<File>,
         direct: Option<bool>,

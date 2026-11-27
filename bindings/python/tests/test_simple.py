@@ -1,11 +1,13 @@
 import errno
 import importlib
+import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -228,6 +230,78 @@ class TestCase(unittest.TestCase):
                     sys.platform in ("linux", "darwin") and sys.byteorder == "little"
                 )
                 self.assertEqual(loaded["large"].flags.owndata, parallel)
+
+    @unittest.skipIf(
+        sys.platform == "win32" or sys.byteorder == "big", "needs the engine"
+    )
+    def test_prefetch_numpy(self):
+        tensors = {
+            "scalar": np.array(3, dtype=np.int64),
+            "empty": np.zeros((2, 0), dtype=np.float32),
+            "bool": np.arange(11) % 3 == 0,
+            "large": np.arange(5 << 20, dtype=np.float64).reshape(-1, 4),
+        }
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.safetensors")
+            save_file(tensors, path)
+            with safe_open(path, framework="np") as f:
+                with f.prefetch() as loader:
+                    loaded = dict(loader)
+                self.assertEqual(loaded.keys(), tensors.keys())
+                for name, tensor in tensors.items():
+                    self.assertEqual(loaded[name].dtype, tensor.dtype)
+                    np.testing.assert_array_equal(loaded[name], tensor)
+                with f.prefetch({"large": slice(10, 20), "bool": None}) as loader:
+                    self.assertEqual(loader.names(), ["large", "bool"])
+                    np.testing.assert_array_equal(
+                        loader.take("large"), tensors["large"][10:20]
+                    )
+                    with self.assertRaisesRegex(SafetensorError, "already"):
+                        loader.take("large")
+
+    @unittest.skipIf(
+        sys.platform == "win32" or sys.byteorder == "big", "needs the engine"
+    )
+    def test_prefetch_numpy_allocates_as_the_load_advances(self):
+        # more than the 1 GiB allocated at `prefetch`: the rest is allocated in
+        # the background. A sparse file: only the first byte of each tensor is
+        # written.
+        count, size = 40, 32 << 20
+        header = {
+            f"t{i:02d}": {
+                "dtype": "U8",
+                "shape": [size],
+                "data_offsets": [i * size, (i + 1) * size],
+            }
+            for i in range(count)
+        }
+        header = json.dumps(header).encode()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.safetensors")
+            with open(path, "wb") as f:
+                f.write(len(header).to_bytes(8, "little") + header)
+                data = f.tell()
+                for i in range(count):
+                    f.seek(data + i * size)
+                    f.write(bytes([i + 1]))
+                f.truncate(data + count * size)
+            threads = []
+
+            def empty(*args, **kwargs):
+                threads.append(threading.get_ident())
+                return np_empty(*args, **kwargs)
+
+            np_empty = np.empty
+            with safe_open(path, framework="np") as f:
+                with mock.patch.object(np, "empty", empty), f.prefetch() as loader:
+                    for i in range(count):
+                        tensor = loader.take(f"t{i:02d}")
+                        self.assertEqual(tensor.shape, (size,))
+                        self.assertEqual(tensor[0], i + 1)
+                        self.assertFalse(tensor[1:].any())
+            self.assertEqual(len(threads), count)
+            self.assertEqual(threads[0], threading.get_ident())
+            self.assertNotEqual(threads[-1], threading.get_ident())
 
     def test_pt_sf_save_model_overlapping_storage(self):
         m = torch.randn(10)
