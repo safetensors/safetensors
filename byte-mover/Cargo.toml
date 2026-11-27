@@ -1,0 +1,23 @@
+[package]
+name = "byte-mover"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.86"
+repository = "https://github.com/safetensors/safetensors"
+license = "Apache-2.0"
+publish = false
+description = """
+Reads byte ranges of files into memory the caller owns: requests are queued,
+run by a pool of threads or an io_uring, and reaped one by one.
+"""
+
+[features]
+default = ["io-uring"]
+# The io_uring backend, on Linux
+io-uring = ["dep:io-uring"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
