@@ -1,5 +1,6 @@
 import platform
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -83,6 +84,31 @@ class LoadTestCase(unittest.TestCase):
         loaded = load(save({"a": np.arange(4, dtype=">i4")}))
         self.assertEqual(loaded["a"].dtype, mx.int32)
         self.assertTrue(mx.array_equal(loaded["a"], mx.arange(4)))
+
+    def test_load_file_reads_every_shape(self):
+        # a scalar, an empty tensor, and one of several 16 MiB chunks: the file
+        # is large enough to be read in parallel
+        data = {
+            "scalar": mx.array(3, dtype=mx.int64),
+            "empty": mx.zeros((2, 0), dtype=mx.float32),
+            "bool": mx.arange(11) % 3 == 0,
+            "bf16": mx.arange(-8, 8, dtype=mx.float32).astype(mx.bfloat16),
+            "large": mx.arange(10 << 20, dtype=mx.float32),
+        }
+        local = "./tests/data/mlx_shapes.safetensors"
+        save_file(data, local)
+        for backend in ["mmap", "pread"]:
+            with mock.patch.object(mx, "zeros", wraps=mx.zeros) as zeros:
+                loaded = load_file(local, backend=backend)
+            # the parallel read allocates the arrays on the CPU stream
+            self.assertEqual(zeros.call_count, len(data))
+            for call in zeros.call_args_list:
+                self.assertEqual(call.kwargs["stream"], mx.cpu)
+            self.assertEqual(loaded.keys(), data.keys())
+            for k, v in data.items():
+                self.assertEqual(loaded[k].dtype, v.dtype)
+                self.assertEqual(loaded[k].shape, v.shape)
+                self.assertTrue(mx.array_equal(loaded[k], v))
 
     def test_deserialization_safe_open(self):
         weights = {}

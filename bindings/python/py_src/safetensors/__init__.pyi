@@ -397,7 +397,7 @@ class safe_open:
         fast path. On a CUDA device with PyTorch, and on Apple-silicon MPS with
         torch 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
         and the `"pread"` backend, or with numpy and either backend, on Linux and
-        macOS, it reads a file larger than 2 MiB in parallel.
+        macOS, it reads a file larger than 2 MiB in parallel. So it does with MLX on macOS.
 
         Returns:
             (`Dict[str, Tensor]`):
