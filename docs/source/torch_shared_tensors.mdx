@@ -95,6 +95,11 @@ We're going to look for all shared tensors, then looking for all tensors
 covering the entire buffer (there can be multiple such tensors).
 That gives us multiple names which can be saved, we simply choose the first one
 
+Shared weights can include transposed views, such as an autoencoder whose decoder
+uses the transpose of its encoder's weight. `save_model` handles these views with
+its default `force_contiguous=True`, provided at least one shared tensor covers
+the entire storage. The model passed to `load_model` must define the same sharing.
+
 During `load_model`, we are loading a bit like `load_state_dict` does, except
 we're looking into the model itself, to check for shared buffers, and ignoring
 the "missed keys" which were actually covered by virtue of buffer sharing (they
