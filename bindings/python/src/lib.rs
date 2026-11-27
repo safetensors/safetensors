@@ -2273,16 +2273,20 @@ impl Open {
     /// Default behavior is a sequential loop over `get_tensor`. Pytorch loads
     /// through [`Open::prefetch`] on a CUDA device when a CUDA runtime is loaded,
     /// and on MPS when torch takes Metal buffers and the file's dtypes. Pytorch
-    /// on the CPU with the `pread` backend on Linux and macOS reads a file larger
-    /// than [`PARALLEL_READ_MIN`] in parallel, see [`Self::get_tensors_pread_cpu`].
+    /// on the CPU with the `pread` backend, and numpy with either backend, on Linux
+    /// and macOS read a file larger than [`PARALLEL_READ_MIN`] in parallel, see
+    /// [`Self::get_tensors_read_cpu`].
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         #[cfg(all(unix, target_endian = "little"))]
-        if self.framework == Framework::Pytorch
-            && self.device == Device::Cpu
-            && self.metadata.data_len() > PARALLEL_READ_MIN
-        {
-            if let Storage::Pread(file) = self.storage.as_ref() {
-                if let Some(tensors) = self.get_tensors_pread_cpu(file)? {
+        if self.device == Device::Cpu && self.metadata.data_len() > PARALLEL_READ_MIN {
+            let parallel = match self.framework {
+                // the mmap backend hands out views of the mapping
+                Framework::Pytorch => matches!(self.storage.as_ref(), Storage::Pread(_)),
+                Framework::Numpy => true,
+                _ => false,
+            };
+            if parallel {
+                if let Some(tensors) = self.get_tensors_read_cpu()? {
                     return Ok(tensors);
                 }
             }
@@ -2322,19 +2326,23 @@ impl Open {
         })
     }
 
-    /// Allocates every tensor with torch, then reads the file into them in
-    /// parallel. `None` when a dtype needs the per-tensor path: `F4`, or one torch
-    /// lacks.
+    /// Allocates every tensor with torch or numpy, then reads the file into them
+    /// in parallel. `None` when a dtype needs the per-tensor path: `F4`, or one
+    /// the framework lacks.
     #[cfg(all(unix, target_endian = "little"))]
-    fn get_tensors_pread_cpu(&self, file: &Arc<File>) -> PyResult<Option<Py<PyDict>>> {
+    fn get_tensors_read_cpu(&self) -> PyResult<Option<Py<PyDict>>> {
         Python::attach(|py| {
-            let torch = get_module(py, &TORCH_MODULE)?;
+            let numpy = self.framework != Framework::Pytorch;
+            let module = match numpy {
+                true => get_module(py, &NUMPY_MODULE)?,
+                false => get_module(py, &TORCH_MODULE)?,
+            };
             let mut infos = Vec::new();
             for name in self.metadata.offset_keys() {
                 let info = self.metadata.info(&name).ok_or_else(|| {
                     SafetensorError::new_err(format!("File does not contain tensor {name}"))
                 })?;
-                match get_pydtype(torch, info.dtype, false) {
+                match get_pydtype(module, info.dtype, numpy) {
                     Ok(dtype) if info.dtype != Dtype::F4 => infos.push((name, info, dtype)),
                     _ => return Ok(None),
                 }
@@ -2344,13 +2352,20 @@ impl Open {
             for (name, info, dtype) in infos {
                 let kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
                 let shape = info.shape.clone();
-                let tensor = torch.call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?;
+                let tensor = module.call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?;
                 let (start, end) = info.data_offsets;
-                let ptr: u64 = tensor.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                let ptr: u64 = match numpy {
+                    true => tensor
+                        .getattr(intern!(py, "__array_interface__"))?
+                        .get_item(intern!(py, "data"))?
+                        .get_item(0)?
+                        .extract()?,
+                    false => tensor.call_method0(intern!(py, "data_ptr"))?.extract()?,
+                };
                 tensors.push((start..end, ptr));
                 dict.set_item(name, tensor)?;
             }
-            let file = file.clone();
+            let file = self.file.clone();
             // SAFETY: each address is a tensor just allocated with its range's
             // bytes, which `dict` keeps alive and only this call accesses
             let read = py.detach(|| unsafe {
@@ -2638,8 +2653,8 @@ impl safe_open {
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
     /// each. On a CUDA device with PyTorch, and on Apple-silicon MPS with torch
     /// 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
-    /// and the `"pread"` backend, on Linux and macOS, it reads a file larger than
-    /// 2 MiB in parallel.
+    /// and the `"pread"` backend, or with numpy and either backend, on Linux and
+    /// macOS, it reads a file larger than 2 MiB in parallel.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):
