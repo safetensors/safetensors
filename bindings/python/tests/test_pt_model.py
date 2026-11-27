@@ -175,6 +175,23 @@ class TorchModelTestCase(unittest.TestCase):
         for k, v in model2.state_dict().items():
             torch.testing.assert_close(v, state_dict[k])
 
+    def test_save_does_not_mutate_metadata(self):
+        model = OnesModel()
+        metadata = {"format": "pt"}
+
+        save_model(model, "tmp_ones.safetensors", metadata=metadata)
+
+        self.assertEqual(metadata, {"format": "pt"})
+        with safe_open("tmp_ones.safetensors", framework="pt") as f:
+            self.assertEqual(
+                f.metadata(),
+                {
+                    "format": "pt",
+                    "b.bias": "a.bias",
+                    "b.weight": "a.weight",
+                },
+            )
+
     def test_workaround(self):
         model = Model()
         save_model(model, "tmp.safetensors")
