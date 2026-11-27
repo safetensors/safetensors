@@ -2,6 +2,8 @@ import os
 import platform
 import tempfile
 
+import pytest
+
 
 if platform.system() == "Darwin":
     import mlx.core as mx
@@ -51,6 +53,37 @@ if platform.system() == "Darwin":
         with tempfile.NamedTemporaryFile(delete=False) as f:
             save_file(weights, f.name)
             result = benchmark(load_file, f.name)
+        os.unlink(f.name)
+
+        for k, v in weights.items():
+            tv = result[k]
+            assert mx.allclose(v, tv)
+
+    def _metal_available() -> bool:
+        return mx.metal.is_available()
+
+    @pytest.mark.skipif(not _metal_available(), reason="requires metal")
+    def test_mlx_sf_load_mps(benchmark):
+        # benchmark something
+        weights = create_gpt2(12)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            save_file(weights, f.name)
+            result = benchmark(load_file, f.name, device="mps")
+        os.unlink(f.name)
+
+        for k, v in weights.items():
+            tv = result[k]
+            assert mx.allclose(v, tv)
+
+    @pytest.mark.skipif(not _metal_available(), reason="requires metal")
+    def test_mlx_sf_load_mps_pread(benchmark):
+        # On Apple-silicon MPS, get_tensors() allocates Shared MTLBuffers and
+        # parallel-preads into them, then hands off to MLX via DLPack. The
+        # `backend` kwarg selects how bytes are sourced (pread here).
+        weights = create_gpt2(12)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            save_file(weights, f.name)
+            result = benchmark(load_file, f.name, device="mps", backend="pread")
         os.unlink(f.name)
 
         for k, v in weights.items():
