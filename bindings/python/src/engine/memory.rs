@@ -489,15 +489,22 @@ impl<S> Memory<S> {
     }
 }
 
+impl<S: Gather> Memory<S> {
+    /// Copies the bytes of `file` its spans hold to `dst`, leaving the rest.
+    pub fn gather_into(&self, file: &Range<u64>, dst: &mut [u8]) -> Result<(), Error> {
+        let spans = self.plan.spans_in(file);
+        self.wait_provided(spans.end)?;
+        let copies: Vec<StridedCopy> = spans
+            .filter_map(|s| self.plan.copy_from(s, file, self.dest(s).addr))
+            .collect();
+        self.space.gather(dst, &copies)
+    }
+}
+
 impl<S: Gather> Source for Memory<S> {
     fn fill(&self, file: Range<u64>, mut slab: Slab) -> Result<Staged, Error> {
         let len = (file.end - file.start) as usize;
-        let spans = self.plan.spans_in(&file);
-        self.wait_provided(spans.end)?;
-        let copies: Vec<StridedCopy> = spans
-            .filter_map(|s| self.plan.copy_from(s, &file, self.dest(s).addr))
-            .collect();
-        self.space.gather(&mut slab[..len], &copies)?;
+        self.gather_into(&file, &mut slab[..len])?;
         Ok(Staged::new(slab, 0, file))
     }
 }

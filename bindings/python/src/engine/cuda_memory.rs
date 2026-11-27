@@ -8,7 +8,7 @@ use std::sync::{
 
 use super::{
     cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream},
-    memory::Scatter,
+    memory::{Gather, Scatter},
     pool::{Backing, SlabPool, SLAB_SIZE},
     transfer::{Error, Fence, Staged},
 };
@@ -149,6 +149,25 @@ impl Scatter for CudaDevice {
 
     fn allocation_end(&self, addr: u64) -> Option<u64> {
         self.api.allocation_end(addr)
+    }
+}
+
+impl Gather for CudaDevice {
+    fn gather(&self, dst: &mut [u8], copies: &[StridedCopy]) -> Result<(), Error> {
+        let api = self.api;
+        let done = api.with_device(self.device, |d| {
+            let issued = copies.iter().try_for_each(|c| {
+                let to = dst[c.dst..c.dst + c.width].as_mut_ptr();
+                api.memcpy_d2h_async(to, c.src as u64, c.width, self.stream)
+            });
+            let done = issued.and_then(|()| CudaEvent::record_on(api, d, self.stream));
+            if done.is_err() {
+                // `dst` is the caller's again on return: nothing may write it
+                let _ = api.stream_sync(self.stream);
+            }
+            done
+        })?;
+        done.wait()
     }
 }
 
