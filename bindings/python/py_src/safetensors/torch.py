@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from safetensors import (
+    FileLayout,
     TensorSpec,
     deserialize,
     safe_open,
@@ -147,7 +148,7 @@ def save_model(
     filename: str,
     metadata: Optional[Dict[str, str]] = None,
     force_contiguous: bool = True,
-):
+) -> FileLayout:
     """
     Saves a given torch model to specified filename.
     This method exists specifically to avoid tensor sharing issues which are
@@ -168,6 +169,9 @@ def save_model(
             This has no effect on the correctness of the model, but it
             could potentially change performance if the layout of the tensor
             was chosen specifically for that reason.
+
+    Returns:
+        `FileLayout`: where the file holds each tensor, see [`save_file`].
     """
     state_dict = model.state_dict()
     to_removes = _remove_duplicate_names(state_dict)
@@ -184,7 +188,7 @@ def save_model(
     if force_contiguous:
         state_dict = {k: v.contiguous() for k, v in state_dict.items()}
     try:
-        save_file(state_dict, filename, metadata=metadata)
+        return save_file(state_dict, filename, metadata=metadata)
     except ValueError as e:
         msg = str(e)
         msg += " Or use save_model(..., force_contiguous=True), read the docs for potential caveats."
@@ -286,7 +290,7 @@ def save_file(
     tensors: Dict[str, torch.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
-):
+) -> FileLayout:
     """
     Saves a dictionary of tensors into `filename` in safetensors format.
     There is no mechanism in place to prevent the caller from modifying the data while a file save occurs,
@@ -304,7 +308,9 @@ def save_file(
             tensors. This is purely informative and does not affect tensor loading.
 
     Returns:
-        `None`
+        `FileLayout`: where the file holds each tensor: `data_offset`, the start of
+        the data section, and `tensors`, each tensor's dtype, shape and offsets
+        within that section, by name, in file order.
 
     Example:
 
@@ -316,7 +322,9 @@ def save_file(
     save_file(tensors, "model.safetensors")
     ```
     """
-    serialize_file(_flatten(tensors), filename, metadata=metadata)
+    return serialize_file(
+        _flatten(tensors, from_cuda=_SAVE_FROM_CUDA), filename, metadata=metadata
+    )
 
 
 def load_file(
@@ -530,9 +538,20 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
         )
 
 
-def _flatten(tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorSpec]:
+# `serialize_file` reads tensors on CUDA devices itself on Linux
+_SAVE_FROM_CUDA = (
+    sys.platform.startswith("linux")
+    and sys.byteorder == "little"
+    and torch.version.cuda is not None
+)
+
+
+def _flatten(
+    tensors: Dict[str, torch.Tensor], from_cuda: bool = False
+) -> Dict[str, TensorSpec]:
     _evaluate_tensors_for_save(tensors)
     flattened = {}
+    synchronized = set()
     for k, v in tensors.items():
         # XXX: doing this check later on instead of in _evaluate_tensors_for_save
         # since on old versions of torch, SparseTensorImpl do not implement is_contiguous
@@ -544,6 +563,20 @@ def _flatten(tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorSpec]:
                 " only the full tensors, and reslice at load time, or simply call `.contiguous()` on your tensor to"
                 " pack it before saving."
             )
+        if from_cuda and v.device.type == "cuda":
+            v = v.detach().resolve_conj().resolve_neg()
+            # the tensor is read once the work queued on it so far completed
+            if v.device not in synchronized:
+                torch.cuda.current_stream(v.device).synchronize()
+                synchronized.add(v.device)
+            flattened[k] = TensorSpec.cuda(
+                dtype=str(v.dtype).split(".")[-1],
+                shape=v.shape,
+                owner=v,
+                data_ptr=v.data_ptr(),
+                device=v.device.index,
+            )
+            continue
         flattened[k] = TensorSpec(
             dtype=str(v.dtype).split(".")[-1],
             shape=v.shape,

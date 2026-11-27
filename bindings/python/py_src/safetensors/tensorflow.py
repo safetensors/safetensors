@@ -4,7 +4,7 @@ from typing import Dict, Optional, Union
 import numpy as np
 import tensorflow as tf
 
-from safetensors import numpy, safe_open
+from safetensors import FileLayout, numpy, safe_open
 
 
 def save(
@@ -42,7 +42,7 @@ def save_file(
     tensors: Dict[str, tf.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
-) -> None:
+) -> FileLayout:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
 
@@ -57,7 +57,9 @@ def save_file(
             tensors. This is purely informative and does not affect tensor loading.
 
     Returns:
-        `None`
+        `FileLayout`: where the file holds each tensor: `data_offset`, the start of
+        the data section, and `tensors`, each tensor's dtype, shape and offsets
+        within that section, by name, in file order.
 
     Example:
 

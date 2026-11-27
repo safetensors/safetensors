@@ -5,7 +5,7 @@
 #   - `__version__: str`
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
 #   - the `prefetch` method on `safe_open` and the `PrefetchLoader` class
-#   - the `PrefetchPlan` alias and the `TensorMeta` / `PySafeSlice` classes
+#   - the `PrefetchPlan` alias and the `FileLayout` / `TensorMeta` / `PySafeSlice` classes
 #
 # TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
 # `tools/stub-gen` binary using `pyo3-introspection`,
@@ -61,7 +61,7 @@ def serialize_file(
     tensor_dict: Dict[str, TensorSpec],
     filename: Union[str, "os.PathLike[str]"],
     metadata: Optional[Dict[str, str]] = None,
-) -> None:
+) -> FileLayout:
     """
     Serializes raw data into file.
 
@@ -78,8 +78,8 @@ def serialize_file(
             The optional purely text annotations
 
     Returns:
-        (`NoneType`):
-            On success return None
+        (`FileLayout`):
+            Where the file holds each tensor
     """
     pass
 
@@ -165,6 +165,14 @@ class TensorSpec:
         the last-dim-doubled version of whatever was passed to the constructor.
         """
         pass
+
+class FileLayout:
+    """Where a file written by `serialize_file` holds its tensors."""
+
+    data_offset: int
+    """Where the data section starts in the file"""
+    tensors: Dict[str, "TensorMeta"]
+    """Each tensor's header entry by name, in file order"""
 
 class TensorMeta:
     """A tensor's header entry, as written in the file. No data is read to build it."""

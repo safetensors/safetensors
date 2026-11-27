@@ -6,6 +6,7 @@ import numpy as np
 import paddle
 
 from safetensors import (
+    FileLayout,
     TensorSpec,
     numpy,
     deserialize,
@@ -52,7 +53,7 @@ def save_file(
     tensors: Dict[str, paddle.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
-) -> None:
+) -> FileLayout:
     """
     Saves a dictionary of tensors into raw bytes in safetensors format.
 
@@ -67,7 +68,9 @@ def save_file(
             tensors. This is purely informative and does not affect tensor loading.
 
     Returns:
-        `None`
+        `FileLayout`: where the file holds each tensor: `data_offset`, the start of
+        the data section, and `tensors`, each tensor's dtype, shape and offsets
+        within that section, by name, in file order.
 
     Example:
 
@@ -80,7 +83,7 @@ def save_file(
     ```
     """
     keep_references_alive = []
-    serialize_file(
+    return serialize_file(
         _flatten(tensors, keep_references_alive), filename, metadata=metadata
     )
 
