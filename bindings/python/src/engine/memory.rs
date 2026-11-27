@@ -312,10 +312,10 @@ pub trait Gather: Send + Sync {
 }
 
 /// Host memory, copied by the worker
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub struct Host;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl Gather for Host {
     fn gather(&self, dst: &mut [u8], copies: &[StridedCopy]) -> Result<(), Error> {
         for c in copies {

@@ -27,6 +27,42 @@ pub unsafe trait Backing: Send + Sync {
     fn size(&self) -> usize;
 }
 
+/// Zeroed host memory, aligned to [`DIRECT_ALIGN`]
+#[cfg(any(test, target_os = "linux"))]
+pub struct HostMemory {
+    _bytes: Vec<u8>,
+    /// of the aligned start in `_bytes`, taken with `as_mut_ptr`
+    addr: usize,
+    size: usize,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl HostMemory {
+    pub fn new(size: usize) -> Self {
+        let mut bytes = vec![0; size + DIRECT_ALIGN];
+        let ptr = bytes.as_mut_ptr();
+        let addr = ptr.wrapping_add(ptr.align_offset(DIRECT_ALIGN)) as usize;
+        Self {
+            _bytes: bytes,
+            addr,
+            size,
+        }
+    }
+}
+
+// SAFETY: `size` bytes at `addr` in `_bytes`, which is neither resized nor
+// accessed otherwise until dropped
+#[cfg(any(test, target_os = "linux"))]
+unsafe impl Backing for HostMemory {
+    fn ptr(&self) -> *mut u8 {
+        self.addr as *mut u8
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
 struct Slot {
     offset: usize,
     /// what may still read the slab
@@ -148,26 +184,12 @@ pub(crate) mod tests {
         Arc,
     };
 
-    use super::{Backing, SlabPool};
+    use super::{HostMemory, SlabPool};
     use crate::engine::transfer::{Error, Fence};
 
-    /// `slabs` slabs of `slab_size` bytes on the heap, leaked
+    /// `slabs` slabs of `slab_size` bytes in host memory
     pub(crate) fn heap_pool(slabs: usize, slab_size: usize) -> Arc<SlabPool> {
-        struct Leaked(usize, usize);
-        // SAFETY: the bytes at `self.0` are leaked: they live forever, used by the pool alone
-        unsafe impl Backing for Leaked {
-            fn ptr(&self) -> *mut u8 {
-                self.0 as *mut u8
-            }
-            fn size(&self) -> usize {
-                self.1
-            }
-        }
-        let bytes = vec![0u8; slabs * slab_size].leak();
-        SlabPool::new(
-            Box::new(Leaked(bytes.as_mut_ptr() as usize, bytes.len())),
-            slab_size,
-        )
+        SlabPool::new(Box::new(HostMemory::new(slabs * slab_size)), slab_size)
     }
 
     struct Flag(AtomicBool);
