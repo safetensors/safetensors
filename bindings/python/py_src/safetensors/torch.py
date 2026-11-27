@@ -148,6 +148,8 @@ def save_model(
     filename: str,
     metadata: Optional[Dict[str, str]] = None,
     force_contiguous: bool = True,
+    *,
+    direct: Optional[bool] = None,
 ) -> FileLayout:
     """
     Saves a given torch model to specified filename.
@@ -169,6 +171,8 @@ def save_model(
             This has no effect on the correctness of the model, but it
             could potentially change performance if the layout of the tensor
             was chosen specifically for that reason.
+        direct (`bool`, *optional*):
+            Whether to write the file directly to the disk, see [`save_file`].
 
     Returns:
         `FileLayout`: where the file holds each tensor, see [`save_file`].
@@ -188,7 +192,7 @@ def save_model(
     if force_contiguous:
         state_dict = {k: v.contiguous() for k, v in state_dict.items()}
     try:
-        return save_file(state_dict, filename, metadata=metadata)
+        return save_file(state_dict, filename, metadata=metadata, direct=direct)
     except ValueError as e:
         msg = str(e)
         msg += " Or use save_model(..., force_contiguous=True), read the docs for potential caveats."
@@ -290,6 +294,8 @@ def save_file(
     tensors: Dict[str, torch.Tensor],
     filename: Union[str, os.PathLike],
     metadata: Optional[Dict[str, str]] = None,
+    *,
+    direct: Optional[bool] = None,
 ) -> FileLayout:
     """
     Saves a dictionary of tensors into `filename` in safetensors format.
@@ -306,6 +312,11 @@ def save_file(
             Optional text only metadata you might want to save in your header.
             For instance it can be useful to specify more about the underlying
             tensors. This is purely informative and does not affect tensor loading.
+        direct (`bool`, *optional*):
+            Whether to write the file directly to the disk, bypassing the page
+            cache. `None`, the default, does so for a file larger than 16 MiB;
+            `True` for any file; `False` for none. Filesystems that do not
+            support direct writes always go through the cache. Linux only.
 
     Returns:
         `FileLayout`: where the file holds each tensor: `data_offset`, the start of
@@ -323,7 +334,10 @@ def save_file(
     ```
     """
     return serialize_file(
-        _flatten(tensors, from_cuda=_SAVE_FROM_CUDA), filename, metadata=metadata
+        _flatten(tensors, from_cuda=_SAVE_FROM_CUDA),
+        filename,
+        metadata=metadata,
+        direct=direct,
     )
 
 

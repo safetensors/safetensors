@@ -69,7 +69,7 @@ unsafe fn memory<S>(
 
 /// Writes a file of `size` bytes: `header`, then each tensor's bytes at its
 /// range of the data section, on `threads` threads. The file replaces `path`
-/// once complete. `tensors` are `(range, address, location)` in file order;
+/// once complete, `direct` as in [`write_file`]. `tensors` are `(range, address, location)` in file order;
 /// work queued on CUDA tensors must be complete.
 ///
 /// # Safety
@@ -81,6 +81,7 @@ pub unsafe fn save(
     tensors: &[(Range<usize>, u64, Location)],
     size: usize,
     threads: usize,
+    direct: Option<bool>,
 ) -> Result<(), Error> {
     let at = header.len();
     let extents: Vec<_> = std::iter::once((0..at, header.as_ptr() as u64, Location::Host))
@@ -127,5 +128,5 @@ pub unsafe fn save(
             cuda.with_device(first, |_| pinned_pool(cuda))?
         }
     };
-    write_file(path, size as u64, &memories, &pool, threads)
+    write_file(path, size as u64, &memories, &pool, threads, direct)
 }
