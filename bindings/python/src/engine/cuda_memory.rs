@@ -1,5 +1,5 @@
-//! CUDA for the transfer engine: the stream each device's copies are queued
-//! on, pinned host memory as a pool [`Backing`], events as [`Fence`]s.
+//! CUDA for the transfer engine: a device's memory to [`Scatter`] into, pinned host
+//! memory as a pool [`Backing`], events as [`Fence`]s.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -8,11 +8,13 @@ use std::sync::{
 
 use super::{
     cuda::{api, CudaApi, CudaError, DeviceGuard, Event, Stream},
+    memory::Scatter,
     pool::{Backing, SlabPool, SLAB_SIZE},
-    transfer::{Error, Fence},
+    transfer::{Error, Fence, Staged},
 };
+use safetensors::slice::StridedCopy;
 
-/// Whether a CUDA runtime is loaded in this process, as [`Loader::load`] needs
+/// Whether a CUDA runtime is loaded in this process
 pub fn available() -> bool {
     api().is_some()
 }
@@ -40,7 +42,7 @@ fn get_stream(stream_slots: &[AtomicU64], api: &CudaApi, device: i32) -> Result<
     }
 }
 
-pub(super) fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
+fn device_stream(api: &CudaApi, device: i32) -> Result<Stream, CudaError> {
     get_stream(&STREAMS, api, device)
 }
 
@@ -56,7 +58,12 @@ unsafe impl Send for CudaEvent {}
 unsafe impl Sync for CudaEvent {}
 
 impl CudaEvent {
-    pub(super) fn record_on(
+    /// Records an event on `stream` of `device`.
+    pub fn record(api: &'static CudaApi, device: i32, stream: Stream) -> Result<Self, CudaError> {
+        api.with_device(device, |d| Self::record_on(api, d, stream))
+    }
+
+    fn record_on(
         api: &'static CudaApi,
         d: &DeviceGuard<'_>,
         stream: Stream,
@@ -79,6 +86,69 @@ impl Fence for CudaEvent {
 impl Drop for CudaEvent {
     fn drop(&mut self) {
         let _ = self.api.event_destroy(self.event);
+    }
+}
+
+/// A CUDA device's memory, copied to on the device's stream
+pub struct CudaDevice {
+    api: &'static CudaApi,
+    device: i32,
+    stream: Stream,
+}
+
+// SAFETY: the stream handle is used from any thread through the runtime API
+unsafe impl Send for CudaDevice {}
+// SAFETY: as for `Send`: the runtime API is thread safe
+unsafe impl Sync for CudaDevice {}
+
+impl CudaDevice {
+    pub fn new(api: &'static CudaApi, device: i32) -> Result<Self, CudaError> {
+        Ok(Self {
+            api,
+            device,
+            stream: device_stream(api, device)?,
+        })
+    }
+}
+
+impl Scatter for CudaDevice {
+    fn scatter(
+        &self,
+        staged: Staged,
+        copies: &[StridedCopy],
+    ) -> Result<Option<Arc<dyn Fence>>, Error> {
+        let src = staged.bytes().as_ptr();
+        let api = self.api;
+        let fence = api.with_device(self.device, |d| {
+            let issued = copies.iter().try_for_each(|c| {
+                let src = src.wrapping_add(c.src);
+                match c.height {
+                    1 => api.memcpy_h2d_async(c.dst as u64, src, c.width, self.stream),
+                    _ => api.memcpy2d_h2d_async(
+                        c.dst as u64,
+                        c.dst_pitch,
+                        src,
+                        c.src_pitch,
+                        c.width,
+                        c.height,
+                        self.stream,
+                    ),
+                }
+            });
+            let fence = issued.and_then(|()| CudaEvent::record_on(api, d, self.stream));
+            if fence.is_err() {
+                // the slab returns to the pool with `staged`: nothing may read it
+                let _ = api.stream_sync(self.stream);
+            }
+            fence
+        })?;
+        let fence: Arc<dyn Fence> = Arc::new(fence);
+        staged.into_slab().release_after(fence.clone());
+        Ok(Some(fence))
+    }
+
+    fn allocation_end(&self, addr: u64) -> Option<u64> {
+        self.api.allocation_end(addr)
     }
 }
 
