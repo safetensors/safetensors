@@ -167,6 +167,21 @@ class PreadBackendTests(unittest.TestCase):
             for k, v in tensors.items():
                 self.assertTrue(torch.equal(got[k], v), f"{k}, cold {cold}")
 
+    @unittest.skipIf(
+        sys.platform not in ("linux", "darwin") or sys.byteorder == "big",
+        "reads in parallel on Linux and macOS",
+    )
+    def test_load_file_reads_large_files_in_parallel(self):
+        # a file over the threshold is read in parallel into tensors torch
+        # allocates, whose storage is resizable; the per-tensor path wraps
+        # buffers that are not
+        threshold = 2 * MIB
+        for size, parallel in [(threshold, False), (threshold + 4, True)]:
+            path = os.path.join(self.tempdir.name, f"{size}.safetensors")
+            save_file({"t": torch.zeros(size // 4)}, path)
+            t = load_file_pt(path, backend="pread")["t"]
+            self.assertEqual(t.untyped_storage().resizable(), parallel)
+
     def test_get_slice(self):
         with safe_open(self.path, framework="pt", device="cpu", backend="pread") as f:
             slice_obj = f.get_slice("fp32_2d")

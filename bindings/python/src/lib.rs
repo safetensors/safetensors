@@ -888,8 +888,13 @@ pub struct PrefetchLoader {
 const GET_TENSORS_THREADS: usize = 16;
 
 /// Reader threads of `get_tensors` on the CPU with the `pread` backend
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(all(unix, target_endian = "little"))]
 const CPU_READ_THREADS: usize = 16;
+
+/// The data section above which `get_tensors` reads the file in parallel to the
+/// CPU: below, one tensor after the other is as fast
+#[cfg(all(unix, target_endian = "little"))]
+const PARALLEL_READ_MIN: usize = 2 << 20;
 
 /// Bytes of the plan torch allocates ahead of the read schedule
 const ALLOC_AHEAD: usize = 1 << 30;
@@ -2268,11 +2273,14 @@ impl Open {
     /// Default behavior is a sequential loop over `get_tensor`. Pytorch loads
     /// through [`Open::prefetch`] on a CUDA device when a CUDA runtime is loaded,
     /// and on MPS when torch takes Metal buffers and the file's dtypes. Pytorch
-    /// on the CPU with the `pread` backend on Linux reads the file in parallel,
-    /// see [`Self::get_tensors_pread_cpu`].
+    /// on the CPU with the `pread` backend on Linux and macOS reads a file larger
+    /// than [`PARALLEL_READ_MIN`] in parallel, see [`Self::get_tensors_pread_cpu`].
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if self.framework == Framework::Pytorch && self.device == Device::Cpu {
+        #[cfg(all(unix, target_endian = "little"))]
+        if self.framework == Framework::Pytorch
+            && self.device == Device::Cpu
+            && self.metadata.data_len() > PARALLEL_READ_MIN
+        {
             if let Storage::Pread(file) = self.storage.as_ref() {
                 if let Some(tensors) = self.get_tensors_pread_cpu(file)? {
                     return Ok(tensors);
@@ -2317,7 +2325,7 @@ impl Open {
     /// Allocates every tensor with torch, then reads the file into them in
     /// parallel. `None` when a dtype needs the per-tensor path: `F4`, or one torch
     /// lacks.
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[cfg(all(unix, target_endian = "little"))]
     fn get_tensors_pread_cpu(&self, file: &Arc<File>) -> PyResult<Option<Py<PyDict>>> {
         Python::attach(|py| {
             let torch = get_module(py, &TORCH_MODULE)?;
@@ -2630,7 +2638,8 @@ impl safe_open {
     /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
     /// each. On a CUDA device with PyTorch, and on Apple-silicon MPS with torch
     /// 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
-    /// and the `"pread"` backend, on Linux, it reads the file in parallel.
+    /// and the `"pread"` backend, on Linux and macOS, it reads a file larger than
+    /// 2 MiB in parallel.
     ///
     /// Returns:
     ///     (`Dict[str, Tensor]`):

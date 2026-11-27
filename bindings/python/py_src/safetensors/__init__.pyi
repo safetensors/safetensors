@@ -396,7 +396,8 @@ class safe_open:
         each, but specific `framework` + `device` combinations take an internal
         fast path. On a CUDA device with PyTorch, and on Apple-silicon MPS with
         torch 2.9 or later, it loads through `prefetch`. On the CPU with PyTorch
-        and the `"pread"` backend, on Linux, it reads the file in parallel.
+        and the `"pread"` backend, on Linux and macOS, it reads a file larger than
+        2 MiB in parallel.
 
         Returns:
             (`Dict[str, Tensor]`):
