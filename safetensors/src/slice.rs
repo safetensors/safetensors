@@ -550,10 +550,13 @@ pub fn slice_layout(
                     narrow_bounds(left, right, dim)
                 }
             };
-            if start >= dim || stop > dim {
+            let is_select = matches!(indexer, TensorIndexer::Select(_));
+            // A narrow may start at `dim` and select nothing, e.g. `[0:0]` on an empty dim.
+            let start_oob = if is_select { start >= dim } else { start > dim };
+            if start_oob || stop > dim {
                 return Err(InvalidSlice::SliceOutOfRange {
                     dim_index: i,
-                    asked: if start >= dim { start } else { stop - 1 },
+                    asked: if start_oob { start } else { stop - 1 },
                     dim_size: dim,
                 });
             }
@@ -893,6 +896,13 @@ mod layout_tests {
         assert_eq!((r.read, r.shape, r.gather), (0..0, vec![0, 2], None));
         let r = slice_layout(Dtype::U8, &[8, 2], &[vec![(0..2).into(), reversed]]).unwrap();
         assert_eq!((r.read, r.shape), (0..4, vec![2, 2]));
+        for (dim, start) in [(8, 8), (0, 0)] {
+            let slice =
+                TensorIndexer::Narrow(Bound::Included(start), Bound::Unbounded, NonZeroUsize::MIN);
+            let r = slice_layout(Dtype::F32, &[dim, 2], &[vec![slice]]).unwrap();
+            assert_eq!((r.read, r.shape, r.gather), (0..0, vec![0, 2], None));
+        }
+        assert!(slice_layout(Dtype::F32, &[0, 2], &[vec![TensorIndexer::Select(0)]]).is_err());
     }
 
     #[test]
@@ -914,12 +924,11 @@ mod layout_tests {
                 ..
             })
         ));
-        // as in `slice_byte_ranges`, a start at the end is out of range even when empty
         assert!(matches!(
-            slice_layout(u8, &[4, 5], &[vec![(4..4).into()]]),
+            slice_layout(u8, &[4, 5], &[vec![(5..5).into()]]),
             Err(InvalidSlice::SliceOutOfRange {
                 dim_index: 0,
-                asked: 4,
+                asked: 5,
                 ..
             })
         ));
@@ -991,12 +1000,10 @@ mod layout_tests {
                 // sorted cut points, paired into ranges; a one-element range may be a select
                 let slices = cuts
                     .into_iter()
-                    .zip(&shape)
                     .take(sliced)
-                    .map(|(mut cuts, &dim)| {
+                    .map(|mut cuts| {
                         cuts.sort();
                         cuts.chunks_exact(2)
-                            .filter(|pair| pair[0].0 < dim)
                             .map(|pair| match (pair[0], pair[1].0) {
                                 ((start, true), stop) if stop == start + 1 => {
                                     TensorIndexer::Select(start)
