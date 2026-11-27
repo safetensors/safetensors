@@ -1784,11 +1784,37 @@ impl Open {
                     let sys = PyModule::import(py, intern!(py, "sys"))?;
                     let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
 
-                    let mut tensor = torch
-                        .getattr(intern!(py, "asarray"))?
-                        .call((storage_slice,), Some(&kwargs))?
+                    // Build the tensor as a view over the storage instead of
+                    // going through `torch.asarray`.
+                    //
+                    // `asarray` on an UntypedStorage slice costs time
+                    // proportional to the number of bytes in the slice, and
+                    // it holds the GIL for the whole time, so the cost
+                    // cannot be parallelized away. The result already
+                    // aliases the storage, so no bytes are copied - the
+                    // cost is in the conversion itself.
+                    //
+                    // `set_` aliases the storage directly instead. The
+                    // bytes are unchanged: the tensor is still a view over
+                    // the file's mapping, and every tensor was checked byte
+                    // for byte against the previous implementation.
+                    //
+                    // The storage slice already holds exactly this tensor's
+                    // bytes, so the view starts at element 0 of it. The
+                    // tensor is created as a flat uint8 buffer (the
+                    // storage's element type) of the tensor's byte length,
+                    // then reinterpreted to the real dtype and reshaped,
+                    // both of which are free.
+                    let nbytes = info.data_offsets.1 - info.data_offsets.0;
+                    let flat_shape: Py<PyAny> = vec![nbytes].into_pyobject(py)?.into();
+                    let tensor = torch
+                        .getattr(intern!(py, "empty"))?
+                        .call((0,), Some(&kwargs))?
+                        .getattr(intern!(py, "set_"))?
+                        .call1((storage_slice, 0, flat_shape))?
                         .getattr(intern!(py, "view"))?
                         .call((), Some(&view_kwargs))?;
+                    let mut tensor = tensor;
 
                     if byteorder == "big" {
                         let inplace_kwargs =
