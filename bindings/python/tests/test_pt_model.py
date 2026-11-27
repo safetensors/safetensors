@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 
 import torch
@@ -117,6 +119,14 @@ class TorchModelTestCase(unittest.TestCase):
         # Then add the size of the datapoint 4 bytes
         self.assertEqual(end - start, 16 * 3 + 4)
 
+        # A 2D tensor with holes in its storage: ``view(-1)`` cannot be used,
+        # but the last element still has offset 8 in the backing storage.
+        B = torch.zeros((3, 3))
+        A = B[::2, :]
+        start = A.data_ptr()
+        end = _end_ptr(A)
+        self.assertEqual(end - start, 8 * 4 + 4)
+
         # FLOAT16
         A = torch.zeros((4,), dtype=torch.float16)
         start = A.data_ptr()
@@ -201,6 +211,59 @@ class TorchModelTestCase(unittest.TestCase):
         state_dict = model.state_dict()
         for k, v in model2.state_dict().items():
             torch.testing.assert_close(v, state_dict[k])
+
+    def test_workaround_shared_non_contiguous_2d(self):
+        # ``A[::2, :]`` is not contiguous but still shares its storage with
+        # ``A`` and ``A[:1, :]``. Overlap detection must not rely on
+        # ``Tensor.view(-1)``, which raises for such tensors.
+        class StridedSharedModel(torch.nn.Module):
+            def __init__(self, fill):
+                super().__init__()
+                A = torch.arange(9, dtype=torch.float32).reshape(3, 3) * fill
+                self.A = torch.nn.Parameter(A)
+                self.B = torch.nn.Parameter(A[:1, :])
+                self.C = torch.nn.Parameter(A[::2, :])
+
+        model = StridedSharedModel(1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "tmp_strided.safetensors")
+            save_model(model, filename)
+            with safe_open(filename, framework="pt") as f:
+                self.assertEqual(f.metadata(), {"B": "A", "C": "A"})
+
+            model2 = StridedSharedModel(0.0)
+            load_model(model2, filename)
+            for k, v in model.state_dict().items():
+                torch.testing.assert_close(model2.state_dict()[k], v)
+
+    def test_workaround_expanded_view_keeps_complete_storage(self):
+        class ExpandedModel(torch.nn.Module):
+            def __init__(self, fill):
+                super().__init__()
+                raw = torch.arange(4, dtype=torch.float32) * fill
+                self.raw = torch.nn.Parameter(raw)
+                self.expanded = torch.nn.Parameter(raw[::2, None].expand(2, 2))
+                self.middle = torch.nn.Parameter(raw[1:2])
+
+        model = ExpandedModel(1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "expanded.safetensors")
+            save_model(model, filename)
+            with safe_open(filename, framework="pt") as f:
+                self.assertEqual(list(f.keys()), ["raw"])
+            restored = ExpandedModel(0.0)
+            load_model(restored, filename)
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(restored.state_dict()[name], value)
+
+    def test_find_shared_nested_slices(self):
+        # A slice nested in an enclosing tensor must not shrink the covered
+        # interval: ``c`` still overlaps ``a`` after the nested ``b``.
+        a = torch.zeros((10,))
+        b = a[2:4]
+        c = a[6:8]
+        shared = _find_shared_tensors({"a": a, "b": b, "c": c})
+        self.assertEqual(shared, [{"a", "b", "c"}])
 
     def test_workaround_non_contiguous(self):
         model = NonContiguousModel()
