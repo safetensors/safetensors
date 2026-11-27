@@ -295,20 +295,29 @@ class ReadmeTestCase(unittest.TestCase):
     def test_exception(self):
         # Unknown dtype is rejected by TensorSpec's constructor.
         with self.assertRaises(SafetensorError):
-            TensorSpec(dtype="nonsense", shape=[1], data_ptr=0, data_len=0)
+            TensorSpec(dtype="nonsense", shape=[1], data=b"")
 
         # Raw dicts are no longer accepted by `serialize` (API moved to TensorSpec in 0.8.0).
         with self.assertRaises(TypeError):
-            serialize(
-                {
-                    "test": {
-                        "dtype": "float32",
-                        "shape": [1],
-                        "data_ptr": 0,
-                        "data_len": 0,
-                    }
-                }
-            )
+            serialize({"test": {"dtype": "float32", "shape": [1], "data": b"\0" * 4}})
+
+    def test_tensor_spec_data(self):
+        with self.assertRaisesRegex(SafetensorError, "data is 3 bytes"):
+            TensorSpec(dtype="float32", shape=[1], data=b"\0" * 3)
+
+        with self.assertRaisesRegex(SafetensorError, "not C-contiguous"):
+            TensorSpec(dtype="uint8", shape=[2, 3], data=np.zeros((3, 2), np.uint8).T)
+
+        with self.assertRaises(TypeError):
+            TensorSpec(dtype="uint8", shape=[1], data=[0])
+
+        # the spec keeps the memory it describes alive
+        spec = TensorSpec(
+            dtype="int64", shape=[4], data=np.arange(4, dtype="<i8").view(np.uint8)
+        )
+        self.assertEqual(spec.data_len, 32)
+        loaded = load(serialize({"test": spec}))
+        np.testing.assert_array_equal(loaded["test"], np.arange(4))
 
     def test_torch_slice(self):
         A = torch.randn((10, 5))
