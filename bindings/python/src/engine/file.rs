@@ -18,7 +18,8 @@ use super::{
 /// The largest alignment of offset, length and buffer a direct read may need
 pub(super) const DIRECT_ALIGN: usize = 4096;
 
-/// A file read or written with `O_DIRECT` where the filesystem allows it
+/// A file read or written with `O_DIRECT` where the filesystem allows it; on
+/// macOS, read with `F_NOCACHE`
 pub(super) struct DirectFile {
     file: Arc<File>,
     #[cfg(target_os = "linux")]
@@ -26,6 +27,8 @@ pub(super) struct DirectFile {
     /// of a file written: a direct write pads the chunk that ends there
     #[cfg(target_os = "linux")]
     size: u64,
+    #[cfg(target_os = "macos")]
+    uncached: Option<File>,
 }
 
 impl DirectFile {
@@ -53,7 +56,15 @@ impl DirectFile {
                 size: 0,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let uncached = match direct {
+                Some(true) if aligned_slabs => uncached(&file),
+                _ => None,
+            };
+            Self { file, uncached }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (direct, aligned_slabs);
             Self { file }
@@ -78,6 +89,13 @@ impl DirectFile {
                 }
                 res => return res,
             }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(file) = &self.uncached {
+            // only a read from an aligned offset skips the page cache
+            let head = (offset % DIRECT_ALIGN as u64) as usize;
+            file.read_exact_at(&mut slab[..head + len], offset - head as u64)?;
+            return Ok(head);
         }
         self.file.read_exact_at(&mut slab[..len], offset)?;
         Ok(0)
@@ -272,6 +290,10 @@ impl Source for DirectFile {
         if self.direct.is_some() {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        if self.uncached.is_some() {
+            return None;
+        }
         Some(self)
     }
 }
@@ -280,6 +302,30 @@ impl ReadAt for DirectFile {
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
         self.file.read_exact_at(dst, offset)
     }
+}
+
+/// `file` reopened with `F_NOCACHE`: its reads take what the page cache holds
+/// from it and add nothing to it. `None` when its path now names another file.
+#[cfg(target_os = "macos")]
+fn uncached(file: &File) -> Option<File> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    };
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes at most `PATH_MAX` bytes; `file` holds an open
+    // descriptor for the call's duration
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
+    let reopened = File::open(std::ffi::OsStr::from_bytes(path.to_bytes())).ok()?;
+    let (a, b) = (file.metadata().ok()?, reopened.metadata().ok()?);
+    if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+        return None;
+    }
+    // SAFETY: `reopened` holds an open descriptor for the call's duration
+    (unsafe { libc::fcntl(reopened.as_raw_fd(), libc::F_NOCACHE, 1) } == 0).then_some(reopened)
 }
 
 /// The file reopened `O_DIRECT`
@@ -401,7 +447,7 @@ pub(super) mod tests {
     use std::ops::Range;
 
     use super::DIRECT_ALIGN;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use {
         super::DirectFile,
         crate::engine::pool::SLAB_SIZE,
@@ -420,7 +466,7 @@ pub(super) mod tests {
     }
 
     /// `len` pseudo-random bytes in a new file, and the bytes
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn random_file(name: &str, len: usize) -> (std::path::PathBuf, Arc<File>, Vec<u8>) {
         let mut rng = Rng(len as u64);
         let data: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
@@ -429,13 +475,16 @@ pub(super) mod tests {
         (path.clone(), Arc::new(File::open(path).unwrap()), data)
     }
 
-    /// Drops `file` from the page cache
-    #[cfg(target_os = "linux")]
+    /// Drops `file` from the page cache, on Linux
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn evict(file: &File) {
-        use std::os::fd::AsRawFd;
         file.sync_all().unwrap();
-        // SAFETY: `file` holds an open descriptor for the call's duration
-        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `file` holds an open descriptor for the call's duration
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
     }
 
     /// A zeroed buffer of `len` bytes, `misalign` bytes past a [`DIRECT_ALIGN`] boundary
@@ -445,7 +494,7 @@ pub(super) mod tests {
         (buf, at..at + len)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_source_reads_cold_and_cached() {
         // odd offsets, and a tail whose aligned superset reaches past the end of a
