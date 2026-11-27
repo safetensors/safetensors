@@ -199,6 +199,18 @@ class WithOpenCase(unittest.TestCase):
 
 @unittest.skipIf(not HAS_PADDLE, "Paddle is not available")
 class SaveLoadCase(unittest.TestCase):
+    def test_complex64_in_memory(self):
+        values = np.array(
+            [[1.25 + 2.5j, -3.25 - 4.5j], [0j, 7 - 0.125j]], dtype=np.complex64
+        )
+        for array in (values, values.reshape(-1), values[0, 0], values[:0]):
+            with self.subTest(shape=array.shape):
+                tensor = paddle.to_tensor(array, dtype=paddle.complex64)
+                reloaded = load(save({"test": tensor}))["test"]
+                self.assertEqual(reloaded.dtype, paddle.complex64)
+                self.assertEqual(tuple(reloaded.shape), array.shape)
+                np.testing.assert_array_equal(reloaded.numpy(), array)
+
     def test_in_memory(self):
         data = {
             "test": paddle.zeros((2, 2), dtype=paddle.float32),
