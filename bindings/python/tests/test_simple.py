@@ -450,6 +450,18 @@ class ReadmeTestCase(unittest.TestCase):
                 "Error during slicing [:, :20] with shape [10, 5]: index 19 out of bounds for tensor dimension #1 of size 5",
             )
 
+            # Integer indices past the i32 range are still indices
+            with self.assertRaises(SafetensorError) as cm:
+                tensor = slice_[2**31]
+            self.assertIn("out of bounds", str(cm.exception))
+
+            with self.assertRaises(SafetensorError) as cm:
+                tensor = slice_[-(2**31) - 1]
+            self.assertEqual(
+                str(cm.exception),
+                "Invalid index -2147483649 for dimension 0 of size 10",
+            )
+
     def test_numpy_slice_negative_bounds(self):
         A = np.random.rand(10, 5)
         filename = f"./slice_neg_{threading.get_ident()}.safetensors"

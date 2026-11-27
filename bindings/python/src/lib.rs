@@ -369,10 +369,10 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
             };
             indexers.push(TensorIndexer::Narrow(start_b, stop_b, step));
             dim_idx += 1;
-        } else if let Ok(idx) = it.extract::<i32>() {
+        } else if let Ok(idx) = it.extract::<isize>() {
             let dim = shape.get(dim_idx).copied().unwrap_or(0);
             let resolved = if idx < 0 {
-                dim.checked_add_signed(idx as isize).ok_or_else(|| {
+                dim.checked_add_signed(idx).ok_or_else(|| {
                     SafetensorError::new_err(format!(
                         "Invalid index {idx} for dimension {dim_idx} of size {dim}"
                     ))
