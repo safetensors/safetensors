@@ -230,7 +230,6 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaEventRecord)(e, s) })
     }
 
-    #[cfg(test)]
     pub fn event_query(&self, e: Event) -> Result<bool, CudaError> {
         match unsafe { (self.f.cudaEventQuery)(e) } {
             0 => Ok(true),

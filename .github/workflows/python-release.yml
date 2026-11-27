@@ -17,6 +17,7 @@ on:
     paths:
       - "safetensors/**"
       - "bindings/python/**"
+      - "byte-mover/**"
       - "README.md"
       - ".github/workflows/python-release.yml"
   workflow_dispatch:

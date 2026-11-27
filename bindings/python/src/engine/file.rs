@@ -334,6 +334,21 @@ fn uncached(file: &File) -> Option<File> {
     (unsafe { libc::fcntl(reopened.as_raw_fd(), libc::F_NOCACHE, 1) } == 0).then_some(reopened)
 }
 
+/// `file` reopened for direct reads (`O_DIRECT`, `F_NOCACHE` on macOS), of
+/// offsets, lengths and buffers aligned to [`DIRECT_ALIGN`]; `None` when the
+/// filesystem takes none.
+pub(super) fn reopen_direct(file: &File) -> Option<File> {
+    #[cfg(target_os = "linux")]
+    return Direct::open(file, false, false).map(|direct| direct.file);
+    #[cfg(target_os = "macos")]
+    return uncached(file);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        None
+    }
+}
+
 /// The file reopened `O_DIRECT`
 #[cfg(target_os = "linux")]
 struct Direct {
