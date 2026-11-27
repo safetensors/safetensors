@@ -375,6 +375,8 @@ pub fn slice_byte_ranges(
         return Err(InvalidSlice::TooManySlices);
     }
     let mut newshape = Vec::with_capacity(n_shape);
+    // An empty tensor has no bytes to read, however large its other dims are.
+    let empty = shape.contains(&0);
 
     // Minimum span is the span of 1 item;
     let mut span = dtype.bitsize();
@@ -413,7 +415,9 @@ pub fn slice_byte_ranges(
             if !is_select {
                 newshape.push((stop - start).div_ceil(step));
             }
-            if indices.is_empty() {
+            if empty {
+                // Only the bounds and the result shape matter.
+            } else if indices.is_empty() {
                 if step == 1 && start == 0 && stop == dim {
                     // Full range, nothing sliced yet; just grow the span.
                 } else if step == 1 {
@@ -1323,6 +1327,41 @@ mod tests {
             assert_eq!(shape, vec![0, 2]);
         }
         assert!(slice_byte_ranges(Dtype::F32, &[0, 2], &[TensorIndexer::Select(0)]).is_err());
+    }
+
+    #[test]
+    fn test_slice_empty_tensor_with_large_dims() {
+        // A zero-byte tensor whose other dims are as large as a header may declare: slicing
+        // it must not walk those dims.
+        let shape = [1 << 58, 2, 0];
+        let (ranges, newshape) = slice_byte_ranges(
+            Dtype::U8,
+            &shape,
+            &[(..).into(), (0..1).into(), (..).into()],
+        )
+        .unwrap();
+        assert!(ranges.is_empty());
+        assert_eq!(newshape, vec![1 << 58, 1, 0]);
+
+        let step = TensorIndexer::Narrow(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let (ranges, newshape) =
+            slice_byte_ranges(Dtype::U8, &[0, 1 << 58], &[(..).into(), step]).unwrap();
+        assert!(ranges.is_empty());
+        assert_eq!(newshape, vec![0, 1 << 57]);
+
+        // bounds are still checked
+        assert_eq!(
+            slice_byte_ranges(Dtype::U8, &shape, &[(..).into(), (0..3).into()]),
+            Err(InvalidSlice::SliceOutOfRange {
+                dim_index: 1,
+                asked: 2,
+                dim_size: 2,
+            })
+        );
     }
 
     #[test]
