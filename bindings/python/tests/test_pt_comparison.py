@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from safetensors import safe_open
+from safetensors import SafetensorError, TensorSpec, safe_open, serialize
 from safetensors.torch import load, load_file, save, save_file
 
 
@@ -258,6 +258,14 @@ class TorchTestCase(unittest.TestCase):
             self.assertTrue(torch.equal(mapped["a"], torch.zeros(1 << 20)))
             self.assertTrue(torch.equal(load_file(path)["a"], torch.ones(1 << 20)))
             self.assertEqual(os.listdir(d), ["out.safetensors"])
+
+    def test_serialize_rejects_device_memory(self):
+        spec = TensorSpec.cuda(
+            dtype="float32", shape=[1], owner=None, data_ptr=8, device=0
+        )
+        self.assertEqual(spec.device, 0)
+        with self.assertRaises(SafetensorError):
+            serialize({"a": spec})
 
     def test_disjoint_tensors_shared_storage(self):
         A = torch.zeros((10, 10))
