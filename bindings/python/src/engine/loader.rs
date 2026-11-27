@@ -40,12 +40,12 @@ use std::{
 };
 
 use super::{
-    cuda::{api, CudaApi, CudaError},
-    cuda_memory::{pinned_pool, CudaDevice, CudaEvent, MAX_DEVICES},
+    cuda::{api, CudaError},
+    cuda_memory::{pinned_pool, CudaDevice, MAX_DEVICES},
     file::DirectFile,
-    memory::{LoadPlan, Memory, Span},
+    memory::{LoadPlan, Memory, Scatter, Span},
     pool::SlabPool,
-    transfer::{self, Error, Fence, Plan, Sink, CHUNK_SIZE},
+    transfer::{self, Error, Plan, Sink, CHUNK_SIZE},
 };
 use safetensors::slice::Gather;
 
@@ -118,7 +118,7 @@ impl From<std::io::Error> for LoaderError {
 
 struct LoaderInner<D> {
     source: DirectFile,
-    memory: Memory<CudaDevice>,
+    memory: Memory<Box<dyn Scatter>>,
     pool: Arc<SlabPool>,
     /// the plan's chunks as the workers claim them, and the first error
     transfer: Plan,
@@ -127,8 +127,6 @@ struct LoaderInner<D> {
     owners: Box<[Mutex<Option<D>>]>,
     /// set by `close`: `provide` hands destinations back from then on
     released: Mutex<bool>,
-    api: &'static CudaApi,
-    device: i32,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -211,8 +209,8 @@ impl<D> Feed<D> {
         }
         // the caller's allocator may hand out memory still in use by work queued
         // on the stream it allocated on: workers wait for that work before copying
-        let ready: Arc<dyn Fence> = match CudaEvent::record(inner.api, inner.device, stream as _) {
-            Ok(event) => Arc::new(event),
+        let ready = match inner.memory.space().queued(stream) {
+            Ok(ready) => ready,
             Err(err) => return Err((err.into(), dsts)),
         };
         let first = inner.memory.provided();
@@ -227,7 +225,7 @@ impl<D> Feed<D> {
         // SAFETY: each address is a tensor allocated for its span, kept alive by
         // its owner until `take` hands it out once landed, or `close` returns it
         // once the copies completed
-        unsafe { inner.memory.provide(addrs.into_iter(), Some(ready)) };
+        unsafe { inner.memory.provide(addrs.into_iter(), ready) };
         Ok(())
     }
 
@@ -304,11 +302,24 @@ impl<D: Send + 'static> Loader<D> {
             return Err(LoaderError::InvalidDevice(device));
         }
         let plan = LoadPlan::new(spans, gathers, in_file_offset, CHUNK_SIZE);
-        let memory = Memory::new(plan, CudaDevice::new(cuda_api, device)?);
+        let space = Box::new(CudaDevice::new(cuda_api, device)?);
+        let pool = cuda_api.with_device(device, |_| pinned_pool(cuda_api))?;
+        Self::start(file, direct, threads, plan, space, pool)
+    }
+
+    /// Starts the workers of a load to `space`, which stage chunks in `pool`.
+    fn start(
+        file: Arc<File>,
+        direct: Option<bool>,
+        threads: usize,
+        plan: LoadPlan,
+        space: Box<dyn Scatter>,
+        pool: Arc<SlabPool>,
+    ) -> Result<Self, LoaderError> {
+        let memory = Memory::new(plan, space);
         let chunks = memory.chunks();
         // avoid spawning too many threads when not needed, up to chunks.len()
         let threads = threads.clamp(1, chunks.len().max(1));
-        let pool = cuda_api.with_device(device, |_| pinned_pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
             source: DirectFile::new(file, direct, pool.aligned()),
             transfer: Plan::new(chunks),
@@ -316,15 +327,13 @@ impl<D: Send + 'static> Loader<D> {
             memory,
             pool,
             released: Mutex::new(false),
-            api: cuda_api,
-            device,
             workers: Mutex::new(Vec::with_capacity(threads)),
         });
         let loader = Self { inner };
         for _ in 0..threads {
             let inner = loader.inner.clone();
             let spawned = std::thread::Builder::new().spawn(move || {
-                let _ = cuda_api.set_device(device);
+                inner.memory.space().enter();
                 transfer::work(&inner.transfer, &inner.source, &inner.memory, &inner.pool)
             });
             // on failure, dropping the loader stops and joins the workers already started
