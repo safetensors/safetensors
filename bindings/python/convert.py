@@ -145,7 +145,7 @@ def rename(pt_filename: str) -> str:
 def convert_multi(
     model_id: str,
     *,
-    revision=Optional[str],
+    revision: Optional[str] = None,
     folder: str,
     token: Optional[str],
     discard_names: List[str],
@@ -164,7 +164,11 @@ def convert_multi(
     local_filenames = []
     for filename in filenames:
         pt_filename = hf_hub_download(
-            repo_id=model_id, filename=filename, token=token, cache_dir=folder
+            repo_id=model_id,
+            revision=revision,
+            filename=filename,
+            token=token,
+            cache_dir=folder,
         )
 
         sf_filename = rename(pt_filename)
