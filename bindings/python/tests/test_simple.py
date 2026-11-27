@@ -368,6 +368,34 @@ class ReadmeTestCase(unittest.TestCase):
             self.assertEqual(list(tensor.shape), [0, 5])
             torch.testing.assert_close(tensor, A[list()])
 
+    def test_slice_rejects_bool_index(self):
+        # `bool` subclasses `int`, but `x[True]` / `x[False]` in numpy and torch
+        # add a new axis rather than select row 1 / row 0. Indexing must not
+        # silently read a bool as an integer position.
+        A = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        filename = f"./slice_bool_{threading.get_ident()}.safetensors"
+        save_file({"a": A}, filename)
+
+        for framework, backend in [("np", "mmap"), ("np", "pread"), ("pt", "pread")]:
+            with safe_open(filename, framework=framework, backend=backend) as f:
+                slice_ = f.get_slice("a")
+                for index, position in [
+                    (True, 0),
+                    (False, 0),
+                    ((0, True), 1),
+                    ((slice(None), False), 1),
+                    ((..., True), 2),
+                ]:
+                    with self.subTest(
+                        framework=framework, backend=backend, index=index
+                    ):
+                        with self.assertRaises(SafetensorError) as cm:
+                            slice_[index]
+                        self.assertEqual(
+                            str(cm.exception),
+                            f"Unsupported slice index at position {position}: expected slice, int, or ellipsis",
+                        )
+
     def test_numpy_slice(self):
         A = np.random.rand(10, 5)
         tensors = {
